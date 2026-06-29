@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Search, Copy, ChevronDown, ChevronUp, X, BookOpen, Menu, Heart, Shuffle, Link2, Eye, Check } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
@@ -57,6 +57,52 @@ export default function AIInterviewPrep() {
   const [viewedQuestions, setViewedQuestions] = useState<Set<string>>(() =>
     loadStoredSet('ai-interview-viewed')
   );
+  const headerRef = useRef<HTMLElement>(null);
+  const [headerHeight, setHeaderHeight] = useState(112);
+
+  const getScrollOffset = useCallback((extra = 12) => headerHeight + extra, [headerHeight]);
+
+  // Track sticky header height for sidebar offset and scroll targets
+  useEffect(() => {
+    const header = headerRef.current;
+    if (!header) return;
+
+    const update = () => {
+      const height = Math.ceil(header.getBoundingClientRect().height);
+      setHeaderHeight(height);
+      document.documentElement.style.setProperty('--site-header-height', `${height}px`);
+    };
+
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(header);
+    window.addEventListener('resize', update);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', update);
+    };
+  }, []);
+
+  // Lock page scroll when modal or mobile nav is open
+  useEffect(() => {
+    const shouldLock = Boolean(focusQuestion) || showMobileToc;
+    if (!shouldLock) return;
+
+    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
+    const previousOverflow = document.body.style.overflow;
+    const previousPaddingRight = document.body.style.paddingRight;
+
+    document.body.style.overflow = 'hidden';
+    if (scrollbarWidth > 0) {
+      document.body.style.paddingRight = `${scrollbarWidth}px`;
+    }
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.body.style.paddingRight = previousPaddingRight;
+    };
+  }, [focusQuestion, showMobileToc]);
 
   // Persist favorites
   useEffect(() => {
@@ -80,7 +126,7 @@ export default function AIInterviewPrep() {
             setTimeout(() => {
               const el = document.getElementById(`card-${hash}`);
               if (el) {
-                const top = el.getBoundingClientRect().top + window.scrollY - 110;
+                const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
                 window.scrollTo({ top, behavior: 'smooth' });
               }
             }, 80);
@@ -96,7 +142,7 @@ export default function AIInterviewPrep() {
     // Listen for hash changes
     window.addEventListener('hashchange', handleHash);
     return () => window.removeEventListener('hashchange', handleHash);
-  }, []);
+  }, [getScrollOffset]);
 
   // Mark question as viewed when expanded
   const markAsViewed = (id: string) => {
@@ -307,7 +353,7 @@ export default function AIInterviewPrep() {
     setTimeout(() => {
       const el = document.getElementById(`card-${randomQ.id}`);
       if (el) {
-        const top = el.getBoundingClientRect().top + window.scrollY - 100;
+        const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
         window.scrollTo({ top, behavior: 'smooth' });
       }
     }, 50);
@@ -338,8 +384,7 @@ export default function AIInterviewPrep() {
   const scrollToSection = (sectionId: string) => {
     const el = document.getElementById(sectionId);
     if (el) {
-      const offset = 90;
-      const top = el.getBoundingClientRect().top + window.scrollY - offset;
+      const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
       window.scrollTo({ top, behavior: 'smooth' });
       setActiveSection(sectionId);
       setShowMobileToc(false);
@@ -364,6 +409,7 @@ export default function AIInterviewPrep() {
 
   // Track active section on scroll
   useEffect(() => {
+    const topMargin = `-${getScrollOffset()}px`;
     const observer = new IntersectionObserver(
       (entries) => {
         const visible = entries
@@ -373,7 +419,7 @@ export default function AIInterviewPrep() {
           setActiveSection(visible.target.id);
         }
       },
-      { rootMargin: '-100px 0px -60% 0px', threshold: [0.2, 0.6] }
+      { rootMargin: `${topMargin} 0px -60% 0px`, threshold: [0.2, 0.6] }
     );
 
     data.sections.forEach((s) => {
@@ -382,14 +428,17 @@ export default function AIInterviewPrep() {
     });
 
     return () => observer.disconnect();
-  }, []);
+  }, [headerHeight, getScrollOffset]);
 
   const isSearching = searchTerm.trim().length > 0;
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-200">
       {/* Top nav / header */}
-      <header className="sticky top-0 z-50 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/80">
+      <header
+        ref={headerRef}
+        className="sticky top-0 z-50 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/80"
+      >
         <div className="mx-auto max-w-7xl px-4 sm:px-6">
           <div className="flex h-16 items-center justify-between gap-4">
             <div className="flex items-center gap-3">
@@ -444,7 +493,7 @@ export default function AIInterviewPrep() {
                 )}
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2">
                 <button
                   onClick={goToRandomQuestion}
                   className="flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 hover:bg-zinc-800 hover:border-yellow-900/50 px-4 py-3 text-sm font-medium transition-colors action-btn"
@@ -565,7 +614,13 @@ export default function AIInterviewPrep() {
         <div className="flex flex-col lg:flex-row gap-8 pt-6 pb-24">
           {/* Sidebar TOC */}
           <aside className="hidden lg:block w-72 shrink-0">
-            <div className="sticky top-28">
+            <div
+              className="sidebar-panel sticky overflow-y-auto overscroll-contain"
+              style={{
+                top: 'var(--site-header-height, 7rem)',
+                maxHeight: 'calc(100vh - var(--site-header-height, 7rem) - 1rem)',
+              }}
+            >
               <div className="mb-3 px-3 text-xs font-semibold uppercase tracking-[1px] text-zinc-500">
                 Contents
               </div>
@@ -609,9 +664,9 @@ export default function AIInterviewPrep() {
 
           {/* Mobile TOC drawer */}
           {showMobileToc && (
-            <div className="lg:hidden fixed inset-0 z-50 bg-black/60" onClick={() => setShowMobileToc(false)}>
+            <div className="lg:hidden fixed inset-0 z-[60] bg-black/60" onClick={() => setShowMobileToc(false)}>
               <div
-                className="absolute left-0 top-0 bottom-0 w-72 bg-zinc-950 border-r border-zinc-800 p-4 overflow-auto"
+                className="absolute left-0 top-0 bottom-0 w-[min(18rem,85vw)] max-w-full bg-zinc-950 border-r border-zinc-800 p-4 overflow-y-auto overscroll-contain"
                 onClick={(e) => e.stopPropagation()}
               >
                 <div className="flex justify-between items-center mb-4">
@@ -682,17 +737,17 @@ export default function AIInterviewPrep() {
             )}
 
             {filteredSections.map((section) => (
-              <div key={section.id} id={section.id} className="section-header mb-12 scroll-mt-24">
+              <div key={section.id} id={section.id} className="section-header mb-12">
                 {/* Section header */}
-                <div className="mb-4 flex items-center justify-between border-b border-zinc-800 pb-3">
-                  <div>
+                <div className="mb-4 flex flex-col gap-3 border-b border-zinc-800 pb-3 sm:flex-row sm:items-end sm:justify-between">
+                  <div className="min-w-0">
                     <div className="font-mono text-xs text-blue-500 tracking-[1.5px]">
                       SECTION {section.number}
                     </div>
-                    <h2 className="text-2xl font-semibold tracking-tight">{section.title}</h2>
+                    <h2 className="text-xl sm:text-2xl font-semibold tracking-tight break-words">{section.title}</h2>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex shrink-0 items-center gap-2 self-start sm:self-auto">
                     <div className="text-xs text-zinc-500 font-mono mr-1">
                       {section.questions.length} Q{section.questions.length === 1 ? '' : 's'}
                     </div>
@@ -735,35 +790,38 @@ export default function AIInterviewPrep() {
                               toggleQuestion(q.id);
                             }
                           }}
-                          className="question-header flex w-full items-start gap-4 px-5 py-[17px] text-left cursor-pointer"
+                          className="question-header w-full px-4 py-4 text-left cursor-pointer sm:px-5 sm:py-[17px]"
                         >
-                          <div className="shrink-0 mt-0.5">
-                            <div className="w-7 h-7 rounded-md bg-zinc-900 flex items-center justify-center text-[11px] font-mono text-zinc-500 border border-zinc-800">
-                              {idx + 1}
-                            </div>
-                          </div>
-
-                          <div className="flex-1 min-w-0 pr-1">
-                            <div className="question-text group-hover:text-white">
-                              {highlightText(q.question, searchTerm)}
-                            </div>
-
-                            {/* Answer preview when collapsed - hugely improves readability/scannability */}
-                            {!isExpanded && (
-                              <div className="question-preview">
-                                {getAnswerPreview(q.answer)}
+                          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-4">
+                            <div className="flex min-w-0 items-start gap-3 sm:contents">
+                              <div className="shrink-0 mt-0.5">
+                                <div className="w-7 h-7 rounded-md bg-zinc-900 flex items-center justify-center text-[11px] font-mono text-zinc-500 border border-zinc-800">
+                                  {idx + 1}
+                                </div>
                               </div>
-                            )}
 
-                            {/* Viewed indicator */}
-                            {viewedQuestions.has(q.id) && !isExpanded && (
-                              <div className="mt-1 flex items-center gap-1 text-[11px] text-emerald-600/80">
-                                <Check className="h-3 w-3" /> viewed
+                              <div className="flex-1 min-w-0 pr-1">
+                                <div className="question-text group-hover:text-white break-words">
+                                  {highlightText(q.question, searchTerm)}
+                                </div>
+
+                                {/* Answer preview when collapsed - hugely improves readability/scannability */}
+                                {!isExpanded && (
+                                  <div className="question-preview">
+                                    {getAnswerPreview(q.answer)}
+                                  </div>
+                                )}
+
+                                {/* Viewed indicator */}
+                                {viewedQuestions.has(q.id) && !isExpanded && (
+                                  <div className="mt-1 flex items-center gap-1 text-[11px] text-emerald-600/80">
+                                    <Check className="h-3 w-3" /> viewed
+                                  </div>
+                                )}
                               </div>
-                            )}
-                          </div>
+                            </div>
 
-                          <div className="flex shrink-0 items-center gap-0.5 pt-0.5">
+                            <div className="flex shrink-0 items-center justify-end gap-0.5 border-t border-zinc-800/60 pt-3 sm:border-0 sm:pt-0.5">
                             {/* Focus / Read mode (very interactive) */}
                             <button
                               onClick={(e) => openFocus(q, e)}
@@ -814,6 +872,7 @@ export default function AIInterviewPrep() {
                               ) : (
                                 <ChevronDown className="h-4 w-4" />
                               )}
+                            </div>
                             </div>
                           </div>
                         </div>
@@ -903,7 +962,7 @@ export default function AIInterviewPrep() {
       <AnimatePresence>
         {focusQuestion && (
           <div 
-            className="fixed inset-0 z-[100] flex items-start justify-center bg-black/80 pt-12 pb-12 px-4"
+            className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-black/80 p-4 sm:p-6"
             onClick={closeFocus}
           >
             <motion.div
@@ -911,28 +970,29 @@ export default function AIInterviewPrep() {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: 20, scale: 0.985 }}
               transition={{ duration: 0.2, ease: [0.32, 0.72, 0, 1] }}
-              className="focus-modal w-full max-w-4xl rounded-2xl p-7 sm:p-9 shadow-2xl"
+              className="focus-modal my-auto flex w-full max-w-4xl max-h-[min(90vh,calc(100dvh-2rem))] flex-col rounded-2xl p-5 shadow-2xl sm:p-9"
               onClick={(e) => e.stopPropagation()}
             >
-              <div className="flex items-start justify-between gap-4 mb-5">
-                <div className="font-medium text-xl pr-6 leading-tight text-zinc-100">
+              <div className="mb-5 flex shrink-0 items-start justify-between gap-4">
+                <div className="pr-2 text-lg font-medium leading-tight text-zinc-100 break-words sm:pr-6 sm:text-xl">
                   {focusQuestion.question}
                 </div>
                 <button 
                   onClick={closeFocus} 
-                  className="text-zinc-400 hover:text-white p-1 -mr-2"
+                  className="shrink-0 p-1 text-zinc-400 hover:text-white"
+                  aria-label="Close focus mode"
                 >
                   <X className="h-5 w-5" />
                 </button>
               </div>
 
-              <div className="prose max-w-none">
+              <div className="prose max-w-none min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {focusQuestion.answer}
                 </ReactMarkdown>
               </div>
 
-              <div className="flex flex-wrap gap-2 mt-8 pt-6 border-t border-zinc-800">
+              <div className="mt-8 flex shrink-0 flex-wrap gap-2 border-t border-zinc-800 pt-6">
                 <button
                   onClick={() => copyQA(focusQuestion)}
                   className="flex items-center gap-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 px-4 py-2 text-sm font-medium transition-colors"

@@ -3,10 +3,16 @@
 :root {
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --site-header-height: 7rem;
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 body {
   font-family: var(--font-geist-sans);
+  overflow-x: hidden;
 }
 
 /* Enhanced dark tech theme */
@@ -166,7 +172,7 @@ mark {
 
 /* TOC */
 .section-header {
-  scroll-margin-top: 90px;
+  scroll-margin-top: calc(var(--site-header-height) + 0.75rem);
 }
 
 .toc-link {
@@ -253,9 +259,9 @@ mark {
   max-width: 72ch;
 }
 
-/* Section header enhancement */
-.section-header {
-  scroll-margin-top: 90px;
+.sidebar-panel {
+  scrollbar-width: thin;
+  scrollbar-color: #3f3f46 transparent;
 }
 
 .section-expand-btn {
