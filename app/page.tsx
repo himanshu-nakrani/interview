@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
 import { Search, Copy, ChevronDown, ChevronUp, X, BookOpen, Menu, Heart, Shuffle, Link2, Eye, Check } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
@@ -57,8 +57,16 @@ export default function AIInterviewPrep() {
   const [viewedQuestions, setViewedQuestions] = useState<Set<string>>(() =>
     loadStoredSet('ai-interview-viewed')
   );
+  const isMounted = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false
+  );
+
   const headerRef = useRef<HTMLElement>(null);
+  const lastScrollY = useRef(0);
   const [headerHeight, setHeaderHeight] = useState(112);
+  const [filtersCollapsed, setFiltersCollapsed] = useState(false);
 
   const getScrollOffset = useCallback((extra = 12) => headerHeight + extra, [headerHeight]);
 
@@ -82,6 +90,29 @@ export default function AIInterviewPrep() {
       observer.disconnect();
       window.removeEventListener('resize', update);
     };
+  }, []);
+
+  // Collapse filter rows on scroll down; expand on scroll up or near top
+  useEffect(() => {
+    lastScrollY.current = window.scrollY;
+
+    const handleScroll = () => {
+      const currentY = window.scrollY;
+      const delta = currentY - lastScrollY.current;
+
+      if (currentY <= 48) {
+        setFiltersCollapsed(false);
+      } else if (delta > 6) {
+        setFiltersCollapsed(true);
+      } else if (delta < -6) {
+        setFiltersCollapsed(false);
+      }
+
+      lastScrollY.current = currentY;
+    };
+
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
   // Lock page scroll when modal or mobile nav is open
@@ -471,7 +502,7 @@ export default function AIInterviewPrep() {
 
         {/* Search bar */}
         <div className="border-t border-zinc-800 bg-zinc-950">
-          <div className="mx-auto max-w-7xl px-4 sm:px-6 py-4">
+          <div className={`mx-auto max-w-7xl px-4 sm:px-6 transition-[padding] duration-300 ${filtersCollapsed ? 'py-2.5' : 'py-4'}`}>
             <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
               <div className="relative flex-1">
                 <Search className="absolute left-4 top-3.5 h-4 w-4 text-zinc-500" />
@@ -523,89 +554,124 @@ export default function AIInterviewPrep() {
               </div>
             </div>
 
-            {/* Results summary + Filters */}
-            <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
-              <div className="flex items-center gap-2">
-                {isSearching ? (
-                  <span>
-                    <span className="text-blue-400 font-medium">{visibleQuestionCount}</span>
-                    <span className="text-zinc-500"> result{visibleQuestionCount === 1 ? '' : 's'} for “{searchTerm}”</span>
-                  </span>
-                ) : showFavoritesOnly ? (
-                  <span className="text-rose-400 font-medium">
-                    {visibleQuestionCount} favorite{visibleQuestionCount === 1 ? '' : 's'}
-                  </span>
-                ) : (
-                  <span className="text-zinc-500">
-                    Showing <span className="text-zinc-300">{visibleQuestionCount}</span> / {data.stats.totalQuestions}
+            {/* Compact active-filter hint when collapsed */}
+            {filtersCollapsed && (searchTerm || showFavoritesOnly || activeSectionFilter) && (
+              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                {activeSectionFilter && (
+                  <span className="rounded-full border border-blue-500/30 bg-blue-500/10 px-2.5 py-0.5 text-blue-300">
+                    {data.sections.find((s) => s.id === activeSectionFilter)?.title ?? 'Section filter'}
                   </span>
                 )}
-                
-                {expandedCount > 0 && (
-                  <span className="stat-pill">
-                    {expandedCount} open
+                {showFavoritesOnly && (
+                  <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2.5 py-0.5 text-rose-300">
+                    Favorites only
                   </span>
                 )}
-              </div>
-
-              {/* Favorites toggle */}
-              <button
-                onClick={() => setShowFavoritesOnly(!showFavoritesOnly)}
-                className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium border transition-all ${
-                  showFavoritesOnly 
-                    ? 'bg-rose-500/10 text-rose-400 border-rose-500/30' 
-                    : 'bg-zinc-900 border-zinc-800 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-300'
-                }`}
-              >
-                <Heart className={`h-3.5 w-3.5 ${showFavoritesOnly ? 'fill-current' : ''}`} />
-                Favorites
-                {favorites.size > 0 && (
-                  <span className="ml-0.5 px-1.5 rounded bg-zinc-950/60">{favorites.size}</span>
+                {searchTerm && (
+                  <span className="rounded-full border border-zinc-700 bg-zinc-900 px-2.5 py-0.5 text-zinc-400">
+                    Search: “{searchTerm.length > 24 ? `${searchTerm.slice(0, 24)}…` : searchTerm}”
+                  </span>
                 )}
-              </button>
-
-              {(searchTerm || showFavoritesOnly || activeSectionFilter) && (
                 <button
                   onClick={() => {
                     setSearchTerm('');
                     setShowFavoritesOnly(false);
                     setActiveSectionFilter(null);
                   }}
-                  className="text-xs text-zinc-400 hover:text-white underline"
+                  className="text-zinc-500 underline hover:text-white"
                 >
-                  Clear all filters
+                  Clear
                 </button>
-              )}
-            </div>
-
-            {/* Quick section filters */}
-            {!showFavoritesOnly && (
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                <button
-                  onClick={() => setActiveSectionFilter(null)}
-                  className={`filter-pill text-xs px-3 py-1 rounded-full border text-zinc-400 ${
-                    !activeSectionFilter 
-                      ? 'active' 
-                      : 'border-zinc-800 bg-zinc-900'
-                  }`}
-                >
-                  All sections
-                </button>
-                {data.sections.map((section) => (
-                  <button
-                    key={section.id}
-                    onClick={() => setActiveSectionFilter(section.id === activeSectionFilter ? null : section.id)}
-                    className={`filter-pill text-xs px-3 py-1 rounded-full border ${
-                      activeSectionFilter === section.id 
-                        ? 'active' 
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-300'
-                    }`}
-                  >
-                    {section.number}. {section.title.split(' ').slice(0, 3).join(' ')}
-                  </button>
-                ))}
               </div>
             )}
+
+            {/* Results summary + Filters — collapses on scroll */}
+            <div className={`header-filters ${filtersCollapsed ? 'header-filters-collapsed' : ''}`}>
+              <div className="header-filters-inner">
+                <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+                  <div className="flex items-center gap-2">
+                    {isSearching ? (
+                      <span>
+                        <span className="text-blue-400 font-medium">{visibleQuestionCount}</span>
+                        <span className="text-zinc-500"> result{visibleQuestionCount === 1 ? '' : 's'} for “{searchTerm}”</span>
+                      </span>
+                    ) : showFavoritesOnly ? (
+                      <span className="text-rose-400 font-medium">
+                        {visibleQuestionCount} favorite{visibleQuestionCount === 1 ? '' : 's'}
+                      </span>
+                    ) : (
+                      <span className="text-zinc-500">
+                        Showing <span className="text-zinc-300">{visibleQuestionCount}</span> / {data.stats.totalQuestions}
+                      </span>
+                    )}
+
+                    {expandedCount > 0 && (
+                      <span className="stat-pill">
+                        {expandedCount} open
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Favorites toggle */}
+                  <button
+                    onClick={() => setShowFavoritesOnly(!showFavoritesOnly)}
+                    className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium border transition-all ${
+                      showFavoritesOnly
+                        ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
+                        : 'bg-zinc-900 border-zinc-800 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-300'
+                    }`}
+                  >
+                    <Heart className={`h-3.5 w-3.5 ${showFavoritesOnly ? 'fill-current' : ''}`} />
+                    Favorites
+                    {isMounted && favorites.size > 0 && (
+                      <span className="ml-0.5 px-1.5 rounded bg-zinc-950/60">{favorites.size}</span>
+                    )}
+                  </button>
+
+                  {(searchTerm || showFavoritesOnly || activeSectionFilter) && (
+                    <button
+                      onClick={() => {
+                        setSearchTerm('');
+                        setShowFavoritesOnly(false);
+                        setActiveSectionFilter(null);
+                      }}
+                      className="text-xs text-zinc-400 hover:text-white underline"
+                    >
+                      Clear all filters
+                    </button>
+                  )}
+                </div>
+
+                {/* Quick section filters */}
+                {!showFavoritesOnly && (
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    <button
+                      onClick={() => setActiveSectionFilter(null)}
+                      className={`filter-pill text-xs px-3 py-1 rounded-full border text-zinc-400 ${
+                        !activeSectionFilter
+                          ? 'active'
+                          : 'border-zinc-800 bg-zinc-900'
+                      }`}
+                    >
+                      All sections
+                    </button>
+                    {data.sections.map((section) => (
+                      <button
+                        key={section.id}
+                        onClick={() => setActiveSectionFilter(section.id === activeSectionFilter ? null : section.id)}
+                        className={`filter-pill text-xs px-3 py-1 rounded-full border ${
+                          activeSectionFilter === section.id
+                            ? 'active'
+                            : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-300'
+                        }`}
+                      >
+                        {section.number}. {section.title.split(' ').slice(0, 3).join(' ')}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       </header>
@@ -812,8 +878,8 @@ export default function AIInterviewPrep() {
                                   </div>
                                 )}
 
-                                {/* Viewed indicator */}
-                                {viewedQuestions.has(q.id) && !isExpanded && (
+                                {/* Viewed indicator (only after client mount to avoid hydration mismatch) */}
+                                {isMounted && viewedQuestions.has(q.id) && !isExpanded && (
                                   <div className="mt-1 flex items-center gap-1 text-[11px] text-emerald-600/80">
                                     <Check className="h-3 w-3" /> viewed
                                   </div>

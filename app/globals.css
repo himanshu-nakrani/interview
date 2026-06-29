@@ -212,6 +212,24 @@ mark {
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* Collapsible header filters */
+.header-filters {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.28s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.22s ease;
+  opacity: 1;
+}
+
+.header-filters-collapsed {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.header-filters-inner {
+  overflow: hidden;
+}
+
 /* Pills */
 .filter-pill {
   transition: all 0.1s ease;
