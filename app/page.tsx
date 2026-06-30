@@ -464,7 +464,7 @@ export default function AIInterviewPrep() {
   const isSearching = searchTerm.trim().length > 0;
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-200">
+    <div className="min-h-screen bg-zinc-950 text-zinc-300">
       {/* Top nav / header */}
       <header
         ref={headerRef}
@@ -477,7 +477,7 @@ export default function AIInterviewPrep() {
                 <BookOpen className="h-5 w-5" />
               </div>
               <div>
-                <div className="font-semibold tracking-tight text-xl">AI Engineering</div>
+                <div className="text-lg font-medium text-zinc-200">AI Engineering</div>
                 <div className="text-[10px] text-zinc-500 -mt-1">INTERVIEW PREP</div>
               </div>
             </div>
@@ -512,7 +512,7 @@ export default function AIInterviewPrep() {
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                   placeholder="Search questions and answers... (press / to focus)"
-                  className="search-input w-full rounded-xl pl-11 pr-10 py-3 text-base placeholder:text-zinc-500 focus:ring-0"
+                  className="search-input w-full rounded-xl pl-11 pr-10 py-3 placeholder:text-zinc-600 focus:ring-0"
                 />
                 {searchTerm && (
                   <button
@@ -687,7 +687,7 @@ export default function AIInterviewPrep() {
                 maxHeight: 'calc(100vh - var(--site-header-height, 7rem) - 1rem)',
               }}
             >
-              <div className="mb-3 px-3 text-xs font-semibold uppercase tracking-[1px] text-zinc-500">
+              <div className="mb-3 px-3 text-[11px] font-medium uppercase tracking-wide text-zinc-600">
                 Contents
               </div>
               <nav className="space-y-0.5">
@@ -707,7 +707,7 @@ export default function AIInterviewPrep() {
                       key={section.id}
                       onClick={() => scrollToSection(section.id)}
                       className={`toc-link flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm ${
-                        isActive || isFiltered ? 'active text-white bg-zinc-900' : 'text-zinc-400 hover:text-zinc-200'
+                        isActive || isFiltered ? 'active text-zinc-200 bg-zinc-900' : 'text-zinc-500 hover:text-zinc-300'
                       }`}
                     >
                       <span className="truncate pr-3">
@@ -736,7 +736,7 @@ export default function AIInterviewPrep() {
                 onClick={(e) => e.stopPropagation()}
               >
                 <div className="flex justify-between items-center mb-4">
-                  <div className="text-sm font-semibold">Sections</div>
+                  <div className="text-sm font-medium text-zinc-300">Sections</div>
                   <button onClick={() => setShowMobileToc(false)}>
                     <X className="h-5 w-5" />
                   </button>
@@ -810,7 +810,7 @@ export default function AIInterviewPrep() {
                     <div className="font-mono text-xs text-blue-500 tracking-[1.5px]">
                       SECTION {section.number}
                     </div>
-                    <h2 className="text-xl sm:text-2xl font-semibold tracking-tight break-words">{section.title}</h2>
+                    <h2 className="text-lg sm:text-xl font-medium text-zinc-200 break-words">{section.title}</h2>
                   </div>
 
                   <div className="flex shrink-0 items-center gap-2 self-start sm:self-auto">
@@ -867,7 +867,7 @@ export default function AIInterviewPrep() {
                               </div>
 
                               <div className="flex-1 min-w-0 pr-1">
-                                <div className="question-text group-hover:text-white break-words">
+                                <div className="question-text group-hover:text-zinc-100 break-words">
                                   {highlightText(q.question, searchTerm)}
                                 </div>
 
@@ -1040,7 +1040,7 @@ export default function AIInterviewPrep() {
               onClick={(e) => e.stopPropagation()}
             >
               <div className="mb-5 flex shrink-0 items-start justify-between gap-4">
-                <div className="pr-2 text-lg font-medium leading-tight text-zinc-100 break-words sm:pr-6 sm:text-xl">
+                <div className="pr-2 text-base font-medium leading-snug text-zinc-200 break-words sm:pr-6 sm:text-lg">
                   {focusQuestion.question}
                 </div>
                 <button 

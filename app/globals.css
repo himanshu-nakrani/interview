@@ -1,8 +1,6 @@
 @import "tailwindcss";
 
 :root {
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
   --site-header-height: 7rem;
 }
 
@@ -11,7 +9,10 @@ html {
 }
 
 body {
-  font-family: var(--font-geist-sans);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: 0.01em;
   overflow-x: hidden;
 }
 
@@ -31,9 +32,10 @@ body {
 }
 
 .prose {
-  color: #d1d5db;
-  line-height: 1.8;
-  font-size: 15.5px;
+  color: #a8a8b3;
+  line-height: 1.75;
+  font-size: 14.5px;
+  font-weight: 400;
 }
 
 .prose p {
@@ -63,7 +65,7 @@ body {
   padding: 0.15em 0.5em;
   border-radius: 6px;
   font-size: 0.875em;
-  font-family: var(--font-geist-mono);
+  font-family: var(--font-mono), ui-monospace, monospace;
   border: 1px solid #2a2f38;
   color: #e5e7eb;
 }
@@ -86,8 +88,8 @@ body {
 }
 
 .prose strong {
-  color: #f3f4f6;
-  font-weight: 600;
+  color: #d4d4d8;
+  font-weight: 500;
 }
 
 .prose blockquote {
@@ -99,7 +101,8 @@ body {
 }
 
 .prose h1, .prose h2, .prose h3 {
-  color: #f1f5f9;
+  color: #d4d4d8;
+  font-weight: 500;
   margin-top: 1.1em;
   margin-bottom: 0.4em;
 }
@@ -131,16 +134,16 @@ body {
 }
 
 .question-text {
-  font-size: 15.5px;
-  line-height: 1.45;
-  font-weight: 500;
-  color: #e4e4e7;
+  font-size: 14.5px;
+  line-height: 1.55;
+  font-weight: 400;
+  color: #c8c8d0;
 }
 
 .question-preview {
-  font-size: 13.5px;
-  color: #71717a;
-  line-height: 1.45;
+  font-size: 13px;
+  color: #6b6b76;
+  line-height: 1.5;
   margin-top: 6px;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -152,6 +155,8 @@ body {
 .search-input {
   background: #0f0f12;
   border: 1px solid #262626;
+  font-size: 14px;
+  font-weight: 400;
   transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
@@ -163,11 +168,11 @@ body {
 
 /* Highlighting */
 mark {
-  background-color: rgba(234, 179, 8, 0.25);
-  color: #fde047;
+  background-color: rgba(234, 179, 8, 0.18);
+  color: #e8c84a;
   padding: 0.05em 0.15em;
   border-radius: 3px;
-  font-weight: 500;
+  font-weight: 400;
 }
 
 /* TOC */
@@ -181,12 +186,12 @@ mark {
 }
 
 .toc-link:hover {
-  color: #fff;
+  color: #d4d4d8;
   background: #1f1f25;
 }
 
 .toc-link.active {
-  color: #fff;
+  color: #d4d4d8;
   background: #1f1f25;
 }
 
@@ -273,8 +278,9 @@ mark {
 }
 
 .focus-modal .prose {
-  font-size: 15.8px;
-  max-width: 72ch;
+  font-size: 15px;
+  line-height: 1.8;
+  max-width: 68ch;
 }
 
 .sidebar-panel {
@@ -304,10 +310,10 @@ mark {
 }
 
 .answer-header {
-  font-size: 12px;
-  letter-spacing: 0.5px;
-  color: #3b82f6;
-  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.35px;
+  color: #5b8fd9;
+  font-weight: 500;
   margin-bottom: 4px;
   display: flex;
   align-items: center;
