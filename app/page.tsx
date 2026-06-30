@@ -63,7 +63,6 @@ export default function AIInterviewPrep() {
     loadStoredSet('ai-interview-favorites')
   );
   const [showFavoritesOnly, setShowFavoritesOnly] = useState(false);
-  const [activeSectionFilter, setActiveSectionFilter] = useState<string | null>(null);
   const [focusQuestion, setFocusQuestion] = useState<Question | null>(null);
   const [viewedQuestions, setViewedQuestions] = useState<Set<string>>(() =>
     loadStoredSet('ai-interview-viewed')
@@ -267,14 +266,9 @@ export default function AIInterviewPrep() {
     return preview;
   };
 
-  // Global search + favorites + section filter
+  // Global search + favorites filter
   const filteredSections = useMemo(() => {
     let sections = data.sections;
-
-    // Section filter
-    if (activeSectionFilter) {
-      sections = sections.filter(s => s.id === activeSectionFilter);
-    }
 
     // Apply search
     const term = searchTerm.toLowerCase().trim();
@@ -302,7 +296,7 @@ export default function AIInterviewPrep() {
     }
 
     return sections;
-  }, [searchTerm, showFavoritesOnly, favorites, activeSectionFilter]);
+  }, [searchTerm, showFavoritesOnly, favorites]);
 
   // Auto-expand all matching results when searching
   const searchExpandedIds = useMemo(() => {
@@ -573,13 +567,8 @@ export default function AIInterviewPrep() {
             </div>
 
             {/* Compact active-filter hint when collapsed */}
-            {filtersCollapsed && (searchTerm || showFavoritesOnly || activeSectionFilter) && (
+            {filtersCollapsed && (searchTerm || showFavoritesOnly) && (
               <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                {activeSectionFilter && (
-                  <span className="rounded-full border border-blue-500/30 bg-blue-500/10 px-2.5 py-0.5 text-blue-300">
-                    {data.sections.find((s) => s.id === activeSectionFilter)?.title ?? 'Section filter'}
-                  </span>
-                )}
                 {showFavoritesOnly && (
                   <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2.5 py-0.5 text-rose-300">
                     Favorites only
@@ -594,7 +583,6 @@ export default function AIInterviewPrep() {
                   onClick={() => {
                     setSearchTerm('');
                     setShowFavoritesOnly(false);
-                    setActiveSectionFilter(null);
                   }}
                   className="text-zinc-500 underline hover:text-white"
                 >
@@ -646,12 +634,11 @@ export default function AIInterviewPrep() {
                     )}
                   </button>
 
-                  {(searchTerm || showFavoritesOnly || activeSectionFilter) && (
+                  {(searchTerm || showFavoritesOnly) && (
                     <button
                       onClick={() => {
                         setSearchTerm('');
                         setShowFavoritesOnly(false);
-                        setActiveSectionFilter(null);
                       }}
                       className="text-xs text-zinc-400 hover:text-white underline"
                     >
@@ -659,35 +646,6 @@ export default function AIInterviewPrep() {
                     </button>
                   )}
                 </div>
-
-                {/* Quick section filters */}
-                {!showFavoritesOnly && (
-                  <div className="mt-3 flex flex-wrap gap-1.5">
-                    <button
-                      onClick={() => setActiveSectionFilter(null)}
-                      className={`filter-pill text-xs px-3 py-1 rounded-full border text-zinc-400 ${
-                        !activeSectionFilter
-                          ? 'active'
-                          : 'border-zinc-800 bg-zinc-900'
-                      }`}
-                    >
-                      All sections
-                    </button>
-                    {data.sections.map((section) => (
-                      <button
-                        key={section.id}
-                        onClick={() => setActiveSectionFilter(section.id === activeSectionFilter ? null : section.id)}
-                        className={`filter-pill text-xs px-3 py-1 rounded-full border ${
-                          activeSectionFilter === section.id
-                            ? 'active'
-                            : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-300'
-                        }`}
-                      >
-                        {section.number}. {section.title.split(' ').slice(0, 3).join(' ')}
-                      </button>
-                    ))}
-                  </div>
-                )}
               </div>
             </div>
           </div>
@@ -741,7 +699,6 @@ export default function AIInterviewPrep() {
                     {data.sections.map((section) => {
                       const originalCount = section.questions.length;
                       const isActive = activeSection === section.id;
-                      const isFiltered = activeSectionFilter === section.id;
 
                       let displayCount = originalCount;
                       if (showFavoritesOnly) {
@@ -753,7 +710,7 @@ export default function AIInterviewPrep() {
                           key={section.id}
                           onClick={() => scrollToSection(section.id)}
                           className={`toc-link flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm ${
-                            isActive || isFiltered
+                            isActive
                               ? 'active text-zinc-200 bg-zinc-900'
                               : 'text-zinc-500 hover:text-zinc-300'
                           }`}
@@ -778,7 +735,6 @@ export default function AIInterviewPrep() {
                 <nav className="flex flex-col items-center gap-1 px-1">
                   {data.sections.map((section) => {
                     const isActive = activeSection === section.id;
-                    const isFiltered = activeSectionFilter === section.id;
 
                     return (
                       <button
@@ -786,7 +742,7 @@ export default function AIInterviewPrep() {
                         onClick={() => scrollToSection(section.id)}
                         title={`${section.number}. ${section.title}`}
                         className={`toc-mini-link flex h-7 w-7 items-center justify-center rounded-md border text-[10px] font-mono tabular-nums transition-colors ${
-                          isActive || isFiltered
+                          isActive
                             ? 'border-blue-500/40 bg-blue-500/10 text-blue-300'
                             : 'border-zinc-800 bg-zinc-900 text-zinc-500 hover:border-zinc-700 hover:bg-zinc-800 hover:text-zinc-300'
                         }`}
@@ -834,7 +790,7 @@ export default function AIInterviewPrep() {
           {/* Main content */}
           <main className="flex-1 min-w-0">
             {/* Intro banner */}
-            {!isSearching && !showFavoritesOnly && !activeSectionFilter && (
+            {!isSearching && !showFavoritesOnly && (
               <div className="mb-8 rounded-3xl border border-zinc-800 bg-zinc-900/50 px-6 py-6">
                 <div className="max-w-2xl">
                   <p className="text-[15px] leading-relaxed text-zinc-400">

@@ -235,23 +235,6 @@ mark {
   overflow: hidden;
 }
 
-/* Pills */
-.filter-pill {
-  transition: all 0.1s ease;
-  white-space: nowrap;
-}
-
-.filter-pill:hover {
-  background-color: #1f1f25;
-  border-color: #3f3f46;
-}
-
-.filter-pill.active {
-  background-color: #1e3a8a;
-  border-color: #3b82f6;
-  color: #bfdbfe;
-}
-
 /* Action buttons */
 .action-btn {
   transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1);
