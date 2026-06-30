@@ -288,6 +288,14 @@ mark {
   scrollbar-color: #3f3f46 transparent;
 }
 
+.sidebar-aside {
+  will-change: width;
+}
+
+.toc-mini-link {
+  flex-shrink: 0;
+}
+
 .section-expand-btn {
   font-size: 12px;
   padding: 2px 9px;

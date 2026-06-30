@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState, useMemo, useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
-import { Search, Copy, ChevronDown, ChevronUp, X, BookOpen, Menu, Heart, Shuffle, Link2, Eye, Check } from 'lucide-react';
+import { Search, Copy, ChevronDown, ChevronUp, X, BookOpen, Menu, Heart, Shuffle, Link2, Eye, Check, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -43,6 +43,17 @@ function loadStoredSet(key: string): Set<string> {
   return new Set();
 }
 
+function loadStoredBoolean(key: string, fallback = false): boolean {
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const saved = localStorage.getItem(key);
+    if (saved !== null) return saved === 'true';
+  } catch {
+    // ignore invalid stored data
+  }
+  return fallback;
+}
+
 export default function AIInterviewPrep() {
   const [searchTerm, setSearchTerm] = useState('');
   const [activeSection, setActiveSection] = useState<string | null>(null);
@@ -67,6 +78,9 @@ export default function AIInterviewPrep() {
   const lastScrollY = useRef(0);
   const [headerHeight, setHeaderHeight] = useState(112);
   const [filtersCollapsed, setFiltersCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() =>
+    loadStoredBoolean('ai-interview-sidebar-collapsed')
+  );
 
   const getScrollOffset = useCallback((extra = 12) => headerHeight + extra, [headerHeight]);
 
@@ -143,6 +157,10 @@ export default function AIInterviewPrep() {
   useEffect(() => {
     localStorage.setItem('ai-interview-viewed', JSON.stringify(Array.from(viewedQuestions)));
   }, [viewedQuestions]);
+
+  useEffect(() => {
+    localStorage.setItem('ai-interview-sidebar-collapsed', String(sidebarCollapsed));
+  }, [sidebarCollapsed]);
 
   // Deep link support: open specific question from URL hash
   useEffect(() => {
@@ -679,7 +697,11 @@ export default function AIInterviewPrep() {
       <div className="mx-auto max-w-7xl px-4 sm:px-6">
         <div className="flex flex-col lg:flex-row gap-8 pt-6 pb-24">
           {/* Sidebar TOC */}
-          <aside className="hidden lg:block w-72 shrink-0">
+          <aside
+            className={`sidebar-aside hidden shrink-0 transition-[width] duration-300 ease-out lg:block ${
+              sidebarCollapsed ? 'w-11' : 'w-72'
+            }`}
+          >
             <div
               className="sidebar-panel sticky overflow-y-auto overscroll-contain"
               style={{
@@ -687,44 +709,94 @@ export default function AIInterviewPrep() {
                 maxHeight: 'calc(100vh - var(--site-header-height, 7rem) - 1rem)',
               }}
             >
-              <div className="mb-3 px-3 text-[11px] font-medium uppercase tracking-wide text-zinc-600">
-                Contents
+              <div
+                className={`mb-3 flex items-center ${
+                  sidebarCollapsed ? 'justify-center px-1' : 'justify-between px-2'
+                }`}
+              >
+                {!sidebarCollapsed && (
+                  <div className="px-1 text-[11px] font-medium uppercase tracking-wide text-zinc-600">
+                    Contents
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setSidebarCollapsed((prev) => !prev)}
+                  className="flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 transition-colors hover:border-zinc-700 hover:bg-zinc-800 hover:text-zinc-200"
+                  title={sidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
+                  aria-label={sidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
+                  aria-expanded={!sidebarCollapsed}
+                >
+                  {sidebarCollapsed ? (
+                    <PanelLeftOpen className="h-4 w-4" />
+                  ) : (
+                    <PanelLeftClose className="h-4 w-4" />
+                  )}
+                </button>
               </div>
-              <nav className="space-y-0.5">
-                {data.sections.map((section) => {
-                  const originalCount = section.questions.length;
-                  const isActive = activeSection === section.id;
-                  const isFiltered = activeSectionFilter === section.id;
-                  
-                  // Count how many would be shown in current filters
-                  let displayCount = originalCount;
-                  if (showFavoritesOnly) {
-                    displayCount = section.questions.filter(q => favorites.has(q.id)).length;
-                  }
-                  
-                  return (
-                    <button
-                      key={section.id}
-                      onClick={() => scrollToSection(section.id)}
-                      className={`toc-link flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm ${
-                        isActive || isFiltered ? 'active text-zinc-200 bg-zinc-900' : 'text-zinc-500 hover:text-zinc-300'
-                      }`}
-                    >
-                      <span className="truncate pr-3">
-                        {section.number}. {section.title}
-                      </span>
-                      <span className="font-mono text-[10px] text-zinc-600 tabular-nums shrink-0">
-                        {displayCount}
-                      </span>
-                    </button>
-                  );
-                })}
-              </nav>
 
-              <div className="mt-8 px-3 text-[11px] text-zinc-500 leading-relaxed">
-                Press <kbd className="rounded bg-zinc-900 px-1.5 py-px font-mono text-[10px]">/</kbd> to search<br />
-                <span className="text-zinc-600">Click cards to expand • Heart to favorite</span>
-              </div>
+              {!sidebarCollapsed ? (
+                <>
+                  <nav className="space-y-0.5">
+                    {data.sections.map((section) => {
+                      const originalCount = section.questions.length;
+                      const isActive = activeSection === section.id;
+                      const isFiltered = activeSectionFilter === section.id;
+
+                      let displayCount = originalCount;
+                      if (showFavoritesOnly) {
+                        displayCount = section.questions.filter((q) => favorites.has(q.id)).length;
+                      }
+
+                      return (
+                        <button
+                          key={section.id}
+                          onClick={() => scrollToSection(section.id)}
+                          className={`toc-link flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm ${
+                            isActive || isFiltered
+                              ? 'active text-zinc-200 bg-zinc-900'
+                              : 'text-zinc-500 hover:text-zinc-300'
+                          }`}
+                        >
+                          <span className="truncate pr-3">
+                            {section.number}. {section.title}
+                          </span>
+                          <span className="font-mono text-[10px] text-zinc-600 tabular-nums shrink-0">
+                            {displayCount}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </nav>
+
+                  <div className="mt-8 px-3 text-[11px] text-zinc-500 leading-relaxed">
+                    Press <kbd className="rounded bg-zinc-900 px-1.5 py-px font-mono text-[10px]">/</kbd> to search<br />
+                    <span className="text-zinc-600">Click cards to expand • Heart to favorite</span>
+                  </div>
+                </>
+              ) : (
+                <nav className="flex flex-col items-center gap-1 px-1">
+                  {data.sections.map((section) => {
+                    const isActive = activeSection === section.id;
+                    const isFiltered = activeSectionFilter === section.id;
+
+                    return (
+                      <button
+                        key={section.id}
+                        onClick={() => scrollToSection(section.id)}
+                        title={`${section.number}. ${section.title}`}
+                        className={`toc-mini-link flex h-7 w-7 items-center justify-center rounded-md border text-[10px] font-mono tabular-nums transition-colors ${
+                          isActive || isFiltered
+                            ? 'border-blue-500/40 bg-blue-500/10 text-blue-300'
+                            : 'border-zinc-800 bg-zinc-900 text-zinc-500 hover:border-zinc-700 hover:bg-zinc-800 hover:text-zinc-300'
+                        }`}
+                      >
+                        {section.number}
+                      </button>
+                    );
+                  })}
+                </nav>
+              )}
             </div>
           </aside>
 
