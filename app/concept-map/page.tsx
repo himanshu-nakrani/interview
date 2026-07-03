@@ -138,9 +138,13 @@ export default function ConceptMapPage() {
   }, [query]);
 
   const relatedSections = useMemo(() => {
-    return edges
+    const relatedIds = new Set(
+      edges
       .filter(([from, to]) => from === selectedId || to === selectedId)
       .map(([from, to]) => (from === selectedId ? to : from))
+    );
+
+    return Array.from(relatedIds)
       .map((id) => data.sections.find((section) => section.id === id))
       .filter(Boolean) as Section[];
   }, [selectedId]);
