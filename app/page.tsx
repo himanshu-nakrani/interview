@@ -31,6 +31,8 @@ interface Data {
 }
 
 const data = rawData as Data;
+const FAST_MODAL_TRANSITION = { duration: 0.08, ease: [0.32, 0.72, 0, 1] } as const;
+const AUTO_EXPAND_SEARCH_LIMIT = 12;
 
 function loadStoredSet(key: string): Set<string> {
   if (typeof window === 'undefined') return new Set();
@@ -175,7 +177,7 @@ export default function AIInterviewPrep() {
               const el = document.getElementById(`card-${hash}`);
               if (el) {
                 const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-                window.scrollTo({ top, behavior: 'smooth' });
+                window.scrollTo({ top, behavior: 'auto' });
               }
             }, 80);
             break;
@@ -301,6 +303,9 @@ export default function AIInterviewPrep() {
   // Auto-expand all matching results when searching
   const searchExpandedIds = useMemo(() => {
     if (!searchTerm.trim()) return null;
+    const matchCount = filteredSections.reduce((sum, s) => sum + s.questions.length, 0);
+    if (matchCount > AUTO_EXPAND_SEARCH_LIMIT) return null;
+
     const allMatching = new Set<string>();
     filteredSections.forEach((s) =>
       s.questions.forEach((q) => allMatching.add(q.id))
@@ -314,6 +319,12 @@ export default function AIInterviewPrep() {
   const visibleQuestionCount = useMemo(() => {
     return filteredSections.reduce((sum, s) => sum + s.questions.length, 0);
   }, [filteredSections]);
+
+  const viewedCount = useMemo(() => viewedQuestions.size, [viewedQuestions]);
+  const progressPercentage = Math.min(
+    100,
+    Math.round((viewedCount / data.stats.totalQuestions) * 100)
+  );
 
   // Stats for current view
   const expandedCount = useMemo(() => {
@@ -397,7 +408,7 @@ export default function AIInterviewPrep() {
       const el = document.getElementById(`card-${randomQ.id}`);
       if (el) {
         const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-        window.scrollTo({ top, behavior: 'smooth' });
+        window.scrollTo({ top, behavior: 'auto' });
       }
     }, 50);
 
@@ -414,13 +425,20 @@ export default function AIInterviewPrep() {
       section.questions.forEach(q => {
         if (expand) {
           next.add(q.id);
-          markAsViewed(q.id);
         } else {
           next.delete(q.id);
         }
       });
       return next;
     });
+
+    if (expand) {
+      setViewedQuestions(prev => {
+        const next = new Set(prev);
+        section.questions.forEach(q => next.add(q.id));
+        return next;
+      });
+    }
   };
 
   // Scroll to section
@@ -428,7 +446,7 @@ export default function AIInterviewPrep() {
     const el = document.getElementById(sectionId);
     if (el) {
       const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-      window.scrollTo({ top, behavior: 'smooth' });
+      window.scrollTo({ top, behavior: 'auto' });
       setActiveSection(sectionId);
       setShowMobileToc(false);
     }
@@ -476,45 +494,41 @@ export default function AIInterviewPrep() {
   const isSearching = searchTerm.trim().length > 0;
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-300">
+    <div className="app-shell min-h-screen bg-zinc-950 text-zinc-300">
       {/* Top nav / header */}
       <header
         ref={headerRef}
-        className="sticky top-0 z-50 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur supports-[backdrop-filter]:bg-zinc-950/80"
+        className="sticky top-0 z-50 border-b border-zinc-800/80 bg-zinc-950/92 shadow-[0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-xl supports-[backdrop-filter]:bg-zinc-950/78"
       >
         <div className="mx-auto max-w-7xl px-4 sm:px-6">
           <div className="flex h-16 items-center justify-between gap-4">
             <div className="flex items-center gap-3">
-              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600">
+              <div className="brand-mark flex h-9 w-9 items-center justify-center rounded-lg">
                 <BookOpen className="h-5 w-5" />
               </div>
               <div>
-                <div className="text-lg font-medium text-zinc-200">AI Engineering</div>
-                <div className="text-[10px] text-zinc-500 -mt-1">INTERVIEW PREP</div>
+                <div className="text-lg font-semibold text-zinc-100">AI Engineering</div>
+                <div className="-mt-1 text-[10px] font-medium uppercase tracking-[0.18em] text-zinc-500">Interview Prep</div>
               </div>
             </div>
 
             <div className="flex items-center gap-3 text-sm">
-              <div className="hidden sm:flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1 text-xs text-zinc-400">
+              <div className="hidden sm:flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 px-3 py-1 text-xs text-zinc-400">
                 <span>{data.stats.totalQuestions} questions</span>
                 <span className="text-zinc-700">•</span>
                 <span>{data.stats.totalSections} sections</span>
               </div>
-              <a
-                href="https://github.com"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="hidden md:inline text-sm text-zinc-400 hover:text-white transition-colors"
-              >
-                Source
-              </a>
+              <div className="hidden md:flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-300">
+                <Check className="h-3.5 w-3.5" />
+                <span>{progressPercentage}% viewed</span>
+              </div>
             </div>
           </div>
         </div>
 
         {/* Search bar */}
-        <div className="border-t border-zinc-800 bg-zinc-950">
-          <div className={`mx-auto max-w-7xl px-4 sm:px-6 transition-[padding] duration-300 ${filtersCollapsed ? 'py-2.5' : 'py-4'}`}>
+        <div className="border-t border-zinc-800/70 bg-zinc-950/86">
+          <div className={`mx-auto max-w-7xl px-4 sm:px-6 transition-[padding] duration-100 ${filtersCollapsed ? 'py-2.5' : 'py-4'}`}>
             <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
               <div className="relative flex-1">
                 <Search className="absolute left-4 top-3.5 h-4 w-4 text-zinc-500" />
@@ -523,7 +537,7 @@ export default function AIInterviewPrep() {
                   type="text"
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
-                  placeholder="Search questions and answers... (press / to focus)"
+                  placeholder="Search questions and answers..."
                   className="search-input w-full rounded-xl pl-11 pr-10 py-3 placeholder:text-zinc-600 focus:ring-0"
                 />
                 {searchTerm && (
@@ -539,7 +553,7 @@ export default function AIInterviewPrep() {
               <div className="flex flex-wrap items-center justify-end gap-2">
                 <button
                   onClick={goToRandomQuestion}
-                  className="flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 hover:bg-zinc-800 hover:border-yellow-900/50 px-4 py-3 text-sm font-medium transition-colors action-btn"
+                  className="primary-action flex items-center gap-1.5 rounded-lg px-4 py-3 text-sm font-semibold transition-colors"
                   title="Load a random question (great for practice)"
                 >
                   <Shuffle className="h-4 w-4" />
@@ -547,19 +561,20 @@ export default function AIInterviewPrep() {
                 </button>
                 <button
                   onClick={expandAll}
-                  className="flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 hover:bg-zinc-800 px-4 py-3 text-sm font-medium transition-colors action-btn"
+                  className="soft-btn flex items-center gap-1.5 rounded-lg px-4 py-3 text-sm font-medium transition-colors"
                 >
                   <ChevronDown className="h-4 w-4" /> <span className="hidden sm:inline">Expand</span>
                 </button>
                 <button
                   onClick={collapseAll}
-                  className="flex items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-900 hover:bg-zinc-800 px-4 py-3 text-sm font-medium transition-colors action-btn"
+                  className="soft-btn flex items-center gap-1.5 rounded-lg px-4 py-3 text-sm font-medium transition-colors"
                 >
                   <ChevronUp className="h-4 w-4" /> <span className="hidden sm:inline">Collapse</span>
                 </button>
                 <button
                   onClick={() => setShowMobileToc(!showMobileToc)}
-                  className="sm:hidden flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-900 px-3 py-3 text-sm"
+                  className="soft-btn flex items-center gap-2 rounded-lg px-3 py-3 text-sm sm:hidden"
+                  aria-label="Open sections"
                 >
                   <Menu className="h-4 w-4" />
                 </button>
@@ -624,7 +639,7 @@ export default function AIInterviewPrep() {
                     className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium border transition-all ${
                       showFavoritesOnly
                         ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
-                        : 'bg-zinc-900 border-zinc-800 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-300'
+                        : 'bg-zinc-900/80 border-zinc-800 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-300'
                     }`}
                   >
                     <Heart className={`h-3.5 w-3.5 ${showFavoritesOnly ? 'fill-current' : ''}`} />
@@ -656,12 +671,12 @@ export default function AIInterviewPrep() {
         <div className="flex flex-col lg:flex-row gap-8 pt-6 pb-24">
           {/* Sidebar TOC */}
           <aside
-            className={`sidebar-aside hidden shrink-0 transition-[width] duration-300 ease-out lg:block ${
+            className={`sidebar-aside hidden shrink-0 transition-[width] duration-100 ease-out lg:block ${
               sidebarCollapsed ? 'w-11' : 'w-72'
             }`}
           >
             <div
-              className="sidebar-panel sticky overflow-y-auto overscroll-contain"
+              className="sidebar-panel sticky overflow-y-auto overscroll-contain rounded-lg border border-zinc-800/70 bg-zinc-950/38 p-2"
               style={{
                 top: 'var(--site-header-height, 7rem)',
                 maxHeight: 'calc(100vh - var(--site-header-height, 7rem) - 1rem)',
@@ -705,11 +720,14 @@ export default function AIInterviewPrep() {
                         displayCount = section.questions.filter((q) => favorites.has(q.id)).length;
                       }
 
+                      const viewedInSection = section.questions.filter((q) => viewedQuestions.has(q.id)).length;
+                      const sectionProgress = Math.round((viewedInSection / originalCount) * 100);
+
                       return (
                         <button
                           key={section.id}
                           onClick={() => scrollToSection(section.id)}
-                          className={`toc-link flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm ${
+                          className={`toc-link flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm ${
                             isActive
                               ? 'active text-zinc-200 bg-zinc-900'
                               : 'text-zinc-500 hover:text-zinc-300'
@@ -719,7 +737,7 @@ export default function AIInterviewPrep() {
                             {section.number}. {section.title}
                           </span>
                           <span className="font-mono text-[10px] text-zinc-600 tabular-nums shrink-0">
-                            {displayCount}
+                            {showFavoritesOnly ? displayCount : `${sectionProgress}%`}
                           </span>
                         </button>
                       );
@@ -774,7 +792,7 @@ export default function AIInterviewPrep() {
                     <button
                       key={section.id}
                       onClick={() => scrollToSection(section.id)}
-                      className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-sm hover:bg-zinc-900 text-left text-zinc-300"
+                      className="flex w-full items-center justify-between rounded-md px-3 py-2.5 text-sm hover:bg-zinc-900 text-left text-zinc-300"
                     >
                       <span>
                         {section.number}. {section.title}
@@ -791,24 +809,41 @@ export default function AIInterviewPrep() {
           <main className="flex-1 min-w-0">
             {/* Intro banner */}
             {!isSearching && !showFavoritesOnly && (
-              <div className="mb-8 rounded-3xl border border-zinc-800 bg-zinc-900/50 px-6 py-6">
-                <div className="max-w-2xl">
-                  <p className="text-[15px] leading-relaxed text-zinc-400">
-                    A concise reference covering core AI Engineering interview questions across{" "}
-                    <span className="text-zinc-300">LLMs, RAG, Agents, Fine-Tuning, Vector DBs, System Design, LLMOps, Evaluation, Safety, Multimodal, Infrastructure, and more.</span>
-                  </p>
-                  <div className="mt-4 flex flex-wrap gap-2 text-xs">
-                    <div className="rounded-full border border-zinc-800 bg-zinc-950 px-3 py-1 text-zinc-400">456 curated questions</div>
-                    <div className="rounded-full border border-zinc-800 bg-zinc-950 px-3 py-1 text-zinc-400">Favorites sync in browser</div>
-                    <div className="rounded-full border border-zinc-800 bg-zinc-950 px-3 py-1 text-zinc-400">Press <span className="font-mono">/</span> to search</div>
-                    <div className="rounded-full border border-zinc-800 bg-zinc-950 px-3 py-1 text-amber-400/90">Try Random for practice</div>
+              <div className="hero-panel mb-8 rounded-lg border border-zinc-800/80 px-5 py-5 sm:px-6 sm:py-6">
+                <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_22rem] xl:items-end">
+                  <div>
+                    <h1 className="max-w-3xl text-balance text-2xl font-semibold leading-tight text-zinc-50 sm:text-3xl">
+                      Practice high-signal AI engineering interview questions.
+                    </h1>
+                    <p className="mt-3 max-w-3xl text-[15px] leading-7 text-zinc-400">
+                      Search, drill random prompts, mark favorites, and use focus mode across LLMs, RAG, Agents, Fine-Tuning, Vector DBs, System Design, LLMOps, Evaluation, Safety, Infrastructure, and more.
+                    </p>
+                    <div className="mt-5 flex flex-wrap gap-2 text-xs">
+                      <div className="rounded-full border border-zinc-800 bg-zinc-950/80 px-3 py-1 text-zinc-400">{data.stats.totalQuestions} curated questions</div>
+                      <div className="rounded-full border border-zinc-800 bg-zinc-950/80 px-3 py-1 text-zinc-400">Favorites saved locally</div>
+                      <div className="rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-amber-300">Random drill mode</div>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 sm:gap-3 xl:grid-cols-1">
+                    <div className="metric-card">
+                      <span>Viewed</span>
+                      <strong>{viewedCount}</strong>
+                    </div>
+                    <div className="metric-card">
+                      <span>Favorites</span>
+                      <strong>{isMounted ? favorites.size : 0}</strong>
+                    </div>
+                    <div className="metric-card">
+                      <span>Progress</span>
+                      <strong>{progressPercentage}%</strong>
+                    </div>
                   </div>
                 </div>
               </div>
             )}
 
             {filteredSections.length === 0 && (
-              <div className="rounded-2xl border border-zinc-800 bg-zinc-900 p-10 text-center">
+              <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 p-10 text-center">
                 {showFavoritesOnly ? (
                   <>
                     <Heart className="mx-auto h-8 w-8 text-zinc-700 mb-3" />
@@ -833,12 +868,12 @@ export default function AIInterviewPrep() {
             {filteredSections.map((section) => (
               <div key={section.id} id={section.id} className="section-header mb-12">
                 {/* Section header */}
-                <div className="mb-4 flex flex-col gap-3 border-b border-zinc-800 pb-3 sm:flex-row sm:items-end sm:justify-between">
+                <div className="mb-4 flex flex-col gap-3 border-b border-zinc-800/80 pb-3 sm:flex-row sm:items-end sm:justify-between">
                   <div className="min-w-0">
-                    <div className="font-mono text-xs text-blue-500 tracking-[1.5px]">
+                    <div className="font-mono text-xs text-cyan-400/90 tracking-[1.5px]">
                       SECTION {section.number}
                     </div>
-                    <h2 className="text-lg sm:text-xl font-medium text-zinc-200 break-words">{section.title}</h2>
+                    <h2 className="text-lg sm:text-xl font-semibold text-zinc-100 break-words">{section.title}</h2>
                   </div>
 
                   <div className="flex shrink-0 items-center gap-2 self-start sm:self-auto">
@@ -870,7 +905,7 @@ export default function AIInterviewPrep() {
                       <div
                         id={`card-${q.id}`}
                         key={q.id}
-                        className={`question-card group rounded-2xl border overflow-hidden ${isExpanded ? 'expanded' : ''}`}
+                        className={`question-card group rounded-lg border overflow-hidden ${isExpanded ? 'expanded' : ''}`}
                       >
                         {/* Question header */}
                         <div
@@ -889,7 +924,7 @@ export default function AIInterviewPrep() {
                           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-4">
                             <div className="flex min-w-0 items-start gap-3 sm:contents">
                               <div className="shrink-0 mt-0.5">
-                                <div className="w-7 h-7 rounded-md bg-zinc-900 flex items-center justify-center text-[11px] font-mono text-zinc-500 border border-zinc-800">
+                                <div className="question-index flex h-7 w-7 items-center justify-center rounded-md text-[11px] font-mono">
                                   {idx + 1}
                                 </div>
                               </div>
@@ -908,7 +943,7 @@ export default function AIInterviewPrep() {
 
                                 {/* Viewed indicator (only after client mount to avoid hydration mismatch) */}
                                 {isMounted && viewedQuestions.has(q.id) && !isExpanded && (
-                                  <div className="mt-1 flex items-center gap-1 text-[11px] text-emerald-600/80">
+                                  <div className="mt-1 flex items-center gap-1 text-[11px] text-emerald-400/75">
                                     <Check className="h-3 w-3" /> viewed
                                   </div>
                                 )}
@@ -919,7 +954,7 @@ export default function AIInterviewPrep() {
                             {/* Focus / Read mode (very interactive) */}
                             <button
                               onClick={(e) => openFocus(q, e)}
-                              className="share-btn flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-blue-400 transition-all"
+                              className="share-btn flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-blue-400 transition-all"
                               title="Open in focus mode for easier reading"
                             >
                               <Eye className="h-4 w-4" />
@@ -928,7 +963,7 @@ export default function AIInterviewPrep() {
                             {/* Share link */}
                             <button
                               onClick={(e) => shareQuestion(q, e)}
-                              className="share-btn flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-800 hover:text-blue-400 transition-all"
+                              className="share-btn flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-blue-400 transition-all"
                               title="Copy direct link to this question"
                             >
                               <Link2 className="h-4 w-4" />
@@ -937,7 +972,7 @@ export default function AIInterviewPrep() {
                             {/* Favorite */}
                             <button
                               onClick={(e) => toggleFavorite(q.id, e)}
-                              className={`flex h-8 w-8 items-center justify-center rounded-lg transition-all ${
+                              className={`flex h-8 w-8 items-center justify-center rounded-md transition-all ${
                                 isFavorited 
                                   ? 'text-rose-400 hover:text-rose-500' 
                                   : 'text-zinc-500 hover:text-rose-400 hover:bg-zinc-800/70'
@@ -953,7 +988,7 @@ export default function AIInterviewPrep() {
                                 e.stopPropagation();
                                 copyQA(q);
                               }}
-                              className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 opacity-70 hover:bg-zinc-800 hover:text-white hover:opacity-100 transition-all action-btn"
+                              className="flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 opacity-70 hover:bg-zinc-800 hover:text-white hover:opacity-100 transition-all action-btn"
                               title="Copy question + answer"
                             >
                               <Copy className="h-4 w-4" />
@@ -971,63 +1006,55 @@ export default function AIInterviewPrep() {
                           </div>
                         </div>
 
-                        {/* Answer - Animated with clearer header */}
-                        <AnimatePresence initial={false}>
-                          {isExpanded && (
-                            <motion.div
-                              initial={{ height: 0, opacity: 0 }}
-                              animate={{ height: 'auto', opacity: 1 }}
-                              exit={{ height: 0, opacity: 0 }}
-                              transition={{ duration: 0.2, ease: [0.32, 0.72, 0, 1] }}
-                              className="overflow-hidden border-t border-zinc-800 bg-zinc-950/70"
-                            >
-                              <div className="answer-panel px-5 py-5">
-                                <div className="answer-header">
-                                  <span>ANSWER</span>
-                                </div>
-                                <div className="answer-content prose max-w-none">
-                                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                    {q.answer}
-                                  </ReactMarkdown>
-                                </div>
-
-                                <div className="mt-6 flex flex-wrap gap-2 border-t border-zinc-800 pt-4">
-                                  <button
-                                    onClick={() => copyQA(q)}
-                                    className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-1.5 text-xs font-medium hover:bg-zinc-800 hover:border-zinc-600 active:bg-black action-btn"
-                                  >
-                                    <Copy className="h-3.5 w-3.5" /> Copy full answer
-                                  </button>
-                                  <button
-                                    onClick={() => copyQuestion(q)}
-                                    className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-1.5 text-xs font-medium hover:bg-zinc-800 hover:border-zinc-600 active:bg-black action-btn"
-                                  >
-                                    Copy question only
-                                  </button>
-
-                                  <button
-                                    onClick={(e) => openFocus(q, e)}
-                                    className="inline-flex items-center gap-2 rounded-lg border border-blue-900/40 bg-blue-950/20 px-4 py-1.5 text-xs font-medium text-blue-300 hover:bg-blue-950/40 hover:text-blue-200 transition-colors"
-                                  >
-                                    <Eye className="h-3.5 w-3.5" /> Read in focus mode
-                                  </button>
-
-                                  <button
-                                    onClick={(e) => toggleFavorite(q.id, e)}
-                                    className={`ml-auto inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                                      isFavorited 
-                                        ? 'border-rose-800 bg-rose-950/40 text-rose-400' 
-                                        : 'border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-400'
-                                    }`}
-                                  >
-                                    <Heart className={`h-3.5 w-3.5 ${isFavorited ? 'fill-current' : ''}`} />
-                                    {isFavorited ? 'Favorited' : 'Favorite'}
-                                  </button>
-                                </div>
+                        {/* Answer - rendered instantly for faster expansion */}
+                        {isExpanded && (
+                          <div className="overflow-hidden border-t border-zinc-800 bg-zinc-950/70">
+                            <div className="answer-panel px-5 py-5">
+                              <div className="answer-header">
+                                <span>ANSWER</span>
                               </div>
-                            </motion.div>
-                          )}
-                        </AnimatePresence>
+                              <div className="answer-content prose max-w-none">
+                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                  {q.answer}
+                                </ReactMarkdown>
+                              </div>
+
+                              <div className="mt-6 flex flex-wrap gap-2 border-t border-zinc-800 pt-4">
+                                <button
+                                  onClick={() => copyQA(q)}
+                                  className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-1.5 text-xs font-medium hover:bg-zinc-800 hover:border-zinc-600 active:bg-black action-btn"
+                                >
+                                  <Copy className="h-3.5 w-3.5" /> Copy full answer
+                                </button>
+                                <button
+                                  onClick={() => copyQuestion(q)}
+                                  className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-1.5 text-xs font-medium hover:bg-zinc-800 hover:border-zinc-600 active:bg-black action-btn"
+                                >
+                                  Copy question only
+                                </button>
+
+                                <button
+                                  onClick={(e) => openFocus(q, e)}
+                                  className="inline-flex items-center gap-2 rounded-lg border border-blue-900/40 bg-blue-950/20 px-4 py-1.5 text-xs font-medium text-blue-300 hover:bg-blue-950/40 hover:text-blue-200 transition-colors"
+                                >
+                                  <Eye className="h-3.5 w-3.5" /> Read in focus mode
+                                </button>
+
+                                <button
+                                  onClick={(e) => toggleFavorite(q.id, e)}
+                                  className={`ml-auto inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                                    isFavorited
+                                      ? 'border-rose-800 bg-rose-950/40 text-rose-400'
+                                      : 'border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-400'
+                                  }`}
+                                >
+                                  <Heart className={`h-3.5 w-3.5 ${isFavorited ? 'fill-current' : ''}`} />
+                                  {isFavorited ? 'Favorited' : 'Favorite'}
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -1063,7 +1090,7 @@ export default function AIInterviewPrep() {
               initial={{ opacity: 0, y: 30, scale: 0.985 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: 20, scale: 0.985 }}
-              transition={{ duration: 0.2, ease: [0.32, 0.72, 0, 1] }}
+              transition={FAST_MODAL_TRANSITION}
               className="focus-modal my-auto flex w-full max-w-4xl max-h-[min(90vh,calc(100dvh-2rem))] flex-col rounded-2xl p-5 shadow-2xl sm:p-9"
               onClick={(e) => e.stopPropagation()}
             >
