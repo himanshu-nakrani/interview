@@ -325,6 +325,8 @@ export default function AIInterviewPrep() {
     100,
     Math.round((viewedCount / data.stats.totalQuestions) * 100)
   );
+  const displayedViewedCount = isMounted ? viewedCount : 0;
+  const displayedProgressPercentage = isMounted ? progressPercentage : 0;
 
   // Stats for current view
   const expandedCount = useMemo(() => {
@@ -494,7 +496,7 @@ export default function AIInterviewPrep() {
   const isSearching = searchTerm.trim().length > 0;
 
   return (
-    <div className="app-shell min-h-screen bg-zinc-950 text-zinc-300">
+    <div className="minimal-shell min-h-screen bg-zinc-950 text-zinc-300">
       {/* Top nav / header */}
       <header
         ref={headerRef}
@@ -503,7 +505,7 @@ export default function AIInterviewPrep() {
         <div className="mx-auto max-w-7xl px-4 sm:px-6">
           <div className="flex h-16 items-center justify-between gap-4">
             <div className="flex items-center gap-3">
-              <div className="brand-mark flex h-9 w-9 items-center justify-center rounded-lg">
+              <div className="minimal-brand flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-200">
                 <BookOpen className="h-5 w-5" />
               </div>
               <div>
@@ -513,14 +515,21 @@ export default function AIInterviewPrep() {
             </div>
 
             <div className="flex items-center gap-3 text-sm">
+              <a
+                href="/concept-map"
+                className="soft-btn hidden items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors sm:flex"
+              >
+                <Link2 className="h-3.5 w-3.5" />
+                <span>Concept map</span>
+              </a>
               <div className="hidden sm:flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 px-3 py-1 text-xs text-zinc-400">
                 <span>{data.stats.totalQuestions} questions</span>
                 <span className="text-zinc-700">•</span>
                 <span>{data.stats.totalSections} sections</span>
               </div>
-              <div className="hidden md:flex items-center gap-2 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-300">
+              <div className="hidden md:flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-900/80 px-3 py-1 text-xs text-zinc-300">
                 <Check className="h-3.5 w-3.5" />
-                <span>{progressPercentage}% viewed</span>
+                <span>{displayedProgressPercentage}% viewed</span>
               </div>
             </div>
           </div>
@@ -553,7 +562,7 @@ export default function AIInterviewPrep() {
               <div className="flex flex-wrap items-center justify-end gap-2">
                 <button
                   onClick={goToRandomQuestion}
-                  className="primary-action flex items-center gap-1.5 rounded-lg px-4 py-3 text-sm font-semibold transition-colors"
+                  className="minimal-primary-action flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-zinc-100 px-4 py-3 text-sm font-semibold text-zinc-950 transition-colors"
                   title="Load a random question (great for practice)"
                 >
                   <Shuffle className="h-4 w-4" />
@@ -585,7 +594,7 @@ export default function AIInterviewPrep() {
             {filtersCollapsed && (searchTerm || showFavoritesOnly) && (
               <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
                 {showFavoritesOnly && (
-                  <span className="rounded-full border border-rose-500/30 bg-rose-500/10 px-2.5 py-0.5 text-rose-300">
+                  <span className="rounded-full border border-zinc-700 bg-zinc-900 px-2.5 py-0.5 text-zinc-300">
                     Favorites only
                   </span>
                 )}
@@ -613,11 +622,11 @@ export default function AIInterviewPrep() {
                   <div className="flex items-center gap-2">
                     {isSearching ? (
                       <span>
-                        <span className="text-blue-400 font-medium">{visibleQuestionCount}</span>
+                        <span className="text-zinc-200 font-medium">{visibleQuestionCount}</span>
                         <span className="text-zinc-500"> result{visibleQuestionCount === 1 ? '' : 's'} for “{searchTerm}”</span>
                       </span>
                     ) : showFavoritesOnly ? (
-                      <span className="text-rose-400 font-medium">
+                      <span className="text-zinc-200 font-medium">
                         {visibleQuestionCount} favorite{visibleQuestionCount === 1 ? '' : 's'}
                       </span>
                     ) : (
@@ -638,7 +647,7 @@ export default function AIInterviewPrep() {
                     onClick={() => setShowFavoritesOnly(!showFavoritesOnly)}
                     className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium border transition-all ${
                       showFavoritesOnly
-                        ? 'bg-rose-500/10 text-rose-400 border-rose-500/30'
+                        ? 'bg-zinc-800 text-zinc-100 border-zinc-600'
                         : 'bg-zinc-900/80 border-zinc-800 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-300'
                     }`}
                   >
@@ -721,7 +730,9 @@ export default function AIInterviewPrep() {
                       }
 
                       const viewedInSection = section.questions.filter((q) => viewedQuestions.has(q.id)).length;
-                      const sectionProgress = Math.round((viewedInSection / originalCount) * 100);
+                      const sectionProgress = isMounted
+                        ? Math.round((viewedInSection / originalCount) * 100)
+                        : 0;
 
                       return (
                         <button
@@ -761,7 +772,7 @@ export default function AIInterviewPrep() {
                         title={`${section.number}. ${section.title}`}
                         className={`toc-mini-link flex h-7 w-7 items-center justify-center rounded-md border text-[10px] font-mono tabular-nums transition-colors ${
                           isActive
-                            ? 'border-blue-500/40 bg-blue-500/10 text-blue-300'
+                            ? 'border-zinc-500 bg-zinc-800 text-zinc-100'
                             : 'border-zinc-800 bg-zinc-900 text-zinc-500 hover:border-zinc-700 hover:bg-zinc-800 hover:text-zinc-300'
                         }`}
                       >
@@ -809,7 +820,7 @@ export default function AIInterviewPrep() {
           <main className="flex-1 min-w-0">
             {/* Intro banner */}
             {!isSearching && !showFavoritesOnly && (
-              <div className="hero-panel mb-8 rounded-lg border border-zinc-800/80 px-5 py-5 sm:px-6 sm:py-6">
+              <div className="minimal-hero mb-8 rounded-lg border border-zinc-800/80 bg-zinc-900/80 px-5 py-5 sm:px-6 sm:py-6">
                 <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_22rem] xl:items-end">
                   <div>
                     <h1 className="max-w-3xl text-balance text-2xl font-semibold leading-tight text-zinc-50 sm:text-3xl">
@@ -821,21 +832,21 @@ export default function AIInterviewPrep() {
                     <div className="mt-5 flex flex-wrap gap-2 text-xs">
                       <div className="rounded-full border border-zinc-800 bg-zinc-950/80 px-3 py-1 text-zinc-400">{data.stats.totalQuestions} curated questions</div>
                       <div className="rounded-full border border-zinc-800 bg-zinc-950/80 px-3 py-1 text-zinc-400">Favorites saved locally</div>
-                      <div className="rounded-full border border-amber-500/20 bg-amber-500/10 px-3 py-1 text-amber-300">Random drill mode</div>
+                      <div className="rounded-full border border-zinc-700 bg-zinc-950/80 px-3 py-1 text-zinc-300">Random drill mode</div>
                     </div>
                   </div>
                   <div className="grid grid-cols-3 gap-2 sm:gap-3 xl:grid-cols-1">
-                    <div className="metric-card">
+                    <div className="minimal-metric">
                       <span>Viewed</span>
-                      <strong>{viewedCount}</strong>
+                      <strong>{displayedViewedCount}</strong>
                     </div>
-                    <div className="metric-card">
+                    <div className="minimal-metric">
                       <span>Favorites</span>
                       <strong>{isMounted ? favorites.size : 0}</strong>
                     </div>
-                    <div className="metric-card">
+                    <div className="minimal-metric">
                       <span>Progress</span>
-                      <strong>{progressPercentage}%</strong>
+                      <strong>{displayedProgressPercentage}%</strong>
                     </div>
                   </div>
                 </div>
@@ -851,7 +862,7 @@ export default function AIInterviewPrep() {
                     <p className="mt-1 text-sm text-zinc-500">Click the heart icon on any question to save it for later.</p>
                     <button 
                       onClick={() => setShowFavoritesOnly(false)} 
-                      className="mt-4 text-sm text-blue-400 hover:text-blue-300"
+                      className="mt-4 text-sm text-zinc-200 underline underline-offset-4 hover:text-white"
                     >
                       Browse all questions →
                     </button>
@@ -870,7 +881,7 @@ export default function AIInterviewPrep() {
                 {/* Section header */}
                 <div className="mb-4 flex flex-col gap-3 border-b border-zinc-800/80 pb-3 sm:flex-row sm:items-end sm:justify-between">
                   <div className="min-w-0">
-                    <div className="font-mono text-xs text-cyan-400/90 tracking-[1.5px]">
+                    <div className="font-mono text-xs text-zinc-500 tracking-[1.5px]">
                       SECTION {section.number}
                     </div>
                     <h2 className="text-lg sm:text-xl font-semibold text-zinc-100 break-words">{section.title}</h2>
@@ -943,7 +954,7 @@ export default function AIInterviewPrep() {
 
                                 {/* Viewed indicator (only after client mount to avoid hydration mismatch) */}
                                 {isMounted && viewedQuestions.has(q.id) && !isExpanded && (
-                                  <div className="mt-1 flex items-center gap-1 text-[11px] text-emerald-400/75">
+                                  <div className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
                                     <Check className="h-3 w-3" /> viewed
                                   </div>
                                 )}
@@ -954,7 +965,7 @@ export default function AIInterviewPrep() {
                             {/* Focus / Read mode (very interactive) */}
                             <button
                               onClick={(e) => openFocus(q, e)}
-                              className="share-btn flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-blue-400 transition-all"
+                              className="share-btn flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 transition-all"
                               title="Open in focus mode for easier reading"
                             >
                               <Eye className="h-4 w-4" />
@@ -963,7 +974,7 @@ export default function AIInterviewPrep() {
                             {/* Share link */}
                             <button
                               onClick={(e) => shareQuestion(q, e)}
-                              className="share-btn flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-blue-400 transition-all"
+                              className="share-btn flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 transition-all"
                               title="Copy direct link to this question"
                             >
                               <Link2 className="h-4 w-4" />
@@ -974,8 +985,8 @@ export default function AIInterviewPrep() {
                               onClick={(e) => toggleFavorite(q.id, e)}
                               className={`flex h-8 w-8 items-center justify-center rounded-md transition-all ${
                                 isFavorited 
-                                  ? 'text-rose-400 hover:text-rose-500' 
-                                  : 'text-zinc-500 hover:text-rose-400 hover:bg-zinc-800/70'
+                                  ? 'text-zinc-100 hover:text-white'
+                                  : 'text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800/70'
                               }`}
                               title={isFavorited ? "Remove from favorites" : "Save for later"}
                             >
@@ -1035,7 +1046,7 @@ export default function AIInterviewPrep() {
 
                                 <button
                                   onClick={(e) => openFocus(q, e)}
-                                  className="inline-flex items-center gap-2 rounded-lg border border-blue-900/40 bg-blue-950/20 px-4 py-1.5 text-xs font-medium text-blue-300 hover:bg-blue-950/40 hover:text-blue-200 transition-colors"
+                                  className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 transition-colors"
                                 >
                                   <Eye className="h-3.5 w-3.5" /> Read in focus mode
                                 </button>
@@ -1044,7 +1055,7 @@ export default function AIInterviewPrep() {
                                   onClick={(e) => toggleFavorite(q.id, e)}
                                   className={`ml-auto inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
                                     isFavorited
-                                      ? 'border-rose-800 bg-rose-950/40 text-rose-400'
+                                      ? 'border-zinc-600 bg-zinc-800 text-zinc-100'
                                       : 'border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-400'
                                   }`}
                                 >
@@ -1132,7 +1143,7 @@ export default function AIInterviewPrep() {
                   }}
                   className={`ml-auto flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors ${
                     favorites.has(focusQuestion.id) 
-                      ? 'border-rose-800 bg-rose-950/30 text-rose-400' 
+                      ? 'border-zinc-600 bg-zinc-800 text-zinc-100'
                       : 'border-zinc-700 hover:bg-zinc-900 text-zinc-300'
                   }`}
                 >
