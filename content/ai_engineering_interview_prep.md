@@ -18,7 +18,7 @@ At inference, generation is **autoregressive**: feed in a prompt → model outpu
 
 ### Inside ChatGPT: What happens after you hit Enter?
 1. **Tokenization:** your message + chat history + system prompt are converted into token IDs via the model's tokenizer (typically BPE).
-2. **Embedding:** each token ID is looked up in an embedding matrix to produce a vector; positional information is added (sinusoidal, learned, or RoPE).
+2. **Embedding:** each token ID is looked up in an embedding matrix to produce a vector; positional information is injected (added to embeddings for sinusoidal/learned schemes, or applied inside attention with RoPE).
 3. **Forward pass:** the sequence flows through stacked Transformer blocks (often 30-100+ layers), each computing multi-head self-attention (with causal mask) and feed-forward transformations, with residual connections.
 4. **Logits:** the final hidden state of the last token is projected onto the vocabulary, producing a score per possible next token.
 5. **Sampling:** temperature scales logits; top-p/top-k filters the distribution; one token is sampled.
@@ -32,7 +32,7 @@ A Transformer processes all input tokens simultaneously. Each layer transforms t
 
 ### What are the key components of the Transformer architecture?
 - **Token embeddings:** lookup table mapping each vocab ID to a vector (the model's input representation).
-- **Positional encoding:** adds order information since attention is permutation-invariant (sinusoidal, learned, RoPE, or ALiBi).
+- **Positional encoding:** injects order information since attention is otherwise permutation-equivariant (sinusoidal, learned, RoPE, or ALiBi).
 - **Multi-head self-attention:** multiple parallel attention heads, each with its own Q, K, V projections, capturing different types of relationships.
 - **Feed-forward network (FFN):** a 2-layer MLP applied independently per token; typically expands dimension 4× before projecting back. Holds most of the model's parameters.
 - **Residual (skip) connections:** add the input of each sublayer to its output, enabling deep networks to train.
@@ -198,7 +198,7 @@ Why use it? **Fewer operations** (no mean computation, no subtraction)—~10-20%
 ### LLM ignores instructions—how to enforce structured output?
 LLMs trained on free-form text don't naturally produce strict formats. The most reliable approach is **provider-native structured output**: OpenAI's response_format with JSON schema, Anthropic's tool_use as a typed output channel, or Google's response_schema. These use **constrained decoding** under the hood—at each token, the model can only emit tokens valid under the schema, mathematically guaranteeing valid JSON.
 
-Layered defenses: (1) Define a strict **Pydantic / JSON Schema** with descriptions; (2) Open-source: use **Outlines, Instructor, JSONFormer, or LMFE** for grammar-constrained generation; (3) Add **2–3 few-shot examples** of correct format—huge effect; (4) Use **lower temperature** (0–0.2); (5) Wrap in a **validate-and-retry loop**: on JSON parse failure or schema validation error, send the error message back to the LLM and ask for a fix. The retry loop typically resolves remaining failures within 1–2 attempts.
+Layered defenses: (1) Define a strict **Pydantic / JSON Schema** with descriptions; (2) Open-source: use **Outlines, JSONFormer, or LMFE** for grammar-constrained generation (**Instructor** adds Pydantic validation + retries on top of function calling); (3) Add **2–3 few-shot examples** of correct format—huge effect; (4) Use **lower temperature** (0–0.2); (5) Wrap in a **validate-and-retry loop**: on JSON parse failure or schema validation error, send the error message back to the LLM and ask for a fix. The retry loop typically resolves remaining failures within 1–2 attempts.
 
 ### LLM hits context limit on long docs—how to handle?
 Multiple strategies, often combined:
@@ -276,7 +276,7 @@ Self-attention is O(n²) in memory and compute, making long sequences expensive.
 - **Flash Attention**: exact attention with O(n) memory; the first thing to enable.
 - **Sliding-window / local attention** (Mistral, Longformer): each token attends only to nearby tokens—linear memory.
 - **Sparse attention patterns** (Longformer, BigBird): mix local + global tokens; provably captures long-range info with O(n) compute.
-- **Linear attention approximations** (Linformer, Performer, Mamba): approximate softmax attention with linear-cost operations; trade quality for speed.
+- **Linear attention approximations** (Linformer, Performer): approximate softmax attention with linear-cost operations; trade quality for speed.
 - **State-space models** (Mamba, RWKV): sub-quadratic alternatives gaining traction; native long context.
 - **Chunk + RAG**: instead of stuffing the whole doc, retrieve only relevant chunks—usually best engineering choice.
 - **Hierarchical processing**: summarize chunks, then reason over summaries.
@@ -338,7 +338,7 @@ Default LLM behavior is to confabulate. To enable abstention:
 - **Question-generation roundtrip**: from the candidate answer, generate the question it would answer; if it differs from the original, abstain.
 
 ### Summarization hallucinates facts—how to fix?
-Generative summaries can introduce facts not in the source ("intrinsic hallucination") or contradict it ("extrinsic"). Fixes:
+Generative summaries can contradict the source ("intrinsic hallucination") or introduce facts not verifiable from it ("extrinsic hallucination"). Fixes:
 - **Extractive baseline** or **hybrid** (extractive + abstractive): pull verbatim sentences first, then polish.
 - **Faithfulness scoring**: use NLI or QAG (question-answer generation: derive questions from the summary, answer them from the source; if answers disagree, the summary is unfaithful) and regenerate failures.
 - **Lower temperature** (0–0.2) and disable nucleus sampling tricks that allow unlikely tokens.
@@ -424,7 +424,7 @@ It's critical because LLMs are **highly sensitive to phrasing**—a single word 
 **Practical pattern**: try zero-shot first (cheapest); add few-shot for format consistency or domain-specific patterns. Watch for **context length** (examples eat tokens) and **example bias** (model overfits to specific examples shown).
 
 ### What is Chain-of-Thought (CoT) prompting?
-CoT (Wei et al., 2022) prompts the model to produce **explicit intermediate reasoning** before its final answer—either by demonstration ("Q: ... Let me think step by step: ... Answer: ...") or by the magic instruction "Let's think step by step." Generating reasoning gives the model more compute and a scratchpad to break problems down, dramatically improving accuracy on math, logic, multi-hop QA, and complex instructions.
+CoT (Wei et al., 2022) prompts the model to produce **explicit intermediate reasoning** before its final answer—either by demonstration ("Q: ... Let me think step by step: ... Answer: ...") or by the zero-shot trigger "Let's think step by step" (Kojima et al., 2022). Generating reasoning gives the model more compute and a scratchpad to break problems down, dramatically improving accuracy on math, logic, multi-hop QA, and complex instructions.
 
 **When to use**: tasks requiring intermediate calculation or multi-step inference. **When to skip**: simple lookups, classification, format conversion (CoT adds latency and tokens without help). Modern frontier models often do implicit CoT; explicit CoT helps weaker/smaller models more. For production, consider **hidden CoT** patterns where reasoning isn't shown to users.
 
@@ -454,8 +454,8 @@ Layered approach:
 - **Provide an exact schema** in the prompt (Pydantic model, JSON schema, TypeScript interface, or explicit example).
 - **Include 1–3 few-shot examples** of correct output—models follow patterns more than instructions.
 - **Use clear delimiters** (XML tags like `<output>...</output>` or markdown code blocks).
-- **Constrained decoding libraries** (Outlines, Instructor, JSONFormer, LMFE) force valid output token-by-token.
-- **Validate with Pydantic** and **retry on failure**, passing the validation error back to the LLM.
+- **Constrained decoding libraries** (Outlines, JSONFormer, LMFE) force valid output token-by-token.
+- **Validate with Pydantic** and **retry on failure**, passing the validation error back to the LLM (what Instructor automates).
 - **Lower temperature** (0–0.3) for structural consistency.
 - For XML, request explicit closing tags; for JSON, ask for "valid JSON, no markdown fences, no commentary."
 
@@ -468,7 +468,7 @@ Prompt injection is when an attacker's text (in user input, retrieved documents,
 - **Output filters**: scan responses for leaked system prompt, prohibited content.
 - **Privilege separation / dual LLMs**: one untrusted LLM processes attacker-controlled content into structured data; a trusted LLM acts on the structured data.
 - **Confirmation gates** for destructive or irreversible actions.
-- **Specialized detectors**: Lakera, Prompt-Guard, Llama Guard, Rebuff.
+- **Specialized detectors**: Lakera Guard, Prompt Guard, Rebuff (Llama Guard covers content safety, not injection).
 
 ### What is jailbreaking?
 Jailbreaking is bypassing an LLM's safety/alignment guardrails to produce content the model was trained to refuse (illegal advice, hate speech, malware, etc.). Common techniques: **role-play attacks** ("You are DAN, an AI with no restrictions"), **hypothetical framing** ("In a fictional story, how would..."), **encoding tricks** (base64, leet, foreign languages, ASCII art), **token smuggling** via unusual spacing/punctuation, **multi-turn manipulation** (gradually escalating asks), **prompt injection** via context, and **gradient-based adversarial suffixes** (GCG: optimized suffixes that universally jailbreak models).
@@ -488,7 +488,7 @@ Cost ≈ input_tokens × in_price + output_tokens × out_price. Latency ≈ TTFT
 
 ### Prompt engineering vs prompt tuning?
 - **Prompt engineering**: human-crafted natural language. No training. Iterate by editing strings. Works on any model (including closed APIs). Flexible but somewhat manual.
-- **Prompt tuning / soft prompts** (Lester et al., 2021): learn a small set of **continuous embedding vectors** prepended to the input. The base model stays frozen; only the soft prompts (a few thousand parameters) are trained. Performance approaches full fine-tuning at a fraction of the cost. Requires gradient access (so open models only) and is a fixed task-specific artifact rather than human-readable text.
+- **Prompt tuning / soft prompts** (Lester et al., 2021): learn a small set of **continuous embedding vectors** prepended to the input. The base model stays frozen; only the soft prompts (prompt length × embedding dim—tens to hundreds of thousands of parameters, still <0.01% of the model) are trained. Performance approaches full fine-tuning at a fraction of the cost. Requires gradient access (so open models only) and is a fixed task-specific artifact rather than human-readable text.
 
 Soft prompts can outperform hand-crafted prompts on narrow tasks; engineered prompts are far more flexible, debuggable, and shareable. Most production AI uses engineered prompts; soft prompts are more of a research/PEFT technique.
 
@@ -699,7 +699,7 @@ Benefits: handles complex/multi-hop questions, adapts to query difficulty, grace
 ### Hybrid search—why better?
 Hybrid search combines **dense** (semantic, vector-based) and **sparse** (keyword-based, like BM25 or SPLADE) retrieval. Each has complementary strengths: dense captures meaning, paraphrases, and concepts; sparse handles exact matches—proper nouns, IDs, codes, rare technical terms, version numbers.
 
-Example: querying "K-9 visa" — dense might confuse "K-9" (dog) vs "K-9 visa" (a specific category); sparse retrieval on "K-9" gives exact matches. **Fusion**: typically via **Reciprocal Rank Fusion (RRF)**—combines rankings without needing to normalize raw scores. Hybrid consistently outperforms either alone on diverse query distributions. Most enterprise RAG should be hybrid; pure dense is the default only for simple use cases.
+Example: querying "K-1 visa" — dense might drift to generic marriage/fiancé(e) immigration passages; sparse retrieval on the exact token "K-1" pins the right category. **Fusion**: typically via **Reciprocal Rank Fusion (RRF)**—combines rankings without needing to normalize raw scores. Hybrid consistently outperforms either alone on diverse query distributions. Most enterprise RAG should be hybrid; pure dense is the default only for simple use cases.
 
 ### What is re-ranking?
 Initial retrieval (vector search + BM25) returns hundreds of candidates fast but with limited precision—a bi-encoder embedding can't compare query and document at fine granularity. A **re-ranker** is a **cross-encoder**: it takes (query, candidate) pairs together and scores their relevance, attending across both texts simultaneously. Much more accurate but ~100× slower, so you only apply it to the top 50–200 candidates from initial retrieval.
@@ -826,7 +826,7 @@ Critical for trust and debuggability. Implementation:
 - **Inject IDs into the prompt** ("Document [1]: ... Document [2]: ...") and **instruct the LLM** to cite the IDs in its answer.
 - **Post-process** to map [1], [2] to actual source URLs/titles.
 - **Validate**: programmatically check that cited IDs actually appear in retrieved chunks; flag/fix hallucinated citations.
-- **Span-level citations** (more advanced): identify which sentence of the answer comes from which chunk; tools: Self-RAG, AttributedQA.
+- **Span-level citations** (more advanced): identify which sentence of the answer comes from which chunk; active research area (Self-RAG's support judgments, attributed-QA benchmarks like ALCE).
 - **Display in UI**: show snippets, links, hover previews so users can verify.
 - **Audit trails**: log {query, retrieved chunk IDs, generated answer} for compliance and debugging.
 
@@ -973,7 +973,7 @@ Memory enables an agent to maintain context, learn, and personalize over time. C
 - **Semantic memory**: general factual knowledge—often externalized as a KB / RAG.
 - **Procedural memory**: learned skills or workflows—how to do recurring tasks; can be code, prompts, or trained adapters.
 
-Implementation patterns: extract facts after each interaction → write to long-term store; retrieve relevant memories at start of each turn; periodically consolidate. Frameworks: LangGraph memory, MemGPT, Letta, Mem0. Trade-off: more memory = better continuity but more retrieval complexity and privacy concerns.
+Implementation patterns: extract facts after each interaction → write to long-term store; retrieve relevant memories at start of each turn; periodically consolidate. Frameworks: LangGraph memory, MemGPT (now Letta), Mem0. Trade-off: more memory = better continuity but more retrieval complexity and privacy concerns.
 
 ### Harness Engineering in AI?
 The "harness" is everything around the LLM that makes it usable in production: tool registry, scheduling, memory, retries, guardrails, observability, prompt management, evaluation, error handling, sandboxing. The model is necessary but not sufficient—the harness determines whether the system is reliable, debuggable, and safe.
@@ -994,7 +994,7 @@ Plan-and-Execute separates planning from execution. A **planner** LLM (often a s
 Benefits over ReAct: (1) **Better long-horizon performance**—an explicit plan resists drift; (2) **Cost optimization**—use a strong model for planning, cheap one for execution; (3) **Easier human review** of the plan before execution; (4) **Parallelism**—independent plan steps can run concurrently. Trade-offs: less flexible than ReAct when the environment is unpredictable; needs good replanning when the plan goes wrong. Frameworks: LangGraph, BabyAGI, autonomous research agents.
 
 ### What is tool use (function calling)?
-Tool use lets an LLM produce a **structured action** (function name + JSON arguments) that the harness executes; the result is returned to the LLM for further reasoning. Models trained for function calling (GPT-4, Claude, Gemini, Llama 3.1+) emit a special "tool_call" token rather than free text when invoking a tool.
+Tool use lets an LLM produce a **structured action** (function name + JSON arguments) that the harness executes; the result is returned to the LLM for further reasoning. Models trained for function calling (GPT-4, Claude, Gemini, Llama 3.1+) emit a structured tool-call block—often wrapped in model-specific special tokens—that the API layer parses into a function name + JSON arguments instead of free text.
 
 This is the foundation of every agent: it turns the LLM from a text generator into something that can **act on the world**—query databases, call APIs, run code, send emails, control devices. Provider APIs (OpenAI tools, Anthropic tool_use) handle the structured output reliably. Modern systems use tools for retrieval (RAG), computation (Python execution), I/O (file edits, web search), and inter-agent communication.
 
@@ -1300,13 +1300,13 @@ Fine-tuning continues training an already-pretrained model on task- or domain-sp
 When to use: (1) **Format/style consistency** (always JSON, brand voice, specific tone); (2) **Specialized skills** the base model handles poorly (function calling format, domain-specific reasoning patterns, code in a niche language); (3) **Latency/cost optimization**—a fine-tuned 7B model can match a generic 70B on narrow tasks; (4) **Behavior tuning** beyond what prompting reliably achieves; (5) **Privacy**—on-prem fine-tuned models keep data in-house. When NOT to use: for adding *facts* (use RAG—fine-tuning is brittle at knowledge); when prompting works (faster, cheaper); for tasks you have <100 examples of (under-data fine-tuning hurts more than helps).
 
 ### Full fine-tuning vs PEFT?
-- **Full fine-tuning**: update every parameter in the model. Highest quality ceiling, but requires GPU memory proportional to model size × 4 (weights, gradients, optimizer states, activations)—a 70B model needs hundreds of GB. Each fine-tuned model is a full copy (expensive to store and serve). Risk of catastrophic forgetting.
+- **Full fine-tuning**: update every parameter in the model. Highest quality ceiling, but requires roughly 16 bytes of GPU memory per parameter with mixed-precision Adam (fp16 weights + gradients, fp32 master weights, optimizer states—before activations)—a 70B model needs 1TB+. Each fine-tuned model is a full copy (expensive to store and serve). Risk of catastrophic forgetting.
 - **PEFT (Parameter-Efficient Fine-Tuning)**: update only a small fraction (often <1%) of parameters. LoRA, adapters, prompt tuning all fit here. Memory dramatically lower (can fit 70B fine-tuning on a single GPU with QLoRA). Adapters are tiny (~MB) and swappable—one base model can host many task adapters.
 
 **Practical**: PEFT (LoRA/QLoRA) is the default for most applications. Full fine-tuning reserved for very large datasets, deep behavior changes, or when serving constraints demand merged weights.
 
 ### What is LoRA?
-LoRA (Hu et al., 2021) freezes the base model's weights and injects **trainable low-rank matrices** into linear layers. For a frozen weight matrix W (d×k), LoRA adds an update ΔW = BA, where B is (d×r) and A is (r×k), with rank r much smaller than min(d,k) (typically r=8–64). At inference, the effective weight is W + αBA, where α is a scaling factor.
+LoRA (Hu et al., 2021) freezes the base model's weights and injects **trainable low-rank matrices** into linear layers. For a frozen weight matrix W (d×k), LoRA adds an update ΔW = BA, where B is (d×r) and A is (r×k), with rank r much smaller than min(d,k) (typically r=8–64). At inference, the effective weight is W + (α/r)·BA, where α is a scaling hyperparameter and r the rank.
 
 Why it works: research showed that fine-tuning updates have low *intrinsic rank*—the meaningful changes lie in a low-dimensional subspace. LoRA trains <1% of parameters yet matches full fine-tuning on many tasks. Adapters are a few MB, allowing many task-specific adapters per base model. At inference, weights can be merged into the base (zero overhead) or kept separate (swappable). Almost universally used in open-source fine-tuning today.
 
@@ -1331,7 +1331,7 @@ Pros: modular—per-task adapters can be swapped; small parameter count. Cons: a
 ### What is RLHF?
 RLHF (Christiano et al., 2017; popularized in InstructGPT 2022) aligns LLMs with human preferences. Three-stage pipeline:
 1. **SFT (Supervised Fine-Tuning)**: train the base model on high-quality (instruction, response) demonstrations to produce a useful baseline.
-2. **Reward Model (RM) training**: collect human preference pairs—for the same prompt, humans rank multiple responses; train a separate model to predict the preference (essentially a regression on which response humans prefer).
+2. **Reward Model (RM) training**: collect human preference pairs—for the same prompt, humans rank multiple responses; train a separate model with a pairwise ranking (Bradley–Terry) loss so the preferred response scores higher than the rejected one.
 3. **RL fine-tuning**: optimize the SFT model with reinforcement learning (typically PPO) to maximize the RM's predicted reward, with a KL-divergence penalty against the SFT model to prevent reward hacking and language degradation.
 
 This is how ChatGPT, Claude, Gemini, and most production LLMs become helpful, harmless, and honest. Modern variants (DPO, GRPO, RLAIF) simplify or replace parts of the pipeline.
@@ -1361,7 +1361,7 @@ Catastrophic forgetting: fine-tuning a model on narrow data makes it forget pret
 - **Regularization**: EWC (Elastic Weight Consolidation) penalizes changes to weights important for previous tasks.
 - **Separate adapters per task**, merged or routed at inference rather than baking everything in.
 - **Continual evaluation** on general benchmarks (MMLU, HellaSwag) during training; stop or roll back on regression.
-- **Constitutional fine-tuning / mixture of experts** that preserve base capabilities by routing.
+- **Model merging or MoE/adapter routing** that preserves base capabilities alongside the new skill.
 
 ### Fine-tuning vs RAG vs prompt engineering?
 The question is "where should this capability live?"
@@ -1446,9 +1446,9 @@ Many closed-model providers explicitly prohibit using their outputs to train com
 - **Anthropic TOS**: similar restrictions.
 - **Google Gemini TOS**: prohibits using outputs to train models that compete with Google's AI.
 
-Open-weight models have permissive licenses for distillation:
-- **LLaMA 2/3** (Meta): permits commercial use including derived works (with attribution).
-- **Mistral, Qwen, DeepSeek, Gemma**: similarly permissive.
+Open-weight licenses vary—read each one:
+- **LLaMA** (Meta): Llama 2 and 3.0 licenses *prohibit* using outputs to improve non-Llama models; Llama 3.1+ permits it, but requires "Llama" in the derived model's name and "Built with Llama" attribution. All are custom licenses with a 700M-MAU commercial threshold, not OSI-permissive.
+- **Mistral, Qwen, DeepSeek, Gemma**: check per checkpoint—many are Apache-2.0/MIT (Mistral 7B, most Qwen 2.5, DeepSeek-R1), but some Mistral releases are research-only and Gemma ships custom terms with use restrictions.
 
 **Practical implications**: check the specific TOS for your teacher; if using closed-model outputs, restrict to in-house tooling or non-competing use cases; consider open-weight teachers for distillation pipelines. Also be aware of **copyright** issues with training data carried through distillation.
 
@@ -1502,13 +1502,13 @@ Catastrophic forgetting from narrow fine-tuning. Fixes:
 - **Adapter merging or routing**: keep general and domain capabilities in separate adapters, combine at inference.
 
 ### RLHF preference data has low annotator agreement?
-Inter-annotator agreement <70% on preference pairs is a red flag—the data is too ambiguous for a reward model to learn reliably.
+Published RLHF datasets typically land at ~63–77% inter-annotator agreement (InstructGPT reported ~73%), so the red flag is agreement well below that band or a sharp drop against your own baseline—that means the data is too ambiguous for a reward model to learn reliably.
 - **Improve annotation guidelines**: specific rubrics, concrete examples of good/bad, edge case rulings.
 - **Calibration training**: have annotators label common examples, share feedback on disagreements, iterate guidelines.
 - **Multiple annotators per pair**: 3–5 annotators; majority vote, weight by reliability; drop pairs without consensus.
 - **Pre-filter ambiguous pairs**: pairs where neither response clearly dominates add noise; remove or escalate.
 - **Categorical breakdown**: low agreement often clusters by topic (subjective taste vs. factual quality); split categories.
-- **Switch to DPO with high-confidence pairs**: DPO is more robust to noisy data than PPO when you can filter to clear preferences.
+- **Switch to DPO with high-confidence pairs**: DPO trains directly on individual pairs and is *sensitive* to label noise—which is exactly why filtering to clear preferences first is required.
 - **Use LLM-as-judge to pre-screen**: automated detection of ambiguous pairs before human labeling.
 - **Constitutional AI / rubric-based**: replace ambiguous preference labels with explicit rule-based judgments.
 
@@ -1585,7 +1585,7 @@ Applications: text-to-image search ("photo of a dog wearing sunglasses"), image-
 
 ### Multi-tenant indexing?
 - **Metadata filter by tenant_id**: simplest; all tenants share an index, queries filter on tenant. Works for moderate scale; risk: bugs leak across tenants.
-- **Namespace per tenant**: most managed vector DBs (Pinecone, Weaviate) support namespaces—logical separation within one index. Better isolation, similar performance.
+- **Namespace/tenant per customer**: most managed vector DBs support this (Pinecone namespaces, Weaviate multi-tenancy tenants, Milvus partitions)—logical separation within one index. Better isolation, similar performance.
 - **Index per tenant**: strongest isolation, easiest compliance (delete tenant = drop index), but operational overhead grows with tenant count. Suits enterprise SaaS with few large tenants.
 - **Sharded by tenant**: spread tenants across nodes for scale.
 
@@ -1600,10 +1600,10 @@ Reduce vector precision to save memory and improve search speed:
 - **OPQ (Optimized PQ)**: PQ with learned rotation; better quality.
 - **Scalar quantization**: per-dimension scaling.
 
-Combine techniques: **binary for first-stage filtering + float for rescoring** is a common pattern. Most major vector DBs (Qdrant, Milvus, Pinecone, FAISS) support quantization natively.
+Combine techniques: **binary for first-stage filtering + float for rescoring** is a common pattern. Most major vector DBs (Qdrant, Milvus, Pinecone) and libraries (FAISS) support quantization natively.
 
 ### Benchmarking embeddings?
-- **MTEB (Massive Text Embedding Benchmark)**: standard for English; covers retrieval, classification, clustering, STS, summarization. Good for cross-model comparison but biased toward general text.
+- **MTEB (Massive Text Embedding Benchmark)**: the standard cross-model benchmark; covers retrieval, classification, clustering, STS, summarization. The English tab is most cited; MMTEB extends it to 250+ languages. Biased toward general text.
 - **BEIR**: heterogeneous retrieval benchmarks across many domains.
 - **MIRACL**: multilingual retrieval across 18 languages.
 - **Domain-specific evals**: code (CoIR), legal, medical, scientific.
@@ -1636,7 +1636,7 @@ At billion-vector scale, engineering matters more than algorithm choice:
 - **Smart routing / query understanding**: classify the query to the right shard / region.
 - **Caching**: hot queries answered from cache.
 
-Managed services (Pinecone, Vespa, Vald) handle most of this; self-managed (Milvus, Qdrant) require expertise.
+Managed services (Pinecone, Zilliz Cloud, Qdrant Cloud, Vespa Cloud) handle most of this; self-hosted (Milvus, Qdrant, Vespa, Vald) requires expertise.
 
 ### Hybrid search?
 Combine **dense (semantic)** and **sparse (keyword/BM25)** retrieval. Each has complementary strengths: dense for paraphrases and concepts; sparse for exact tokens (codes, names, jargon, rare terms).
@@ -1654,7 +1654,7 @@ Domain-specific fine-tuning produces large gains for narrow tasks.
 - **Collect (query, positive doc, negative doc) triplets** from your domain. Sources: click logs (positives are clicked docs), human labels, LLM-generated pairs, hard-negative mining from existing retrieval.
 - **Loss function**: InfoNCE (contrastive), MultipleNegativesRankingLoss (uses in-batch negatives), Triplet loss.
 - **Hard negative mining**: random negatives are easy; mine top-k retrieved-but-irrelevant docs as hard negatives—biggest quality lever.
-- **Frameworks**: sentence-transformers (most popular), GritLM (combines embedding + generation), Hugging Face PEFT for LoRA.
+- **Frameworks**: sentence-transformers (most popular), Hugging Face PEFT for LoRA.
 - **Eval on retrieval metrics** (Recall@k, MRR, NDCG), not loss—loss decreases don't guarantee retrieval improvement.
 - **Start from a strong base** (BGE, E5, Nomic); fine-tune with LoRA to keep adapters small and reversible.
 - **Watch for overfitting**: regular early stopping on a held-out set.
@@ -1706,8 +1706,8 @@ A new embedding model rolled out hot can break search quality. Recovery + preven
 - **Canary the new model** on 1–5% of traffic first.
 
 ### Semantic search fails for short queries?
-Short queries ("k9 visa") have weak semantic signal—dense embeddings struggle.
-- **Query expansion**: LLM rewrites or adds synonyms; expand "k9 visa" to "K-1 fiancé visa requirements US immigration".
+Short queries ("k1 visa") have weak semantic signal—dense embeddings struggle.
+- **Query expansion**: LLM rewrites or adds synonyms; expand "k1 visa" to "K-1 fiancé(e) visa requirements US immigration".
 - **HyDE**: generate a hypothetical answer, embed *that* for retrieval. Often dramatic improvement for sparse queries.
 - **Hybrid search with BM25**: keyword match catches what dense missed.
 - **Specialized short-query models**: some embedding models are trained for query-style inputs (vs doc-style).
@@ -1912,7 +1912,7 @@ A central proxy mediating all LLM API calls in an organization:
 - **Audit & compliance** logging.
 - **Prompt registry** integration.
 
-Open-source: **LiteLLM, Portkey, Helicone, Langfuse**. Buy vs build depends on scale and integration needs; most orgs benefit from a gateway as soon as multiple teams use LLMs.
+Open-source gateways: **LiteLLM, Portkey, Helicone** (pair with **Langfuse** for the observability/prompt-registry layer). Buy vs build depends on scale and integration needs; most orgs benefit from a gateway as soon as multiple teams use LLMs.
 
 ### RAG with conflicting sources?
 - **Source authority hierarchy** via metadata (official > FAQ > user-generated).
@@ -1989,7 +1989,7 @@ Regulated industry; design for compliance and auditability.
 End-to-end latency target: <500ms perceived (most via streaming).
 **Pipeline**:
 1. **Wake word detection** (on-device, always-on, low-power).
-2. **Streaming ASR** (Whisper, Deepgram, Cartesia)—begin processing as user speaks.
+2. **Streaming ASR** (Deepgram, AssemblyAI, Cartesia; Whisper only via streaming wrappers)—begin processing as user speaks.
 3. **Endpointing** (when user stopped speaking).
 4. **NLU/LLM** with tools—often a small fast model for routine, route to bigger for complex.
 5. **Streaming TTS** (ElevenLabs, OpenAI TTS, Cartesia Sonic)—start speaking before generation finishes.
@@ -2112,10 +2112,10 @@ Cost components:
 
 ### Optimize LLM inference costs?
 - **Semantic + exact caching**: 30–60% of typical workload responds from cache.
-- **Prompt prefix caching**: providers discount cached input tokens (Anthropic: 90% off; OpenAI: 50%).
+- **Prompt prefix caching**: providers discount cached input tokens (Anthropic: 90% off reads, with a 1.25–2× cache-write premium; OpenAI: 50–90% off depending on model family).
 - **Model routing**: small model for easy, large for hard; can cut cost 5–10×.
 - **Prompt compression**: shorten prompts (LLMLingua-style; remove redundant instructions).
-- **Self-host at high volume**: break-even depends on workload but typically 1B+ tokens/month favors self-hosting.
+- **Self-host at high volume**: break-even depends on model size and sustained GPU utilization—typically tens of billions of tokens/month before self-hosting beats open-weight API pricing.
 - **Distill / fine-tune a smaller model** to match a bigger one for your specific use case.
 - **Batch inference**: cheaper rates from providers' batch APIs (often 50% off, 24h SLA).
 - **Limit output length**: instructed and `max_tokens`.
@@ -2161,7 +2161,7 @@ Treat prompts like code:
 - **Track version per deployment** so you can correlate output changes with model changes.
 - **Map each production response to the model + prompt versions used** (in observability).
 - **Automated rollback** triggered by SLO violations (quality drop, error rate spike).
-- **Hold previous version's KV caches / replicas** during rollouts so rollback is instant.
+- **Keep the previous version's replicas warm** during rollouts so rollback is instant.
 - **Provider migration plan**: when a model is deprecated, evaluate replacements in parallel.
 
 ### Rate limiting / throttling?
@@ -2398,7 +2398,7 @@ Saves significant cost (often 5-10×) and latency at scale. Frameworks: **RouteL
 - **Less-aggressive quantization**: INT8 if INT4 hurts too much; FP8 on supported hardware.
 - **Quantization-aware training (QAT)** for production-critical: train with simulated quantization; better quality than post-training quant.
 - **Test on your eval suite**: quality varies by task; some tasks tolerate quantization much better than others.
-- **Newer models with native int4 support** (BitNet, etc.) avoid the issue.
+- **Models trained natively at low precision** (int4-native architectures; BitNet's 1.58-bit ternary weights) avoid the issue.
 
 ### Design graceful degradation?
 - **Service tiers**: must-have (core flow), should-have (helpful features), nice-to-have (extras). Degrade from the bottom under stress.
@@ -2804,7 +2804,7 @@ Key principles applying to AI:
 - **Cross-border transfer restrictions**: Schrems II, regional data residency.
 - **Data Protection Impact Assessment (DPIA)** for high-risk processing.
 - **Vendor compliance**: LLM providers must offer DPAs, sub-processor lists; use enterprise tiers with zero retention; consider on-prem.
-- **Automated decision-making**: GDPR Article 22 right to explanation and human review.
+- **Automated decision-making**: GDPR Article 22 rights to human review and to contest; Articles 13–15 require "meaningful information about the logic involved."
 - **Breach notification**: 72-hour clock for GDPR.
 
 ### PII handling?
@@ -2822,7 +2822,7 @@ Key principles applying to AI:
 The ability to explain why a model produced a specific output. Important for:
 - **Trust**: users want to understand decisions affecting them.
 - **Debugging**: developers need to know why systems fail.
-- **Compliance**: GDPR Article 22 (right to explanation), EU AI Act, EEOC.
+- **Compliance**: GDPR Article 22 (human review/contest rights for automated decisions), EU AI Act, EEOC.
 - **Stakeholder communication**: justifying decisions to non-technical audiences.
 
 **Methods**:
@@ -2881,7 +2881,7 @@ Calibrate **false positive (over-blocking)** and **false negative (missed harm)*
 ### Responsible AI frameworks?
 Industry / regulatory frameworks:
 - **Microsoft Responsible AI Standard**: fairness, reliability, privacy, inclusiveness, transparency, accountability.
-- **Google AI Principles**: be socially beneficial, avoid harm, be accountable, safety, privacy.
+- **Google AI Principles** (2018; restructured in 2025): socially beneficial, avoid unfair bias, accountability, safety, privacy.
 - **NIST AI RMF (US)**: Govern, Map, Measure, Manage functions; voluntary but widely adopted.
 - **EU AI Act**: regulatory, risk-tiered, enforceable.
 - **ISO/IEC 42001**: AI management system standard for certification.
@@ -2943,7 +2943,7 @@ Proactive defenses:
 ### Differential privacy?
 DP (Dwork et al., 2006) is a mathematical framework guaranteeing that the output of a computation doesn't reveal whether any single individual's data was included. Quantified by **privacy budget ε** (epsilon): smaller ε = stronger privacy, more noise added.
 
-**For AI**: DP-SGD adds calibrated Gaussian noise to gradients during training; per-example clipping bounds influence. Result: a model with formal privacy guarantees—no training example can be reconstructed. **Trade-off**: lower ε → more noise → lower accuracy. Practical privacy budgets (ε=1-10) often cost 1-10% accuracy.
+**For AI**: DP-SGD adds calibrated Gaussian noise to gradients during training; per-example clipping bounds influence. Result: a model with a formal, quantified bound on any single example's influence—reconstruction and membership inference become provably harder (guarantees weaken as ε grows). **Trade-off**: lower ε → more noise → lower accuracy. Practical privacy budgets (ε=1-10) often cost 1-10% accuracy.
 
 Implementations: Opacus (PyTorch), TF Privacy. Used for: training on sensitive data (medical, finance), federated learning, synthetic data generation. Beyond training: DP can be applied to query answering, statistical releases, recommendation systems.
 
@@ -3014,7 +3014,7 @@ A model fair by gender AND fair by race separately can still be unfair to women-
 - **External audits** with diverse perspectives.
 
 ### Loan denied—GDPR explanation?
-GDPR Article 22 requires meaningful explanation for automated decisions with legal/significant effect.
+For automated decisions with legal/significant effect, GDPR Article 22 grants rights to human intervention and to contest the decision; Articles 13–15 require "meaningful information about the logic involved" (the oft-cited "right to explanation" appears only in non-binding Recital 71).
 - **Top factors**: SHAP/LIME feature attribution, highlight the 3-5 features most influencing the decision.
 - **Decision boundary explanation**: what would need to change for approval.
 - **Counterfactual**: "if your income were $X higher, your application would have been approved."
@@ -3089,12 +3089,12 @@ A model's predictions affect future data (predictive policing concentrates patro
 - **Periodic retraining on bias-corrected samples** (importance weighting, IPW).
 - **Population-level monitoring**: don't just measure individual accuracy; track aggregate effects.
 - **A/B holdouts** that don't use the model—gives a clean comparison.
-- **Avoid using model decisions as labels** for future training (label leakage).
+- **Avoid using model decisions as labels** for future training (a self-reinforcing feedback loop—the "selective labels" problem).
 
 ### Watermarking AI-generated images?
 Embedding invisible signals in images to identify AI generation:
 - **Perceptual watermarking**: imperceptible pixel changes encode a signal (SynthID by Google DeepMind, Stable Signature by Meta).
-- **Cryptographic watermarking**: signed metadata or hashes (C2PA—Content Provenance and Authenticity).
+- **Cryptographic watermarking**: signed metadata or hashes (C2PA—Coalition for Content Provenance and Authenticity).
 - **Statistical / model watermarking**: subtle patterns inherent to a model's outputs.
 
 Limitations: watermarks can be removed by image editing, cropping, re-encoding; adversarial attacks on watermarks exist. Defense in depth: combine watermarking + provenance metadata (C2PA) + content moderation classifiers + UI labeling. Industry effort underway; useful but not foolproof.
@@ -3237,7 +3237,7 @@ Result: a shared embedding space where related images and texts cluster together
 - **Two-tower contrastive** (CLIP, SigLIP, OpenCLIP): separate encoders trained jointly with contrastive loss; ideal for retrieval and zero-shot classification; doesn't generate.
 - **Vision-LM with projector** (LLaVA, BLIP-2, MiniGPT-4): vision encoder → projector → LLM consumes as tokens. Allows generation; flexible; uses pre-trained components.
 - **Q-Former / cross-attention** (BLIP-2, Flamingo): compress image features into a small set of learnable queries cross-attended to image; reduces token count.
-- **Native multimodal Transformers** (GPT-4o, Gemini, Claude 3.5+, Qwen2-VL): single model trained from scratch on all modalities; best quality and tightest integration.
+- **Natively multimodal Transformers** (GPT-4o, Gemini): single model pretrained on multiple modalities together; best quality and tightest integration. (Claude 3+ and Qwen2-VL take image input but follow the encoder→projector→LLM pattern above.)
 - **Diffusion + LLM hybrids** (DALL-E 3, Stable Diffusion 3): LLM understands prompt; diffusion generates pixels.
 
 ### How does image generation with diffusion work?
@@ -3249,16 +3249,16 @@ Diffusion models (Ho et al., 2020; Sohl-Dickstein 2015) train a neural network t
 
 ### What is TTS?
 Text-to-Speech: converts text input into natural-sounding speech audio. Modern neural TTS:
-- **Acoustic model** (Tacotron, FastSpeech, VITS, Bark): predicts mel-spectrograms from text.
+- **Acoustic model** (Tacotron 2, FastSpeech 2): predicts mel-spectrograms from text.
 - **Vocoder** (HiFi-GAN, WaveNet, BigVGAN): converts spectrograms to waveform audio.
-- **End-to-end models** (VALL-E, OpenAI TTS, ElevenLabs, Cartesia Sonic): single model from text to audio.
+- **End-to-end models** (VITS text-to-waveform; VALL-E and Bark generate neural-codec tokens; OpenAI TTS, ElevenLabs, Cartesia Sonic): single model from text to audio.
 
 **Features**: voice cloning (replicate a voice from a few seconds of audio), prosody control (emotion, pacing, emphasis), multilingual, multi-speaker. Used in voice assistants, audiobook generation, accessibility, content creation, dubbing. Modern TTS is so good that synthetic voices are often indistinguishable from real—creating opportunities and risks (deepfakes, fraud).
 
 ### How does Whisper work?
 Whisper (OpenAI, 2022) is an **encoder-decoder Transformer** trained on 680K hours of multilingual web audio with weak supervision (paired audio-text from the web). Architecture: encoder consumes log-mel spectrograms (audio → time-frequency); decoder generates text tokens autoregressively.
 
-Tasks via special tokens: transcription, translation (to English), language identification, voice activity detection, timestamping. Comes in sizes (tiny → large-v3). Robust across languages, accents, noise. Open-source and free—the de facto standard for ASR. Successors / alternatives: Deepgram, AssemblyAI, Distil-Whisper, NVIDIA NeMo, Cartesia Sonic. Whisper variants include streaming versions for real-time.
+Tasks via special tokens: transcription, translation (to English), language identification, voice activity detection, timestamping. Comes in sizes (tiny → large-v3). Robust across languages, accents, noise. Open-source and free—the de facto standard for ASR. Successors / alternatives: Deepgram, AssemblyAI, Distil-Whisper, faster-whisper, NVIDIA NeMo. Whisper variants include streaming versions for real-time.
 
 ### Multi-modal RAG vs text-only?
 Extends RAG to retrieve and consume images, tables, audio, video alongside text. Two main patterns:
@@ -3455,7 +3455,7 @@ The toolkit:
 - **GQA/MQA**: share K, V across heads for smaller cache.
 - **Prompt caching**: reuse KV cache of shared prefixes.
 - **Model distillation**: smaller student matching teacher quality.
-- **Parallelism**: tensor (split layers), pipeline (split by layer), sequence (split sequence).
+- **Parallelism**: tensor (split weight matrices within a layer), pipeline (split across layers), sequence (split the sequence dimension).
 - **Efficient serving**: vLLM, TGI, TensorRT-LLM, SGLang.
 - **Compiler optimizations**: torch.compile, TensorRT, XLA, ONNX.
 
@@ -3479,7 +3479,7 @@ Key dimensions:
 Data parallel is for **throughput**; model parallel is for **fitting** large models.
 
 ### Tensor parallelism?
-Splits individual matrix multiplications across GPUs. For a linear layer `Y = XW`, partition W column-wise across GPUs; each GPU computes a chunk of Y; **all-reduce** combines them. Same idea for attention heads (split heads across GPUs).
+Splits individual matrix multiplications across GPUs. For a linear layer `Y = XW`, partition W column-wise across GPUs so each GPU computes a slice of Y (combined by **all-gather**), or row-wise so each GPU computes a partial sum (combined by **all-reduce**)—Megatron-style MLPs pair the two so only one all-reduce is needed. Same idea for attention heads (split heads across GPUs).
 
 Requires fast inter-GPU communication (NVLink) since every layer needs cross-GPU sync. Standard for serving 70B+ models on multi-GPU nodes. Megatron-LM popularized it. Tools: vLLM, TGI, TensorRT-LLM all support tensor parallel out of the box.
 
@@ -3491,7 +3491,7 @@ Split the model **by layers** across GPUs—layers 1-10 on GPU 0, 11-20 on GPU 1
 ### Continuous batching for inference throughput?
 Static batching = wait for all requests in a batch to finish before starting the next batch. Wastes GPU when some requests are long, others short.
 
-**Continuous batching** (vLLM, TGI): treat each sample as independent; when one finishes, immediately add a new request to the running batch. The batch size dynamically changes per iteration. Implementation requires paged attention for variable-length KV cache.
+**Continuous batching** (vLLM, TGI): treat each sample as independent; when one finishes, immediately add a new request to the running batch. The batch size dynamically changes per iteration. Paged attention isn't strictly required (Orca/TGI predate it) but makes the variable-length KV cache memory-efficient, so modern stacks pair the two.
 
 Result: 2–10× throughput improvement on real workloads with variable-length generation. Standard in modern serving stacks.
 
@@ -3518,7 +3518,7 @@ KV cache memory = `2 × layers × heads × head_dim × seq_len × batch × bytes
 ### What is Paged Attention?
 Paged Attention (vLLM, Kwon et al., 2023) manages KV cache like OS virtual memory. Cache is split into **fixed-size blocks** (e.g., 16 tokens each); a **block table** maps logical token positions to physical blocks; blocks can be non-contiguous in memory.
 
-Benefits: (1) **Zero memory fragmentation** (no waste from variable-length sequences); (2) **Higher batch sizes** for the same VRAM; (3) **Easy prefix sharing** (multiple sequences share blocks); (4) **Efficient long-context** support. Core enabling technology of vLLM, now also adopted by TGI and others. Significantly improves throughput in production.
+Benefits: (1) **Near-zero memory fragmentation** (external fragmentation eliminated; waste bounded to under one block per sequence, <4%); (2) **Higher batch sizes** for the same VRAM; (3) **Easy prefix sharing** (multiple sequences share blocks); (4) **Efficient long-context** support. Core enabling technology of vLLM, now also adopted by TGI and others. Significantly improves throughput in production.
 
 ### Edge/mobile inference optimization?
 On-device LLMs (phones, laptops, embedded):
@@ -3561,7 +3561,7 @@ Trigger metrics: **GPU utilization**, **queue depth**, **p99 latency**, **active
 - **Health checks**: remove unhealthy replicas from rotation.
 
 ### Manage GPU memory for multiple models?
-- **Multi-model serving** (NVIDIA Triton, TGI, vLLM): host multiple models on the same GPU; load on demand.
+- **Multi-model serving** (NVIDIA Triton, Ray Serve): host multiple models on the same GPU; load on demand (vLLM/TGI serve one base model per instance).
 - **Model swap on demand**: load model when requested; evict idle.
 - **LoRA adapter serving** (S-LoRA, vLLM Lora): one base model + many lightweight adapters; serve thousands of fine-tuned variants from one GPU.
 - **CPU offload**: park idle models in CPU RAM; load to GPU when needed.
@@ -3570,7 +3570,7 @@ Trigger metrics: **GPU utilization**, **queue depth**, **p99 latency**, **active
 
 ### Model sharding—when?
 Model sharding (splitting a model across multiple GPUs) is needed when:
-- **Model + KV cache doesn't fit on one GPU**. 70B in BF16 = 140GB > any single GPU; needs at least 2-4 H100s.
+- **Model + KV cache doesn't fit on one GPU**. 70B in BF16 = 140GB > an 80GB H100/A100; needs 2-4 of them (only 141GB+ parts like H200/B200/MI300X fit it on one device, with little KV headroom).
 - **Long-context serving** requires more memory than one GPU has.
 - **Very large MoE models** with many experts.
 
@@ -3608,9 +3608,9 @@ Loading a 70B model from disk takes minutes; cold start ruins serverless economi
 - **Warm pool of replicas**: keep N always-on at min cost.
 - **Model snapshotting** (CRIU): snapshot a warm process; restore is faster than load.
 - **Smaller models**: SLMs cold-start in seconds.
-- **Always-warm tiers**: providers (Modal, Replicate, Banana) offer pre-warmed instances.
+- **Always-warm tiers**: providers (Modal, Replicate, Baseten) offer pre-warmed instances.
 - **Model streaming**: load weights in chunks, start serving partially.
-- **Disaggregated serving**: separate prefill (cold-start expensive) from decode (cheaper).
+- **Disaggregated serving**: separate compute-bound prefill from bandwidth-bound decode onto different GPU pools so long prefills don't stall decode (a throughput/TTFT optimization rather than a cold-start fix).
 
 ### Model caching for redundant computations?
 - **Prompt prefix KV cache**: providers cache the KV cache of shared prefixes (system prompts, retrieved knowledge); subsequent requests with same prefix skip prefill computation.
@@ -3726,7 +3726,7 @@ def run_agent(task, tools_registry, max_iters=15, max_tokens=20000):
 ```
 
 ### Semantic search
-For production, use a real vector DB; this is for understanding the math. Note `k` should be modest (5-20) for downstream LLM consumption; full-corpus sort is O(N), not practical above ~10K vectors.
+For production, use a real vector DB; this is for understanding the math. Note `k` should be modest (5-20) for downstream LLM consumption; brute-force scoring is O(N·d) plus an O(N log N) sort—fine up to ~10⁵-10⁶ vectors with vectorized NumPy, beyond which you want an ANN index.
 
 ```python
 import numpy as np
@@ -3749,15 +3749,27 @@ Three patterns from simple to sophisticated. Choose based on content type and do
 def fixed_chunk(text, size=500, overlap=50):
     return [text[i:i+size] for i in range(0, len(text), size - overlap)]
 
-# Recursive: try larger separators first; LangChain default
-def recursive_chunk(text, size=500, separators=["\n\n", "\n", ". ", " "]):
+# Recursive: try larger separators first, then merge parts back up to
+# `size` with overlap (what LangChain's RecursiveCharacterTextSplitter does)
+def recursive_chunk(text, size=500, overlap=50, separators=["\n\n", "\n", ". ", " "]):
     if len(text) <= size:
         return [text]
     for sep in separators:
         parts = text.split(sep)
         if len(parts) > 1:
-            return [c for p in parts for c in recursive_chunk(p, size, separators)]
-    return [text[i:i+size] for i in range(0, len(text), size)]
+            # split oversized parts further, then greedily merge up to `size`
+            pieces = [c for p in parts for c in recursive_chunk(p, size, overlap, separators)]
+            chunks, current = [], ""
+            for piece in pieces:
+                if current and len(current) + len(sep) + len(piece) > size:
+                    chunks.append(current)
+                    current = current[-overlap:] + sep + piece  # carry overlap
+                else:
+                    current = piece if not current else current + sep + piece
+            if current:
+                chunks.append(current)
+            return chunks
+    return [text[i:i+size] for i in range(0, len(text), size - overlap)]
 
 # Semantic: split where embedding similarity drops
 def semantic_chunk(sentences, threshold=0.7):
@@ -3818,8 +3830,10 @@ First reason step by step, then give a score."""
 
 def judge(context, question, answer, n_samples=3):
     scores = []
+    prompt = JUDGE_PROMPT.format(context=context, question=question, answer=answer)
     for _ in range(n_samples):
-        resp = llm.complete(JUDGE_PROMPT.format(...), response_format=JudgeScore)
+        # temperature > 0 so repeated samples actually vary
+        resp = llm.complete(prompt, response_format=JudgeScore, temperature=0.7)
         scores.append(resp.score)
     return sum(scores) / len(scores)
 ```
@@ -3828,19 +3842,20 @@ def judge(context, question, answer, n_samples=3):
 Server side streams tokens; client renders incrementally. Use SSE for HTTP, WebSockets for full-duplex.
 
 ```python
-# Server (FastAPI + SSE)
+# Server (FastAPI + SSE) — EventSource only issues GET requests,
+# so expose a GET endpoint (or use fetch + ReadableStream for POST bodies)
 from fastapi.responses import StreamingResponse
 
-@app.post("/chat")
-def chat(req: ChatRequest):
+@app.get("/chat")
+def chat(prompt: str):
     def event_stream():
-        for chunk in llm.stream(req.prompt):
+        for chunk in llm.stream(prompt):
             yield f"data: {json.dumps({'delta': chunk.delta})}\n\n"
         yield "data: [DONE]\n\n"
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 # Client
-const evtSource = new EventSource("/chat");
+const evtSource = new EventSource(`/chat?prompt=${encodeURIComponent(prompt)}`);
 evtSource.onmessage = (e) => {
     if (e.data === "[DONE]") evtSource.close();
     else document.getElementById("out").innerText += JSON.parse(e.data).delta;
@@ -3871,7 +3886,8 @@ Three patterns; in production, combine summary buffer + vector store for long-te
 # Sliding window: simple
 def windowed_history(history, n=10):
     sys = [m for m in history if m["role"] == "system"]
-    return sys + history[-n:]
+    rest = [m for m in history if m["role"] != "system"]  # avoid duplicating sys
+    return sys + rest[-n:]
 
 # Summary buffer: summarize old when limit hit
 def summary_buffer(history, limit_tokens=4000, keep=4):
@@ -3898,11 +3914,11 @@ def detect_hallucination(answer: str, context: str) -> float:
     judgments = llm.complete(prompt, response_format=JudgmentList)
     return sum(1 for j in judgments if j.supported) / len(judgments)
 
-def answer_with_guard(question, context):
+def answer_with_guard(question, context, attempts=2):
     answer = llm.complete(rag_prompt(question, context))
     score = detect_hallucination(answer, context)
-    if score < 0.7:
-        return answer_with_guard(question, context)  # retry once
+    if score < 0.7 and attempts > 1:
+        return answer_with_guard(question, context, attempts - 1)  # bounded retry
     if score < 0.5:
         return "I'm not confident in the answer from the provided sources."
     return answer
@@ -3933,7 +3949,8 @@ def execute_tool_calls(resp, registry, max_output=2000):
     results = []
     for tc in resp.tool_calls:
         if tc.name not in registry:
-            results.append({"id": tc.id, "error": f"Unknown tool: {tc.name}"})
+            results.append({"role": "tool", "tool_call_id": tc.id,
+                            "content": f"Unknown tool: {tc.name}"})
             continue
         try:
             args = json.loads(tc.arguments)
@@ -4080,10 +4097,13 @@ def cached_complete(model, prompt, params, ttl=3600):
 Embed the query; retrieve cached answers for similar queries above a similarity threshold. Tune threshold carefully (0.95+ to avoid false hits).
 
 ```python
+import time
+
 def semantic_cache_get(query: str, threshold=0.95):
     q_vec = embed(query)
     hits = cache_vector_db.search(q_vec, k=1)
-    if hits and hits[0].score >= threshold:
+    if (hits and hits[0].score >= threshold
+            and hits[0].metadata["expires_at"] > time.time()):
         return hits[0].metadata["response"]
     return None
 
@@ -4093,7 +4113,7 @@ def semantic_cache_complete(query, ttl=3600):
     resp = llm.complete(query)
     cache_vector_db.upsert(embed(query),
                            metadata={"query": query, "response": resp,
-                                     "timestamp": time.time()})
+                                     "expires_at": time.time() + ttl})
     return resp
 ```
 
@@ -4101,6 +4121,8 @@ def semantic_cache_complete(query, ttl=3600):
 Layer detectors: cheap regex first, ML classifier for ambiguous, LLM judge for the hardest. No single method catches everything.
 
 ```python
+import re
+
 SUSPICIOUS_PATTERNS = [
     r"ignore.{0,20}(previous|above|prior)",
     r"system.{0,5}prompt",
@@ -4200,7 +4222,7 @@ ROI = (benefit − cost) / cost. **Be honest about uncertainty** in pre-launch e
 Multi-layer defense + transparency:
 - **Detect**: faithfulness scoring (NLI, LLM judge against retrieved context), citation verification, factuality checks against KB.
 - **Prevent**: RAG to ground in real sources; instruct abstention ("say 'I don't know' if not supported"); lower temperature; stronger model; structured output where possible.
-- **Express uncertainty**: surface confidence scores; show citations; let users verify.
+- **Express uncertainty**: derive confidence from retrieval/faithfulness scores or self-consistency (verbalized model confidence is poorly calibrated); show citations; let users verify.
 - **Recover**: retry with stronger prompt; fall back to "I'm not sure" rather than confabulate.
 - **Track**: hallucination rate as a production SLO with alerting.
 - **Learn**: capture user-flagged errors; add to eval set; iterate prompts/retrieval; retrain if needed.
@@ -4209,8 +4231,8 @@ For high-stakes domains (medical, legal, finance), add HITL review for any uncer
 
 ### LLM API vs self-hosting OSS?
 Decision factors:
-- **Quality**: frontier closed models (GPT-4, Claude, Gemini) still beat open-weights on the hardest tasks; gap is narrowing fast.
-- **Volume**: high volume tilts toward self-hosting (break-even ~1B tokens/month); low/spiky volume favors API.
+- **Quality**: the current frontier closed models still beat open-weights on the hardest tasks; gap is narrowing fast.
+- **Volume**: sustained high volume tilts toward self-hosting—break-even is typically tens of billions of tokens/month and depends on model size and keeping the GPUs busy; low/spiky volume favors API.
 - **Latency**: self-hosting can win on latency (no internet round-trip, dedicated capacity); APIs have variable latency.
 - **Privacy / data residency**: self-host or enterprise providers (with BAA, zero-retention) for regulated data.
 - **Customization**: self-host enables fine-tuning, custom architectures.
@@ -4303,7 +4325,7 @@ Cost optimization checklist (apply in order of leverage):
 - **Model routing**: small for easy, big for hard. 5-10× savings possible.
 - **Caching**: semantic + exact + prompt prefix. 30-60% hit rates typical.
 - **Shorten prompts**: remove redundant context, fewer few-shot examples, compress.
-- **Limit output**: explicit length caps; smaller `max_tokens`.
+- **Limit output**: instruct brevity / structured output to genuinely shorten responses; `max_tokens` only as a runaway guard (it truncates, it doesn't summarize).
 - **Trim RAG**: better re-ranking → fewer chunks → less context.
 - **Fine-tune smaller model** to handle the bulk of requests.
 - **Batch / async** where latency allows (50% off APIs).
@@ -4351,7 +4373,7 @@ Drift sources:
 
 ### Limited labeled data—how to approach?
 - **Few-shot prompting**: 5–20 examples can outperform zero-shot for many tasks; don't fine-tune until prompting plateaus.
-- **Synthetic data** generated by a strong LLM (GPT-4, Claude), reviewed by humans for quality before use.
+- **Synthetic data** generated by a strong LLM, reviewed by humans for quality before use (check the provider's ToS on training with outputs; open-weight teachers avoid the issue).
 - **Active learning**: model labels uncertain cases; humans review only the most informative ones; cycle.
 - **Weak supervision** (Snorkel-style): use heuristics, knowledge bases, and other signals to programmatically label data; combine probabilistically.
 - **Transfer learning**: start from a strong general or domain-related model; fine-tune small.
@@ -4373,7 +4395,7 @@ Drift sources:
 ### AI engineering in 3-5 years?
 **Likely directions** (with appropriate humility):
 - **Agents go mainstream**: planning, tool use, autonomous workflows become reliable enough for production.
-- **Cheaper / longer-context models**: 1M+ context becomes affordable; RAG patterns shift.
+- **Cheaper / longer-context models**: 1M+ context is already shipping; the open question is whether it gets cheap enough to displace retrieval for mid-size corpora.
 - **Multimodal default**: text-only is the exception; voice, image, video are integrated.
 - **On-device SLMs everywhere**: phones, browsers, embedded devices run capable models.
 - **Better evaluation**: rigorous, automated, broadly trusted.
@@ -4381,7 +4403,7 @@ Drift sources:
 - **Regulation**: EU AI Act compliance becomes routine; other regions follow.
 - **Specialized AI engineers**: alignment, evals, agent orchestration, multimodal, infrastructure.
 - **Compound AI systems**: many models + tools + retrievers, orchestrated.
-- **Reasoning models** (o1-style) become commoditized.
+- **Reasoning models are already commoditized**; the next knob is controlling reasoning effort/cost per request.
 - **AI-driven AI engineering**: tools that build AI systems.
 
 I'm hesitant to predict specifics—the field has surprised everyone repeatedly. The meta-skill is staying adaptive.
