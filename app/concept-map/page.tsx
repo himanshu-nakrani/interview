@@ -229,6 +229,7 @@ export default function ConceptMapPage() {
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder="Filter concepts..."
+                aria-label="Filter concepts"
                 className="search-input w-full !h-10 py-2.5 pl-10 pr-3"
               />
             </label>
@@ -264,6 +265,13 @@ export default function ConceptMapPage() {
           </div>
 
           <div className="concept-map-scroll" ref={mapScrollRef}>
+            <div
+              className="concept-map-sizer"
+              style={{
+                width: `${mapSize.width * zoomLevels[zoomIndex]}px`,
+                height: `${mapSize.height * zoomLevels[zoomIndex]}px`,
+              }}
+            >
             <div
               className="concept-map-canvas"
               style={{
@@ -342,6 +350,7 @@ export default function ConceptMapPage() {
                       !isMatched ? "concept-node-dimmed" : "",
                     ].join(" ")}
                     style={{ left: position.x, top: position.y }}
+                    tabIndex={isMatched ? undefined : -1}
                   >
                     <span className="concept-node-kicker">{String(section.number).padStart(2, "0")}</span>
                     <span className="concept-node-title">{section.title}</span>
@@ -350,6 +359,7 @@ export default function ConceptMapPage() {
                   </button>
                 );
               })}
+            </div>
             </div>
           </div>
         </section>

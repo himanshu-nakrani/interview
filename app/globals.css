@@ -22,7 +22,7 @@
   /* Text */
   --color-ink-hi: #ece5dc;
   --color-ink-mid: #b3a99c;
-  --color-ink-low: #877d71;
+  --color-ink-low: #93897c;
   --color-ink-question: #e2dad0;
 
   /* Accent: dried sage */
@@ -142,7 +142,6 @@ body::after {
 :focus-visible {
   outline: 2px solid rgba(140, 169, 140, 0.75);
   outline-offset: 2px;
-  border-radius: var(--r-sm);
 }
 
 input:focus-visible,
@@ -450,6 +449,26 @@ kbd {
   color: var(--text-hi);
 }
 
+/* Keep touch targets comfortable without changing the visual size */
+.section-plate .text-btn {
+  padding: 12px 8px;
+  margin: -12px -8px;
+}
+
+/* The question title is a real <button> for keyboard/AT users */
+.question-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
 /* Card action icons rest quieter, wake on card hover/focus */
 .question-card .icon-btn {
   opacity: 0.55;
@@ -562,6 +581,12 @@ kbd {
   animation: blur-settle 900ms var(--ease-out) backwards;
 }
 
+/* After the opening has played once, remounts render settled */
+.no-intro .hero-rule,
+.no-intro .blur-settle {
+  animation: none;
+}
+
 @keyframes blur-settle {
   from {
     filter: blur(6px);
@@ -629,7 +654,7 @@ kbd {
   background: var(--surface-1);
   box-shadow: var(--hairline-top);
   content-visibility: auto;
-  contain-intrinsic-size: auto 88px;
+  contain-intrinsic-size: auto 112px;
   scroll-margin-top: calc(var(--site-header-height) + 0.75rem);
   transition: border-color var(--dur-1) var(--ease-out), background-color var(--dur-1) var(--ease-out);
 }
@@ -732,8 +757,8 @@ kbd {
   height: 5px;
   width: 5px;
   border-radius: 999px;
-  background: var(--sage-500);
-  opacity: 0.4;
+  background: var(--sage-400);
+  opacity: 0.75;
 }
 
 .chevron {
@@ -991,6 +1016,22 @@ kbd {
   transition: transform 600ms var(--ease-out);
 }
 
+/* Sidebar nav swap: fixed measure so labels never reflow mid-animation,
+   incoming nav fades in after the width settles */
+.toc-nav-full {
+  min-width: 16.25rem;
+}
+
+.toc-nav-full,
+.toc-nav-mini {
+  animation: fade-in-soft 200ms var(--ease-out) 140ms backwards;
+}
+
+@keyframes fade-in-soft {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 .toc-mini {
   display: flex;
   height: 28px;
@@ -1103,9 +1144,17 @@ kbd {
   background-size: 32px 32px;
 }
 
-.concept-map-canvas {
+/* Sizer tracks the scaled size so scroll extents and centering follow zoom */
+.concept-map-sizer {
   position: relative;
   margin: 0 auto;
+  transition: width 250ms var(--ease-inout), height 250ms var(--ease-inout);
+}
+
+.concept-map-canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
   transform-origin: left top;
   transition: transform 250ms var(--ease-inout);
 }
@@ -1214,8 +1263,14 @@ kbd {
 }
 
 .concept-node-dimmed {
-  opacity: 0.3;
+  opacity: 0.55;
 }
+
+/* Neutral lightness ramp per learning-stage group */
+.concept-node-foundation .concept-node-tag { border-color: #332c25; }
+.concept-node-build .concept-node-tag { border-color: #3b332b; }
+.concept-node-operate .concept-node-tag { border-color: #443a31; }
+.concept-node-prove .concept-node-tag { border-color: #4d4237; }
 
 .concept-node-kicker {
   font-family: var(--font-mono);
@@ -1275,14 +1330,14 @@ kbd {
 }
 
 .stat-pill {
-  background: var(--sage-glow-soft);
+  background: var(--surface-3);
   border: 1px solid transparent;
   font-family: var(--font-mono);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   padding: 2px 9px;
   border-radius: 999px;
-  color: var(--sage-300);
+  color: var(--text-mid);
 }
 
 .filter-pill {
@@ -1295,6 +1350,11 @@ kbd {
 }
 
 @media (max-width: 640px) {
+  /* 16px stops iOS Safari from auto-zooming the page on focus */
+  .search-input {
+    font-size: 16px;
+  }
+
   .stat-tile {
     padding: 11px 12px;
   }

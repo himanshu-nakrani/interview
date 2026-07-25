@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo, useEffect, useLayoutEffect, useRef, useCallback, useSyncExternalStore } from 'react';
+import React, { useState, useMemo, useEffect, useLayoutEffect, useRef, useCallback, useSyncExternalStore, startTransition } from 'react';
 import { Search, Copy, ChevronDown, X, BookOpen, Menu, Heart, Shuffle, Link2, Eye, Check, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { motion, AnimatePresence, useReducedMotion, animate } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
@@ -59,8 +59,17 @@ function loadStoredBoolean(key: string, fallback = false): boolean {
   return fallback;
 }
 
-/* Mono numeral that counts up on mount, then tracks value changes. */
-function CountUp({ value, suffix = '' }: { value: number; suffix?: string }) {
+function safeSetItem(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // storage may be full or unavailable — persistence is best-effort
+  }
+}
+
+/* Mono numeral that counts up on first mount, then tracks value changes.
+   With animateIn=false (intro already played) it renders settled. */
+function CountUp({ value, suffix = '', animateIn = true }: { value: number; suffix?: string; animateIn?: boolean }) {
   const reduce = useReducedMotion();
   const ref = useRef<HTMLSpanElement>(null);
   const prev = useRef<number | null>(null);
@@ -68,7 +77,7 @@ function CountUp({ value, suffix = '' }: { value: number; suffix?: string }) {
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
-    if (reduce) {
+    if (reduce || (prev.current === null && !animateIn)) {
       el.textContent = `${value}${suffix}`;
       prev.current = value;
       return;
@@ -88,10 +97,10 @@ function CountUp({ value, suffix = '' }: { value: number; suffix?: string }) {
       },
     });
     return () => controls.stop();
-  }, [value, suffix, reduce]);
+  }, [value, suffix, reduce, animateIn]);
 
   return (
-    <span ref={ref} className="blur-settle">
+    <span ref={ref} className={animateIn ? 'blur-settle' : undefined}>
       {value}
       {suffix}
     </span>
@@ -179,22 +188,32 @@ export default function AIInterviewPrep() {
 
   const headerRef = useRef<HTMLElement>(null);
   const lastScrollY = useRef(0);
-  const [headerHeight, setHeaderHeight] = useState(112);
+  const scrollOffsetRef = useRef(124);
   const [filtersCollapsed, setFiltersCollapsed] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() =>
     loadStoredBoolean('ai-interview-sidebar-collapsed')
   );
+  // User-collapsed cards while search auto-expand is active
+  const [searchCollapsedIds, setSearchCollapsedIds] = useState<Set<string>>(new Set());
+  // Once the opening choreography has played, remounts render settled.
+  // Flips via timer/interaction only, so SSR and hydration renders match.
+  const [introDone, setIntroDone] = useState(false);
 
-  const getScrollOffset = useCallback((extra = 12) => headerHeight + extra, [headerHeight]);
+  useEffect(() => {
+    const t = window.setTimeout(() => setIntroDone(true), 1600);
+    return () => window.clearTimeout(t);
+  }, []);
 
-  // Track sticky header height for sidebar offset and scroll targets
+  // Track sticky header height for sidebar offset and scroll targets.
+  // Only a CSS var + ref update — no React state, so the 300ms header
+  // collapse animation never re-renders the 456-card tree.
   useEffect(() => {
     const header = headerRef.current;
     if (!header) return;
 
     const update = () => {
       const height = Math.ceil(header.getBoundingClientRect().height);
-      setHeaderHeight(height);
+      scrollOffsetRef.current = height + 12;
       document.documentElement.style.setProperty('--site-header-height', `${height}px`);
     };
 
@@ -207,6 +226,22 @@ export default function AIInterviewPrep() {
       observer.disconnect();
       window.removeEventListener('resize', update);
     };
+  }, []);
+
+  // Multi-pass scroll: content-visibility placeholders settle to real
+  // heights as the destination renders, so re-measure across two frames.
+  const scrollToElementId = useCallback((elId: string) => {
+    const go = () => {
+      const el = document.getElementById(elId);
+      if (!el) return;
+      const top = el.getBoundingClientRect().top + window.scrollY - scrollOffsetRef.current;
+      window.scrollTo({ top, behavior: 'auto' });
+    };
+    go();
+    requestAnimationFrame(() => {
+      go();
+      requestAnimationFrame(go);
+    });
   }, []);
 
   // Collapse filter rows on scroll down; expand on scroll up or near top
@@ -254,43 +289,42 @@ export default function AIInterviewPrep() {
 
   // Persist favorites
   useEffect(() => {
-    localStorage.setItem('ai-interview-favorites', JSON.stringify(Array.from(favorites)));
+    safeSetItem('ai-interview-favorites', JSON.stringify(Array.from(favorites)));
   }, [favorites]);
 
   useEffect(() => {
-    localStorage.setItem('ai-interview-viewed', JSON.stringify(Array.from(viewedQuestions)));
+    safeSetItem('ai-interview-viewed', JSON.stringify(Array.from(viewedQuestions)));
   }, [viewedQuestions]);
 
   useEffect(() => {
-    localStorage.setItem('ai-interview-sidebar-collapsed', String(sidebarCollapsed));
+    safeSetItem('ai-interview-sidebar-collapsed', String(sidebarCollapsed));
   }, [sidebarCollapsed]);
 
-  // Deep link support: open specific question from URL hash
+  // Deep link support: open specific question from URL hash.
+  // Runs on mount and real hashchange only — never on re-render.
   useEffect(() => {
+    let timer = 0;
     const handleHash = () => {
       const hash = window.location.hash.replace('#', '');
-      if (hash) {
-        for (const section of data.sections) {
-          const found = section.questions.find(q => q.id === hash);
-          if (found) {
-            setExpandedIds(prev => new Set(prev).add(hash));
-            setTimeout(() => {
-              const el = document.getElementById(`card-${hash}`);
-              if (el) {
-                const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-                window.scrollTo({ top, behavior: 'auto' });
-              }
-            }, 80);
-            break;
-          }
+      if (!hash) return;
+      for (const section of data.sections) {
+        const found = section.questions.find(q => q.id === hash);
+        if (found) {
+          setExpandedIds(prev => new Set(prev).add(hash));
+          window.clearTimeout(timer);
+          timer = window.setTimeout(() => scrollToElementId(`card-${hash}`), 80);
+          break;
         }
       }
     };
 
     handleHash();
     window.addEventListener('hashchange', handleHash);
-    return () => window.removeEventListener('hashchange', handleHash);
-  }, [getScrollOffset]);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('hashchange', handleHash);
+    };
+  }, [scrollToElementId]);
 
   // Mark question as viewed when expanded
   const markAsViewed = (id: string) => {
@@ -320,9 +354,11 @@ export default function AIInterviewPrep() {
     });
   };
 
-  // Keyboard support for modal
+  // Keyboard support for modal — plain keys only, never the native
+  // copy/paste shortcuts (Cmd/Ctrl+C must keep the user's selection)
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === 'Escape' && focusQuestion) {
         closeFocus();
       }
@@ -352,10 +388,24 @@ export default function AIInterviewPrep() {
     );
   };
 
-  // Generate a short preview of the answer for collapsed state
-  const getAnswerPreview = (answer: string): string => {
-    let preview = answer.split('\n\n')[0].trim();
-    preview = preview.replace(/[#*`]/g, '').replace(/\s+/g, ' ');
+  // Generate a short preview of the answer for collapsed state.
+  // While searching, center the preview on the first match so every
+  // result card shows WHY it matched.
+  const getAnswerPreview = (answer: string, term?: string): string => {
+    const clean = (s: string) => s.replace(/[#*`]/g, '').replace(/\s+/g, ' ').trim();
+    const t = term?.trim().toLowerCase();
+    if (t) {
+      const cleaned = clean(answer);
+      const i = cleaned.toLowerCase().indexOf(t);
+      if (i >= 0) {
+        const start = Math.max(0, i - 70);
+        let snippet = cleaned.slice(start, start + 180).trim();
+        if (start > 0) snippet = '…' + snippet;
+        if (start + 180 < cleaned.length) snippet += '…';
+        return snippet;
+      }
+    }
+    let preview = clean(answer.split('\n\n')[0]);
     if (preview.length > 180) {
       preview = preview.slice(0, 177) + '…';
     }
@@ -405,7 +455,22 @@ export default function AIInterviewPrep() {
     return allMatching;
   }, [searchTerm, filteredSections]);
 
-  const effectiveExpandedIds = searchExpandedIds ?? expandedIds;
+  // Auto-expanded search results minus the ones the user collapsed
+  const effectiveExpandedIds = useMemo(() => {
+    if (!searchExpandedIds) return expandedIds;
+    if (searchCollapsedIds.size === 0) return searchExpandedIds;
+    const s = new Set(searchExpandedIds);
+    searchCollapsedIds.forEach((id) => s.delete(id));
+    return s;
+  }, [searchExpandedIds, expandedIds, searchCollapsedIds]);
+
+  // Single entry point for search changes: resets per-search collapse
+  // state and marks the opening choreography as done.
+  const updateSearchTerm = (value: string) => {
+    setIntroDone(true);
+    setSearchCollapsedIds((prev) => (prev.size === 0 ? prev : new Set()));
+    setSearchTerm(value);
+  };
 
   const visibleQuestionCount = useMemo(() => {
     return filteredSections.reduce((sum, s) => sum + s.questions.length, 0);
@@ -426,6 +491,21 @@ export default function AIInterviewPrep() {
   }, [effectiveExpandedIds, filteredSections]);
 
   const toggleQuestion = (id: string) => {
+    // While search auto-expand is active, toggling works against the
+    // per-search collapsed set so cards actually close.
+    if (searchExpandedIds?.has(id)) {
+      setSearchCollapsedIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) {
+          next.delete(id);
+          markAsViewed(id);
+        } else {
+          next.add(id);
+        }
+        return next;
+      });
+      return;
+    }
     setExpandedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) {
@@ -440,6 +520,7 @@ export default function AIInterviewPrep() {
 
   const openFocus = (q: Question, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
+    focusReturnRef.current = document.activeElement as HTMLElement | null;
     markAsViewed(q.id);
     setFocusQuestion(q);
     setExpandedIds(prev => new Set(prev).add(q.id));
@@ -468,16 +549,24 @@ export default function AIInterviewPrep() {
     });
   };
 
+  // startTransition keeps the click responsive while 456 answers mount
   const expandAll = () => {
+    if (searchExpandedIds) {
+      setSearchCollapsedIds(new Set());
+    }
     const allIds = new Set<string>();
     filteredSections.forEach((s) =>
       s.questions.forEach((q) => allIds.add(q.id))
     );
-    setExpandedIds(allIds);
+    startTransition(() => setExpandedIds(allIds));
   };
 
   const collapseAll = () => {
-    setExpandedIds(new Set());
+    if (searchExpandedIds) {
+      setSearchCollapsedIds(new Set(searchExpandedIds));
+      return;
+    }
+    startTransition(() => setExpandedIds(new Set()));
   };
 
   const goToRandomQuestion = () => {
@@ -487,15 +576,15 @@ export default function AIInterviewPrep() {
     const randomQ = allQuestions[Math.floor(Math.random() * allQuestions.length)];
 
     setExpandedIds(prev => new Set(prev).add(randomQ.id));
+    setSearchCollapsedIds((prev) => {
+      if (!prev.has(randomQ.id)) return prev;
+      const next = new Set(prev);
+      next.delete(randomQ.id);
+      return next;
+    });
     markAsViewed(randomQ.id);
 
-    setTimeout(() => {
-      const el = document.getElementById(`card-${randomQ.id}`);
-      if (el) {
-        const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-        window.scrollTo({ top, behavior: 'auto' });
-      }
-    }, 50);
+    setTimeout(() => scrollToElementId(`card-${randomQ.id}`), 50);
 
     toast.success('Random question loaded');
   };
@@ -504,17 +593,19 @@ export default function AIInterviewPrep() {
     const section = data.sections.find(s => s.id === sectionId);
     if (!section) return;
 
-    setExpandedIds(prev => {
-      const next = new Set(prev);
-      section.questions.forEach(q => {
-        if (expand) {
-          next.add(q.id);
-        } else {
-          next.delete(q.id);
-        }
-      });
-      return next;
-    });
+    startTransition(() =>
+      setExpandedIds(prev => {
+        const next = new Set(prev);
+        section.questions.forEach(q => {
+          if (expand) {
+            next.add(q.id);
+          } else {
+            next.delete(q.id);
+          }
+        });
+        return next;
+      })
+    );
 
     if (expand) {
       setViewedQuestions(prev => {
@@ -526,56 +617,95 @@ export default function AIInterviewPrep() {
   };
 
   const scrollToSection = (sectionId: string) => {
-    const el = document.getElementById(sectionId);
-    if (el) {
-      const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-      window.scrollTo({ top, behavior: 'auto' });
-      setActiveSection(sectionId);
-      setShowMobileToc(false);
-    }
+    scrollToElementId(sectionId);
+    setActiveSection(sectionId);
+    setShowMobileToc(false);
   };
 
-  // Keyboard shortcut: press / to focus search
+  // Keyboard shortcut: press / to focus search. Escape clears the
+  // search only when no overlay is open (the overlay consumes it).
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === '/' && document.activeElement?.tagName !== 'INPUT') {
         e.preventDefault();
         const input = document.getElementById('search-input') as HTMLInputElement;
         input?.focus();
       }
-      if (e.key === 'Escape' && searchTerm) {
+      if (e.key === 'Escape' && searchTerm && !focusQuestion && !showMobileToc) {
+        setSearchCollapsedIds(new Set());
         setSearchTerm('');
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [searchTerm]);
+  }, [searchTerm, focusQuestion, showMobileToc]);
 
-  // Track active section on scroll
+  // Track active section on scroll. Sections are far taller than the
+  // viewport, so intersection ratios never reach usable thresholds —
+  // instead, pick the last section whose top has passed the header on
+  // each (rAF-throttled) scroll. 14 rect reads per frame is cheap.
   useEffect(() => {
-    const topMargin = `-${getScrollOffset()}px`;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((e) => e.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-        if (visible) {
-          setActiveSection(visible.target.id);
+    let ticking = false;
+    const compute = () => {
+      ticking = false;
+      const offset = scrollOffsetRef.current + 24;
+      let current: string | null = null;
+      for (const s of data.sections) {
+        const el = document.getElementById(s.id);
+        if (!el) continue;
+        if (el.getBoundingClientRect().top <= offset) {
+          current = s.id;
+        } else {
+          break;
         }
-      },
-      { rootMargin: `${topMargin} 0px -60% 0px`, threshold: [0.2, 0.6] }
-    );
+      }
+      if (current) {
+        setActiveSection((prev) => (prev === current ? prev : current));
+      }
+    };
+    const onScroll = () => {
+      if (!ticking) {
+        ticking = true;
+        requestAnimationFrame(compute);
+      }
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    const raf = requestAnimationFrame(compute);
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      cancelAnimationFrame(raf);
+    };
+  }, []);
 
-    data.sections.forEach((s) => {
-      const el = document.getElementById(s.id);
-      if (el) observer.observe(el);
-    });
+  // Move focus into the dialog on open; restore it on close
+  const modalCloseRef = useRef<HTMLButtonElement>(null);
+  const drawerCloseRef = useRef<HTMLButtonElement>(null);
+  const focusReturnRef = useRef<HTMLElement | null>(null);
 
-    return () => observer.disconnect();
-  }, [headerHeight, getScrollOffset]);
+  useEffect(() => {
+    if (focusQuestion) {
+      modalCloseRef.current?.focus();
+      return;
+    }
+    focusReturnRef.current?.focus();
+    focusReturnRef.current = null;
+  }, [focusQuestion]);
+
+  useEffect(() => {
+    if (!showMobileToc) return;
+    drawerCloseRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowMobileToc(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showMobileToc]);
 
   const isSearching = searchTerm.trim().length > 0;
-  const showEntrance = !isSearching && !showFavoritesOnly && !reduceMotion;
+  const showEntrance = !isSearching && !showFavoritesOnly && !reduceMotion && !introDone;
+  // Gate localStorage-derived layout behind mount to keep SSR HTML valid
+  const shownSidebarCollapsed = isMounted && sidebarCollapsed;
 
   const focusSection = focusQuestion
     ? data.sections.find((s) => s.questions.some((q) => q.id === focusQuestion.id))
@@ -599,6 +729,8 @@ export default function AIInterviewPrep() {
 
   return (
     <div className="min-h-screen bg-page text-ink-mid">
+      {/* Page chrome is inert while the focus modal is open */}
+      <div inert={focusQuestion ? true : undefined}>
       {/* Top nav / header */}
       <header ref={headerRef} className="site-header sticky top-0 z-50">
         <div className="relative mx-auto max-w-7xl px-4 sm:px-6">
@@ -645,17 +777,18 @@ export default function AIInterviewPrep() {
                   id="search-input"
                   type="text"
                   value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
+                  onChange={(e) => updateSearchTerm(e.target.value)}
                   onFocus={() => setSearchFocused(true)}
                   onBlur={() => setSearchFocused(false)}
                   placeholder="Search questions and answers..."
+                  aria-label="Search questions and answers"
                   className="search-input w-full pl-11 pr-11"
                 />
                 <div className="search-slot">
                   {searchTerm ? (
                     <button
                       onClick={() => {
-                        setSearchTerm('');
+                        updateSearchTerm('');
                         document.getElementById('search-input')?.focus();
                       }}
                       className="search-clear"
@@ -688,6 +821,7 @@ export default function AIInterviewPrep() {
                   onClick={() => setShowMobileToc(!showMobileToc)}
                   className="btn-soft !px-3 sm:hidden"
                   aria-label="Open sections"
+                  aria-expanded={showMobileToc}
                 >
                   <Menu className="h-4 w-4" />
                 </button>
@@ -705,7 +839,7 @@ export default function AIInterviewPrep() {
                 )}
                 <button
                   onClick={() => {
-                    setSearchTerm('');
+                    updateSearchTerm('');
                     setShowFavoritesOnly(false);
                   }}
                   className="text-btn underline underline-offset-4"
@@ -740,7 +874,11 @@ export default function AIInterviewPrep() {
 
                   {/* Favorites toggle */}
                   <button
-                    onClick={() => setShowFavoritesOnly(!showFavoritesOnly)}
+                    onClick={() => {
+                      setIntroDone(true);
+                      setShowFavoritesOnly(!showFavoritesOnly);
+                    }}
+                    aria-pressed={showFavoritesOnly}
                     className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors duration-200 ${
                       showFavoritesOnly
                         ? 'border-line-strong bg-surface-3 text-ink-hi'
@@ -757,7 +895,7 @@ export default function AIInterviewPrep() {
                   {(searchTerm || showFavoritesOnly) && (
                     <button
                       onClick={() => {
-                        setSearchTerm('');
+                        updateSearchTerm('');
                         setShowFavoritesOnly(false);
                       }}
                       className="text-btn underline underline-offset-4"
@@ -783,7 +921,7 @@ export default function AIInterviewPrep() {
         <div className="flex flex-col gap-8 pt-6 pb-24 lg:flex-row">
           {/* Sidebar TOC */}
           <aside
-            className={`sidebar-aside hidden shrink-0 lg:block ${sidebarCollapsed ? 'w-12' : 'w-72'}`}
+            className={`sidebar-aside hidden shrink-0 lg:block ${shownSidebarCollapsed ? 'w-12' : 'w-72'}`}
           >
             <div
               className="toc-panel sticky overflow-y-auto overscroll-contain p-2"
@@ -794,19 +932,19 @@ export default function AIInterviewPrep() {
             >
               <div
                 className={`mb-3 flex items-center ${
-                  sidebarCollapsed ? 'justify-center px-1' : 'justify-between px-2'
+                  shownSidebarCollapsed ? 'justify-center px-1' : 'justify-between px-2'
                 }`}
               >
-                {!sidebarCollapsed && <div className="kicker px-1 pt-1">Contents</div>}
+                {!shownSidebarCollapsed && <div className="kicker px-1 pt-1">Contents</div>}
                 <button
                   type="button"
                   onClick={() => setSidebarCollapsed((prev) => !prev)}
                   className="icon-btn"
-                  title={sidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
-                  aria-label={sidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
-                  aria-expanded={!sidebarCollapsed}
+                  title={shownSidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
+                  aria-label={shownSidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
+                  aria-expanded={!shownSidebarCollapsed}
                 >
-                  {sidebarCollapsed ? (
+                  {shownSidebarCollapsed ? (
                     <PanelLeftOpen className="h-4 w-4" />
                   ) : (
                     <PanelLeftClose className="h-4 w-4" />
@@ -814,9 +952,9 @@ export default function AIInterviewPrep() {
                 </button>
               </div>
 
-              {!sidebarCollapsed ? (
+              {!shownSidebarCollapsed ? (
                 <>
-                  <nav className="space-y-0.5">
+                  <nav className="toc-nav-full space-y-0.5">
                     {data.sections.map((section) => {
                       const originalCount = section.questions.length;
                       const isActive = activeSection === section.id;
@@ -875,7 +1013,7 @@ export default function AIInterviewPrep() {
                   </div>
                 </>
               ) : (
-                <nav className="flex flex-col items-center gap-1 px-1 pb-1">
+                <nav className="toc-nav-mini flex flex-col items-center gap-1 px-1 pb-1">
                   {data.sections.map((section) => {
                     const isActive = activeSection === section.id;
 
@@ -913,12 +1051,20 @@ export default function AIInterviewPrep() {
                   animate={reduceMotion ? { opacity: 1 } : { x: 0 }}
                   exit={reduceMotion ? { opacity: 0 } : { x: '-100%' }}
                   transition={reduceMotion ? { duration: 0.2 } : MODAL_SPRING}
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="Sections"
                   className="drawer-panel absolute bottom-0 left-0 top-0 w-[min(18rem,85vw)] max-w-full overflow-y-auto overscroll-contain p-4"
                   onClick={(e) => e.stopPropagation()}
                 >
                   <div className="mb-4 flex items-center justify-between">
                     <div className="kicker">Sections</div>
-                    <button onClick={() => setShowMobileToc(false)} className="icon-btn" aria-label="Close sections">
+                    <button
+                      ref={drawerCloseRef}
+                      onClick={() => setShowMobileToc(false)}
+                      className="icon-btn"
+                      aria-label="Close sections"
+                    >
                       <X className="h-4 w-4" />
                     </button>
                   </div>
@@ -943,13 +1089,17 @@ export default function AIInterviewPrep() {
 
           {/* Main content */}
           <main className="min-w-0 flex-1">
+            {/* Keep an h1 in the tree while the hero is filtered away */}
+            {(isSearching || showFavoritesOnly) && (
+              <h1 className="sr-only">AI Engineering Interview Prep</h1>
+            )}
             {/* Intro banner */}
             {!isSearching && !showFavoritesOnly && (
               <motion.div
                 variants={heroStagger}
-                initial="hidden"
+                initial={introDone ? false : 'hidden'}
                 animate="show"
-                className="hero-card mb-10 px-6 py-8 sm:px-10 sm:py-10"
+                className={`hero-card mb-10 px-6 py-8 sm:px-10 sm:py-10 ${introDone ? 'no-intro' : ''}`}
               >
                 <div className="grid gap-8 xl:grid-cols-[minmax(0,1fr)_20rem] xl:items-end">
                   <div>
@@ -974,19 +1124,19 @@ export default function AIInterviewPrep() {
                     <div className="stat-tile">
                       <span className="label">Viewed</span>
                       <span className="value">
-                        <CountUp value={displayedViewedCount} />
+                        <CountUp value={displayedViewedCount} animateIn={!introDone} />
                       </span>
                     </div>
                     <div className="stat-tile">
                       <span className="label">Favorites</span>
                       <span className="value">
-                        <CountUp value={isMounted ? favorites.size : 0} />
+                        <CountUp value={isMounted ? favorites.size : 0} animateIn={!introDone} />
                       </span>
                     </div>
                     <div className="stat-tile">
                       <span className="label">Progress</span>
                       <span className="value">
-                        <CountUp value={displayedProgressPercentage} suffix="%" />
+                        <CountUp value={displayedProgressPercentage} suffix="%" animateIn={!introDone} />
                       </span>
                       <div className="stat-track">
                         <div
@@ -1011,7 +1161,7 @@ export default function AIInterviewPrep() {
                     </p>
                     <button
                       onClick={() => setShowFavoritesOnly(false)}
-                      className="mt-4 text-sm text-sage-300 underline underline-offset-4 hover:text-sage-200"
+                      className="text-btn mt-4 !text-sm underline underline-offset-4"
                     >
                       Browse all questions →
                     </button>
@@ -1069,18 +1219,11 @@ export default function AIInterviewPrep() {
                         style={enters ? { animationDelay: `${350 + idx * 40}ms` } : undefined}
                       >
                         <div className="card-spine" aria-hidden="true" />
-                        {/* Question header */}
+                        {/* Question header — the title is a real <button>
+                            (accordion pattern) so keyboard users can operate
+                            the row AND the action buttons independently */}
                         <div
-                          role="button"
-                          tabIndex={0}
-                          aria-expanded={isExpanded}
                           onClick={() => toggleQuestion(q.id)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault();
-                              toggleQuestion(q.id);
-                            }
-                          }}
                           className="question-header w-full cursor-pointer px-4 py-4 text-left sm:px-6 sm:py-5"
                         >
                           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-4">
@@ -1089,20 +1232,33 @@ export default function AIInterviewPrep() {
                                 <div className="q-index">
                                   {idx + 1}
                                   {isMounted && viewedQuestions.has(q.id) && (
-                                    <span className="viewed-dot" aria-hidden="true">
+                                    <>
+                                      <span className="viewed-dot" aria-hidden="true" />
                                       <span className="sr-only">viewed</span>
-                                    </span>
+                                    </>
                                   )}
                                 </div>
                               </div>
 
                               <div className="min-w-0 flex-1 pr-1">
-                                <div className="question-text break-words">
-                                  {highlightText(q.question, searchTerm)}
-                                </div>
+                                <h3 className="question-text break-words">
+                                  <button
+                                    type="button"
+                                    className="question-toggle"
+                                    aria-expanded={isExpanded}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleQuestion(q.id);
+                                    }}
+                                  >
+                                    {highlightText(q.question, searchTerm)}
+                                  </button>
+                                </h3>
 
                                 {!isExpanded && (
-                                  <div className="question-preview">{getAnswerPreview(q.answer)}</div>
+                                  <div className="question-preview">
+                                    {highlightText(getAnswerPreview(q.answer, searchTerm), searchTerm)}
+                                  </div>
                                 )}
                               </div>
                             </div>
@@ -1156,7 +1312,7 @@ export default function AIInterviewPrep() {
                                 <Copy className="h-4 w-4" />
                               </button>
 
-                              <div className="ml-0.5 flex h-8 w-8 items-center justify-center text-ink-low">
+                              <div className="ml-0.5 flex h-8 w-8 items-center justify-center text-ink-low" aria-hidden="true">
                                 <ChevronDown className="chevron h-4 w-4" />
                               </div>
                             </div>
@@ -1217,6 +1373,7 @@ export default function AIInterviewPrep() {
           </main>
         </div>
       </div>
+      </div>
 
       {/* Focus / Read Modal — the sanctum */}
       <AnimatePresence>
@@ -1238,12 +1395,15 @@ export default function AIInterviewPrep() {
                   : { opacity: 0, y: 12, transition: { duration: 0.2, ease: 'easeIn' } }
               }
               transition={reduceMotion ? { duration: 0.2 } : MODAL_SPRING}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="focus-question-title"
               className="focus-modal my-auto flex max-h-[min(90vh,calc(100dvh-2rem))] w-full max-w-3xl flex-col p-6 sm:p-10"
               onClick={(e) => e.stopPropagation()}
             >
               <motion.div
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
+                initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 6 }}
+                animate={reduceMotion ? { opacity: 1 } : { opacity: 1, y: 0 }}
                 transition={{ duration: 0.25, ease: EASE_OUT, delay: 0.06 }}
                 className="flex min-h-0 flex-1 flex-col"
               >
@@ -1255,9 +1415,16 @@ export default function AIInterviewPrep() {
                         {focusReadMinutes} min read
                       </div>
                     )}
-                    <div className="modal-question break-words pr-2 sm:pr-6">{focusQuestion.question}</div>
+                    <div id="focus-question-title" className="modal-question break-words pr-2 sm:pr-6">
+                      {focusQuestion.question}
+                    </div>
                   </div>
-                  <button onClick={closeFocus} className="icon-btn shrink-0" aria-label="Close focus mode">
+                  <button
+                    ref={modalCloseRef}
+                    onClick={closeFocus}
+                    className="icon-btn shrink-0"
+                    aria-label="Close focus mode"
+                  >
                     <X className="h-5 w-5" />
                   </button>
                 </div>
