@@ -197,38 +197,42 @@ export default function ConceptMapPage() {
     });
   };
 
+  const isFiltering = query.trim().length > 0;
+
   return (
-    <main className="concept-page min-h-screen bg-zinc-950 text-zinc-200">
-      <header className="concept-topbar border-b border-zinc-800/90 bg-zinc-950/90 backdrop-blur-xl">
+    <main className="concept-page min-h-screen bg-page text-ink-mid">
+      <header className="concept-topbar site-header">
         <div className="mx-auto flex max-w-7xl flex-col gap-4 px-4 py-4 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <Link
               href="/"
-              className="soft-btn flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors"
+              className="btn-soft !h-10 !w-10 shrink-0 justify-center !px-0"
               aria-label="Back to study guide"
             >
               <ArrowLeft className="h-4 w-4" />
             </Link>
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-900">
-              <Network className="h-5 w-5 text-zinc-200" />
+            <div className="brand-tile shrink-0">
+              <Network className="h-[18px] w-[18px]" />
             </div>
             <div className="min-w-0">
-              <h1 className="truncate text-xl font-semibold text-zinc-100">Visual Concept Map</h1>
-              <p className="text-sm text-zinc-500">AI engineering interview topics, dependencies, and practice weight.</p>
+              <h1 className="brand-name truncate">Visual Concept Map</h1>
+              <p className="text-[13px] text-ink-low">
+                AI engineering interview topics, dependencies, and practice weight.
+              </p>
             </div>
           </div>
 
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
             <label className="relative min-w-0 sm:w-80">
-              <Search className="pointer-events-none absolute left-3 top-3 h-4 w-4 text-zinc-500" />
+              <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-low" />
               <input
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder="Filter concepts..."
-                className="search-input w-full rounded-lg py-2.5 pl-10 pr-3"
+                className="search-input w-full !h-10 py-2.5 pl-10 pr-3"
               />
             </label>
-            <div className="flex items-center gap-1 rounded-lg border border-zinc-800 bg-zinc-900/80 p-1">
+            <div className="flex items-center gap-1 rounded-xl border border-line-soft bg-surface-2 p-1">
               <button className="concept-icon-btn" onClick={() => setZoom("out")} aria-label="Zoom out">
                 <Minus className="h-4 w-4" />
               </button>
@@ -243,16 +247,18 @@ export default function ConceptMapPage() {
         </div>
       </header>
 
-      <div className="mx-auto grid max-w-7xl gap-4 px-4 py-4 sm:px-6 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <section className="concept-map-panel overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-zinc-800 bg-zinc-900/45 px-4 py-3">
-            <div className="flex items-center gap-2 text-sm text-zinc-400">
-              <Maximize2 className="h-4 w-4" />
-              <span>{matches.size} visible topics</span>
+      <div className="mx-auto grid max-w-7xl gap-4 px-4 py-5 sm:px-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <section className="concept-panel overflow-hidden">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line-soft bg-surface-2/60 px-4 py-3">
+            <div className="flex items-center gap-2 text-sm text-ink-mid">
+              <Maximize2 className="h-4 w-4 text-ink-low" />
+              <span>
+                <span className="font-mono tabular-nums">{matches.size}</span> visible topics
+              </span>
             </div>
-            <div className="flex items-center gap-2 text-xs text-zinc-500">
+            <div className="kicker flex items-center gap-2">
               <span>{data.stats.totalSections} concepts</span>
-              <span className="h-1 w-1 rounded-full bg-zinc-700" />
+              <span className="h-1 w-1 rounded-full bg-line-strong" />
               <span>{totalQuestions} questions</span>
             </div>
           </div>
@@ -269,6 +275,7 @@ export default function ConceptMapPage() {
               <svg className="concept-link-layer" viewBox={`0 0 ${mapSize.width} ${mapSize.height}`} aria-hidden="true">
                 {data.sections.map((section) => {
                   const position = nodePositions[section.id];
+                  const dimmed = isFiltering && !matches.has(section.id);
                   return (
                     <line
                       key={`core-${section.id}`}
@@ -276,7 +283,13 @@ export default function ConceptMapPage() {
                       y1={centerNode.y}
                       x2={position.x}
                       y2={position.y}
-                      className={selectedId === section.id ? "concept-link concept-link-active" : "concept-link"}
+                      className={
+                        selectedId === section.id
+                          ? "concept-link concept-link-active"
+                          : dimmed
+                            ? "concept-link concept-link-dimmed"
+                            : "concept-link"
+                      }
                     />
                   );
                 })}
@@ -284,6 +297,7 @@ export default function ConceptMapPage() {
                   const fromNode = nodePositions[from];
                   const toNode = nodePositions[to];
                   const id = `${from}-${to}`;
+                  const dimmed = isFiltering && (!matches.has(from) || !matches.has(to));
                   return (
                     <line
                       key={id}
@@ -291,7 +305,13 @@ export default function ConceptMapPage() {
                       y1={fromNode.y}
                       x2={toNode.x}
                       y2={toNode.y}
-                      className={activeEdgeIds.has(id) ? "concept-link concept-link-active" : "concept-link concept-link-secondary"}
+                      className={
+                        activeEdgeIds.has(id)
+                          ? "concept-link concept-link-active"
+                          : dimmed
+                            ? "concept-link concept-link-dimmed"
+                            : "concept-link concept-link-secondary"
+                      }
                     />
                   );
                 })}
@@ -323,7 +343,7 @@ export default function ConceptMapPage() {
                     ].join(" ")}
                     style={{ left: position.x, top: position.y }}
                   >
-                    <span className="concept-node-kicker">0{section.number}</span>
+                    <span className="concept-node-kicker">{String(section.number).padStart(2, "0")}</span>
                     <span className="concept-node-title">{section.title}</span>
                     <span className="concept-node-meta">{section.questions.length} questions</span>
                     <span className="concept-node-tag">{position.label}</span>
@@ -334,45 +354,41 @@ export default function ConceptMapPage() {
           </div>
         </section>
 
-        <aside className="concept-detail rounded-lg border border-zinc-800 bg-zinc-950">
-          <div className="border-b border-zinc-800 bg-zinc-900/45 px-5 py-4">
-            <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500">
+        <aside className="concept-panel">
+          <div className="border-b border-line-soft bg-surface-2/60 px-5 py-4">
+            <div className="kicker mb-2 flex items-center gap-2">
               <Target className="h-3.5 w-3.5" />
               Selected concept
             </div>
-            <h2 className="text-xl font-semibold leading-tight text-zinc-100">{selectedSection.title}</h2>
+            <h2 className="section-title">{selectedSection.title}</h2>
           </div>
 
           <div className="space-y-5 p-5">
-            <p className="text-sm leading-6 text-zinc-400">{sectionSummaries[selectedSection.id]}</p>
+            <p className="text-sm leading-6 text-ink-mid">{sectionSummaries[selectedSection.id]}</p>
 
             <div className="grid grid-cols-3 gap-2">
-              <div className="minimal-metric">
-                <span>Questions</span>
-                <strong>{selectedSection.questions.length}</strong>
+              <div className="stat-tile">
+                <span className="label">Questions</span>
+                <span className="value">{selectedSection.questions.length}</span>
               </div>
-              <div className="minimal-metric">
-                <span>Share</span>
-                <strong>{selectedShare}%</strong>
+              <div className="stat-tile">
+                <span className="label">Share</span>
+                <span className="value">{selectedShare}%</span>
               </div>
-              <div className="minimal-metric">
-                <span>Links</span>
-                <strong>{relatedSections.length}</strong>
+              <div className="stat-tile">
+                <span className="label">Links</span>
+                <span className="value">{relatedSections.length}</span>
               </div>
             </div>
 
             <div>
-              <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-zinc-200">
-                <BookOpen className="h-4 w-4" />
+              <h3 className="mb-3 flex items-center gap-2 text-sm font-medium text-ink-hi">
+                <BookOpen className="h-4 w-4 text-ink-low" />
                 Practice entry points
               </h3>
               <div className="space-y-2">
                 {selectedSection.questions.slice(0, 4).map((question) => (
-                  <Link
-                    href={`/#${question.id}`}
-                    key={question.id}
-                    className="concept-question-link block rounded-lg border border-zinc-800 bg-zinc-900/55 px-3 py-2 text-sm leading-5 text-zinc-300 transition-colors"
-                  >
+                  <Link href={`/#${question.id}`} key={question.id} className="concept-question-link">
                     {question.question}
                   </Link>
                 ))}
@@ -380,14 +396,14 @@ export default function ConceptMapPage() {
             </div>
 
             <div>
-              <h3 className="mb-3 text-sm font-semibold text-zinc-200">Related concepts</h3>
+              <h3 className="mb-3 text-sm font-medium text-ink-hi">Related concepts</h3>
               <div className="flex flex-wrap gap-2">
                 {relatedSections.map((section) => (
                   <button
                     key={section.id}
                     type="button"
                     onClick={() => setSelectedId(section.id)}
-                    className="rounded-full border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-400 transition-colors hover:border-zinc-600 hover:text-zinc-100"
+                    className="rounded-full border border-line-soft bg-surface-2 px-3 py-1.5 text-xs text-ink-mid transition-colors duration-200 hover:border-line-strong hover:text-ink-hi"
                   >
                     {section.title}
                   </button>
