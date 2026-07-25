@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useState, useMemo, useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
-import { Search, Copy, ChevronDown, ChevronUp, X, BookOpen, Menu, Heart, Shuffle, Link2, Eye, Check, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import React, { useState, useMemo, useEffect, useLayoutEffect, useRef, useCallback, useSyncExternalStore, startTransition } from 'react';
+import { Search, Copy, ChevronDown, X, BookOpen, Menu, Heart, Shuffle, Link2, Eye, Check, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
+import { motion, AnimatePresence, useReducedMotion, animate } from 'framer-motion';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
@@ -31,8 +31,11 @@ interface Data {
 }
 
 const data = rawData as Data;
-const FAST_MODAL_TRANSITION = { duration: 0.08, ease: [0.32, 0.72, 0, 1] } as const;
 const AUTO_EXPAND_SEARCH_LIMIT = 12;
+
+const MODAL_SPRING = { type: 'spring', stiffness: 300, damping: 34, mass: 0.8 } as const;
+const RAIL_SPRING = { type: 'spring', stiffness: 380, damping: 38 } as const;
+const EASE_OUT = [0.22, 1, 0.36, 1] as const;
 
 function loadStoredSet(key: string): Set<string> {
   if (typeof window === 'undefined') return new Set();
@@ -56,8 +59,115 @@ function loadStoredBoolean(key: string, fallback = false): boolean {
   return fallback;
 }
 
+function safeSetItem(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // storage may be full or unavailable — persistence is best-effort
+  }
+}
+
+/* Mono numeral that counts up on first mount, then tracks value changes.
+   With animateIn=false (intro already played) it renders settled. */
+function CountUp({ value, suffix = '', animateIn = true }: { value: number; suffix?: string; animateIn?: boolean }) {
+  const reduce = useReducedMotion();
+  const ref = useRef<HTMLSpanElement>(null);
+  const prev = useRef<number | null>(null);
+
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (reduce || (prev.current === null && !animateIn)) {
+      el.textContent = `${value}${suffix}`;
+      prev.current = value;
+      return;
+    }
+    const from = prev.current ?? 0;
+    const firstRun = prev.current === null;
+    prev.current = value;
+    if (from === value) {
+      el.textContent = `${value}${suffix}`;
+      return;
+    }
+    const controls = animate(from, value, {
+      duration: firstRun ? 0.9 : 0.4,
+      ease: EASE_OUT,
+      onUpdate: (v) => {
+        el.textContent = `${Math.round(v)}${suffix}`;
+      },
+    });
+    return () => controls.stop();
+  }, [value, suffix, reduce, animateIn]);
+
+  return (
+    <span ref={ref} className={animateIn ? 'blur-settle' : undefined}>
+      {value}
+      {suffix}
+    </span>
+  );
+}
+
+/* "Paper first, ink second": surface opens via grid-rows, content fades up.
+   Mounts on expand (double rAF so the collapsed frame commits before the
+   transition starts), unmounts after the collapse transition ends. */
+function AnswerReveal({ open, children }: { open: boolean; children: React.ReactNode }) {
+  const [mounted, setMounted] = useState(open);
+  const ref = useRef<HTMLDivElement>(null);
+  const isShown = useRef(false);
+
+  // Derive mount state from props during render (official React pattern)
+  if (open && !mounted) {
+    setMounted(true);
+  }
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+
+    if (open) {
+      if (isShown.current) return;
+      isShown.current = true;
+      let raf2 = 0;
+      const raf1 = requestAnimationFrame(() => {
+        raf2 = requestAnimationFrame(() => el.classList.add('is-open'));
+      });
+      return () => {
+        cancelAnimationFrame(raf1);
+        if (raf2) cancelAnimationFrame(raf2);
+      };
+    }
+
+    if (!isShown.current) return;
+    isShown.current = false;
+    el.classList.remove('is-open');
+    const timer = window.setTimeout(() => setMounted(false), 350);
+    const onEnd = (e: TransitionEvent) => {
+      if (e.target === el && e.propertyName === 'grid-template-rows') {
+        window.clearTimeout(timer);
+        setMounted(false);
+      }
+    };
+    el.addEventListener('transitionend', onEnd);
+    return () => {
+      el.removeEventListener('transitionend', onEnd);
+      window.clearTimeout(timer);
+    };
+  }, [open, mounted]);
+
+  if (!mounted) return null;
+
+  return (
+    <div ref={ref} className="answer-reveal">
+      <div className="answer-reveal-inner">
+        <div className="answer-fade">{children}</div>
+      </div>
+    </div>
+  );
+}
+
 export default function AIInterviewPrep() {
   const [searchTerm, setSearchTerm] = useState('');
+  const [searchFocused, setSearchFocused] = useState(false);
   const [activeSection, setActiveSection] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [showMobileToc, setShowMobileToc] = useState(false);
@@ -74,25 +184,36 @@ export default function AIInterviewPrep() {
     () => true,
     () => false
   );
+  const reduceMotion = useReducedMotion();
 
   const headerRef = useRef<HTMLElement>(null);
   const lastScrollY = useRef(0);
-  const [headerHeight, setHeaderHeight] = useState(112);
+  const scrollOffsetRef = useRef(124);
   const [filtersCollapsed, setFiltersCollapsed] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() =>
     loadStoredBoolean('ai-interview-sidebar-collapsed')
   );
+  // User-collapsed cards while search auto-expand is active
+  const [searchCollapsedIds, setSearchCollapsedIds] = useState<Set<string>>(new Set());
+  // Once the opening choreography has played, remounts render settled.
+  // Flips via timer/interaction only, so SSR and hydration renders match.
+  const [introDone, setIntroDone] = useState(false);
 
-  const getScrollOffset = useCallback((extra = 12) => headerHeight + extra, [headerHeight]);
+  useEffect(() => {
+    const t = window.setTimeout(() => setIntroDone(true), 1600);
+    return () => window.clearTimeout(t);
+  }, []);
 
-  // Track sticky header height for sidebar offset and scroll targets
+  // Track sticky header height for sidebar offset and scroll targets.
+  // Only a CSS var + ref update — no React state, so the 300ms header
+  // collapse animation never re-renders the 456-card tree.
   useEffect(() => {
     const header = headerRef.current;
     if (!header) return;
 
     const update = () => {
       const height = Math.ceil(header.getBoundingClientRect().height);
-      setHeaderHeight(height);
+      scrollOffsetRef.current = height + 12;
       document.documentElement.style.setProperty('--site-header-height', `${height}px`);
     };
 
@@ -105,6 +226,22 @@ export default function AIInterviewPrep() {
       observer.disconnect();
       window.removeEventListener('resize', update);
     };
+  }, []);
+
+  // Multi-pass scroll: content-visibility placeholders settle to real
+  // heights as the destination renders, so re-measure across two frames.
+  const scrollToElementId = useCallback((elId: string) => {
+    const go = () => {
+      const el = document.getElementById(elId);
+      if (!el) return;
+      const top = el.getBoundingClientRect().top + window.scrollY - scrollOffsetRef.current;
+      window.scrollTo({ top, behavior: 'auto' });
+    };
+    go();
+    requestAnimationFrame(() => {
+      go();
+      requestAnimationFrame(go);
+    });
   }, []);
 
   // Collapse filter rows on scroll down; expand on scroll up or near top
@@ -152,47 +289,42 @@ export default function AIInterviewPrep() {
 
   // Persist favorites
   useEffect(() => {
-    localStorage.setItem('ai-interview-favorites', JSON.stringify(Array.from(favorites)));
+    safeSetItem('ai-interview-favorites', JSON.stringify(Array.from(favorites)));
   }, [favorites]);
 
   useEffect(() => {
-    localStorage.setItem('ai-interview-viewed', JSON.stringify(Array.from(viewedQuestions)));
+    safeSetItem('ai-interview-viewed', JSON.stringify(Array.from(viewedQuestions)));
   }, [viewedQuestions]);
 
   useEffect(() => {
-    localStorage.setItem('ai-interview-sidebar-collapsed', String(sidebarCollapsed));
+    safeSetItem('ai-interview-sidebar-collapsed', String(sidebarCollapsed));
   }, [sidebarCollapsed]);
 
-  // Deep link support: open specific question from URL hash
+  // Deep link support: open specific question from URL hash.
+  // Runs on mount and real hashchange only — never on re-render.
   useEffect(() => {
+    let timer = 0;
     const handleHash = () => {
       const hash = window.location.hash.replace('#', '');
-      if (hash) {
-        // Try to find the question by id
-        for (const section of data.sections) {
-          const found = section.questions.find(q => q.id === hash);
-          if (found) {
-            setExpandedIds(prev => new Set(prev).add(hash));
-            setTimeout(() => {
-              const el = document.getElementById(`card-${hash}`);
-              if (el) {
-                const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-                window.scrollTo({ top, behavior: 'auto' });
-              }
-            }, 80);
-            break;
-          }
+      if (!hash) return;
+      for (const section of data.sections) {
+        const found = section.questions.find(q => q.id === hash);
+        if (found) {
+          setExpandedIds(prev => new Set(prev).add(hash));
+          window.clearTimeout(timer);
+          timer = window.setTimeout(() => scrollToElementId(`card-${hash}`), 80);
+          break;
         }
       }
     };
 
-    // Run on mount
     handleHash();
-
-    // Listen for hash changes
     window.addEventListener('hashchange', handleHash);
-    return () => window.removeEventListener('hashchange', handleHash);
-  }, [getScrollOffset]);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('hashchange', handleHash);
+    };
+  }, [scrollToElementId]);
 
   // Mark question as viewed when expanded
   const markAsViewed = (id: string) => {
@@ -205,12 +337,10 @@ export default function AIInterviewPrep() {
     }
   };
 
-  // Close focus modal
   const closeFocus = () => {
     setFocusQuestion(null);
   };
 
-  // Copy Q + A
   const copyQA = (q: Question) => {
     const text = `${q.question}\n\n${q.answer}`;
     navigator.clipboard.writeText(text).then(() => {
@@ -218,16 +348,17 @@ export default function AIInterviewPrep() {
     });
   };
 
-  // Copy just the question
   const copyQuestion = (q: Question) => {
     navigator.clipboard.writeText(q.question).then(() => {
       toast.success('Question copied');
     });
   };
 
-  // Keyboard support for modal
+  // Keyboard support for modal — plain keys only, never the native
+  // copy/paste shortcuts (Cmd/Ctrl+C must keep the user's selection)
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === 'Escape' && focusQuestion) {
         closeFocus();
       }
@@ -257,11 +388,24 @@ export default function AIInterviewPrep() {
     );
   };
 
-  // Generate a short preview of the answer for collapsed state (more readable scanning)
-  const getAnswerPreview = (answer: string): string => {
-    // Take first paragraph or first 180 chars, clean it up
-    let preview = answer.split('\n\n')[0].trim();
-    preview = preview.replace(/[#*`]/g, '').replace(/\s+/g, ' ');
+  // Generate a short preview of the answer for collapsed state.
+  // While searching, center the preview on the first match so every
+  // result card shows WHY it matched.
+  const getAnswerPreview = (answer: string, term?: string): string => {
+    const clean = (s: string) => s.replace(/[#*`]/g, '').replace(/\s+/g, ' ').trim();
+    const t = term?.trim().toLowerCase();
+    if (t) {
+      const cleaned = clean(answer);
+      const i = cleaned.toLowerCase().indexOf(t);
+      if (i >= 0) {
+        const start = Math.max(0, i - 70);
+        let snippet = cleaned.slice(start, start + 180).trim();
+        if (start > 0) snippet = '…' + snippet;
+        if (start + 180 < cleaned.length) snippet += '…';
+        return snippet;
+      }
+    }
+    let preview = clean(answer.split('\n\n')[0]);
     if (preview.length > 180) {
       preview = preview.slice(0, 177) + '…';
     }
@@ -272,7 +416,6 @@ export default function AIInterviewPrep() {
   const filteredSections = useMemo(() => {
     let sections = data.sections;
 
-    // Apply search
     const term = searchTerm.toLowerCase().trim();
     if (term) {
       sections = sections
@@ -287,7 +430,6 @@ export default function AIInterviewPrep() {
         .filter((s) => s.questions.length > 0);
     }
 
-    // Apply favorites filter
     if (showFavoritesOnly) {
       sections = sections
         .map((section) => ({
@@ -313,9 +455,23 @@ export default function AIInterviewPrep() {
     return allMatching;
   }, [searchTerm, filteredSections]);
 
-  const effectiveExpandedIds = searchExpandedIds ?? expandedIds;
+  // Auto-expanded search results minus the ones the user collapsed
+  const effectiveExpandedIds = useMemo(() => {
+    if (!searchExpandedIds) return expandedIds;
+    if (searchCollapsedIds.size === 0) return searchExpandedIds;
+    const s = new Set(searchExpandedIds);
+    searchCollapsedIds.forEach((id) => s.delete(id));
+    return s;
+  }, [searchExpandedIds, expandedIds, searchCollapsedIds]);
 
-  // Total visible questions after filter
+  // Single entry point for search changes: resets per-search collapse
+  // state and marks the opening choreography as done.
+  const updateSearchTerm = (value: string) => {
+    setIntroDone(true);
+    setSearchCollapsedIds((prev) => (prev.size === 0 ? prev : new Set()));
+    setSearchTerm(value);
+  };
+
   const visibleQuestionCount = useMemo(() => {
     return filteredSections.reduce((sum, s) => sum + s.questions.length, 0);
   }, [filteredSections]);
@@ -328,15 +484,28 @@ export default function AIInterviewPrep() {
   const displayedViewedCount = isMounted ? viewedCount : 0;
   const displayedProgressPercentage = isMounted ? progressPercentage : 0;
 
-  // Stats for current view
   const expandedCount = useMemo(() => {
     return Array.from(effectiveExpandedIds).filter((id) =>
       filteredSections.some((s) => s.questions.some((q) => q.id === id))
     ).length;
   }, [effectiveExpandedIds, filteredSections]);
 
-  // Toggle a single question
   const toggleQuestion = (id: string) => {
+    // While search auto-expand is active, toggling works against the
+    // per-search collapsed set so cards actually close.
+    if (searchExpandedIds?.has(id)) {
+      setSearchCollapsedIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) {
+          next.delete(id);
+          markAsViewed(id);
+        } else {
+          next.add(id);
+        }
+        return next;
+      });
+      return;
+    }
     setExpandedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) {
@@ -349,26 +518,23 @@ export default function AIInterviewPrep() {
     });
   };
 
-  // Open in focus/read mode
   const openFocus = (q: Question, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
+    focusReturnRef.current = document.activeElement as HTMLElement | null;
     markAsViewed(q.id);
     setFocusQuestion(q);
     setExpandedIds(prev => new Set(prev).add(q.id));
   };
 
-  // Shareable link for a question
   const shareQuestion = (q: Question, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     const url = `${window.location.origin}${window.location.pathname}#${q.id}`;
     navigator.clipboard.writeText(url).then(() => {
-      // Also update the current URL hash
       window.history.pushState(null, '', `#${q.id}`);
       toast.success('Link copied to clipboard');
     });
   };
 
-  // Toggle favorite
   const toggleFavorite = (id: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     setFavorites((prev) => {
@@ -383,56 +549,63 @@ export default function AIInterviewPrep() {
     });
   };
 
-  // Expand / collapse all visible
+  // startTransition keeps the click responsive while 456 answers mount
   const expandAll = () => {
+    if (searchExpandedIds) {
+      setSearchCollapsedIds(new Set());
+    }
     const allIds = new Set<string>();
     filteredSections.forEach((s) =>
       s.questions.forEach((q) => allIds.add(q.id))
     );
-    setExpandedIds(allIds);
+    startTransition(() => setExpandedIds(allIds));
   };
 
   const collapseAll = () => {
-    setExpandedIds(new Set());
+    if (searchExpandedIds) {
+      setSearchCollapsedIds(new Set(searchExpandedIds));
+      return;
+    }
+    startTransition(() => setExpandedIds(new Set()));
   };
 
-  // Go to random question (great for interview practice)
   const goToRandomQuestion = () => {
     const allQuestions = filteredSections.flatMap(s => s.questions);
     if (allQuestions.length === 0) return;
 
     const randomQ = allQuestions[Math.floor(Math.random() * allQuestions.length)];
-    
+
     setExpandedIds(prev => new Set(prev).add(randomQ.id));
+    setSearchCollapsedIds((prev) => {
+      if (!prev.has(randomQ.id)) return prev;
+      const next = new Set(prev);
+      next.delete(randomQ.id);
+      return next;
+    });
     markAsViewed(randomQ.id);
-    
-    setTimeout(() => {
-      const el = document.getElementById(`card-${randomQ.id}`);
-      if (el) {
-        const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-        window.scrollTo({ top, behavior: 'auto' });
-      }
-    }, 50);
+
+    setTimeout(() => scrollToElementId(`card-${randomQ.id}`), 50);
 
     toast.success('Random question loaded');
   };
 
-  // Expand or collapse all questions in a specific section
   const toggleSection = (sectionId: string, expand: boolean) => {
     const section = data.sections.find(s => s.id === sectionId);
     if (!section) return;
 
-    setExpandedIds(prev => {
-      const next = new Set(prev);
-      section.questions.forEach(q => {
-        if (expand) {
-          next.add(q.id);
-        } else {
-          next.delete(q.id);
-        }
-      });
-      return next;
-    });
+    startTransition(() =>
+      setExpandedIds(prev => {
+        const next = new Set(prev);
+        section.questions.forEach(q => {
+          if (expand) {
+            next.add(q.id);
+          } else {
+            next.delete(q.id);
+          }
+        });
+        return next;
+      })
+    );
 
     if (expand) {
       setViewedQuestions(prev => {
@@ -443,147 +616,212 @@ export default function AIInterviewPrep() {
     }
   };
 
-  // Scroll to section
   const scrollToSection = (sectionId: string) => {
-    const el = document.getElementById(sectionId);
-    if (el) {
-      const top = el.getBoundingClientRect().top + window.scrollY - getScrollOffset();
-      window.scrollTo({ top, behavior: 'auto' });
-      setActiveSection(sectionId);
-      setShowMobileToc(false);
-    }
+    scrollToElementId(sectionId);
+    setActiveSection(sectionId);
+    setShowMobileToc(false);
   };
 
-  // Keyboard shortcut: press / to focus search
+  // Keyboard shortcut: press / to focus search. Escape clears the
+  // search only when no overlay is open (the overlay consumes it).
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (e.key === '/' && document.activeElement?.tagName !== 'INPUT') {
         e.preventDefault();
         const input = document.getElementById('search-input') as HTMLInputElement;
         input?.focus();
       }
-      if (e.key === 'Escape' && searchTerm) {
+      if (e.key === 'Escape' && searchTerm && !focusQuestion && !showMobileToc) {
+        setSearchCollapsedIds(new Set());
         setSearchTerm('');
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [searchTerm]);
+  }, [searchTerm, focusQuestion, showMobileToc]);
 
-  // Track active section on scroll
+  // Track active section on scroll. Sections are far taller than the
+  // viewport, so intersection ratios never reach usable thresholds —
+  // instead, pick the last section whose top has passed the header on
+  // each (rAF-throttled) scroll. 14 rect reads per frame is cheap.
   useEffect(() => {
-    const topMargin = `-${getScrollOffset()}px`;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((e) => e.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-        if (visible) {
-          setActiveSection(visible.target.id);
+    let ticking = false;
+    const compute = () => {
+      ticking = false;
+      const offset = scrollOffsetRef.current + 24;
+      let current: string | null = null;
+      for (const s of data.sections) {
+        const el = document.getElementById(s.id);
+        if (!el) continue;
+        if (el.getBoundingClientRect().top <= offset) {
+          current = s.id;
+        } else {
+          break;
         }
-      },
-      { rootMargin: `${topMargin} 0px -60% 0px`, threshold: [0.2, 0.6] }
-    );
+      }
+      if (current) {
+        setActiveSection((prev) => (prev === current ? prev : current));
+      }
+    };
+    const onScroll = () => {
+      if (!ticking) {
+        ticking = true;
+        requestAnimationFrame(compute);
+      }
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    const raf = requestAnimationFrame(compute);
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      cancelAnimationFrame(raf);
+    };
+  }, []);
 
-    data.sections.forEach((s) => {
-      const el = document.getElementById(s.id);
-      if (el) observer.observe(el);
-    });
+  // Move focus into the dialog on open; restore it on close
+  const modalCloseRef = useRef<HTMLButtonElement>(null);
+  const drawerCloseRef = useRef<HTMLButtonElement>(null);
+  const focusReturnRef = useRef<HTMLElement | null>(null);
 
-    return () => observer.disconnect();
-  }, [headerHeight, getScrollOffset]);
+  useEffect(() => {
+    if (focusQuestion) {
+      modalCloseRef.current?.focus();
+      return;
+    }
+    focusReturnRef.current?.focus();
+    focusReturnRef.current = null;
+  }, [focusQuestion]);
+
+  useEffect(() => {
+    if (!showMobileToc) return;
+    drawerCloseRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowMobileToc(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [showMobileToc]);
 
   const isSearching = searchTerm.trim().length > 0;
+  const showEntrance = !isSearching && !showFavoritesOnly && !reduceMotion && !introDone;
+  // Gate localStorage-derived layout behind mount to keep SSR HTML valid
+  const shownSidebarCollapsed = isMounted && sidebarCollapsed;
+
+  const focusSection = focusQuestion
+    ? data.sections.find((s) => s.questions.some((q) => q.id === focusQuestion.id))
+    : null;
+  const focusReadMinutes = focusQuestion
+    ? Math.max(1, Math.ceil(focusQuestion.answer.split(/\s+/).length / 220))
+    : 0;
+
+  const heroStagger = {
+    hidden: {},
+    show: { transition: { staggerChildren: 0.06 } },
+  };
+  const heroChild = {
+    hidden: reduceMotion
+      ? { opacity: 0 }
+      : { opacity: 0, y: 14, filter: 'blur(5px)' },
+    show: reduceMotion
+      ? { opacity: 1, transition: { duration: 0.2 } }
+      : { opacity: 1, y: 0, filter: 'blur(0px)', transition: { duration: 0.7, ease: EASE_OUT } },
+  };
 
   return (
-    <div className="minimal-shell min-h-screen bg-zinc-950 text-zinc-300">
+    <div className="min-h-screen bg-page text-ink-mid">
+      {/* Page chrome is inert while the focus modal is open */}
+      <div inert={focusQuestion ? true : undefined}>
       {/* Top nav / header */}
-      <header
-        ref={headerRef}
-        className="sticky top-0 z-50 border-b border-zinc-800/80 bg-zinc-950/92 shadow-[0_1px_0_rgba(255,255,255,0.03)] backdrop-blur-xl supports-[backdrop-filter]:bg-zinc-950/78"
-      >
-        <div className="mx-auto max-w-7xl px-4 sm:px-6">
+      <header ref={headerRef} className="site-header sticky top-0 z-50">
+        <div className="relative mx-auto max-w-7xl px-4 sm:px-6">
           <div className="flex h-16 items-center justify-between gap-4">
-            <div className="flex items-center gap-3">
-              <div className="minimal-brand flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-900 text-zinc-200">
-                <BookOpen className="h-5 w-5" />
+            <div className="flex items-center gap-3.5">
+              <div className="brand-tile">
+                <div className="brand-glow" aria-hidden="true" />
+                <BookOpen className="relative h-[18px] w-[18px]" />
               </div>
               <div>
-                <div className="text-lg font-semibold text-zinc-100">AI Engineering</div>
-                <div className="-mt-1 text-[10px] font-medium uppercase tracking-[0.18em] text-zinc-500">Interview Prep</div>
+                <div className="brand-name">AI Engineering</div>
+                <div className="kicker -mt-0.5">Interview Prep</div>
               </div>
             </div>
 
-            <div className="flex items-center gap-3 text-sm">
-              <a
-                href="/concept-map"
-                className="soft-btn hidden items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors sm:flex"
-              >
+            <div className="flex items-center gap-2 text-sm">
+              <a href="/concept-map" className="btn-soft hidden !h-9 text-xs sm:inline-flex">
                 <Link2 className="h-3.5 w-3.5" />
                 <span>Concept map</span>
               </a>
-              <div className="hidden sm:flex items-center gap-2 rounded-full border border-zinc-800 bg-zinc-900/80 px-3 py-1 text-xs text-zinc-400">
-                <span>{data.stats.totalQuestions} questions</span>
-                <span className="text-zinc-700">•</span>
-                <span>{data.stats.totalSections} sections</span>
+              <div className="stat-chip hidden sm:flex">
+                <span className="num">{data.stats.totalQuestions}</span>
+                <span>questions</span>
+                <span className="opacity-40">·</span>
+                <span className="num">{data.stats.totalSections}</span>
+                <span>sections</span>
               </div>
-              <div className="hidden md:flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-900/80 px-3 py-1 text-xs text-zinc-300">
+              <div className="stat-chip progress-chip hidden md:flex">
                 <Check className="h-3.5 w-3.5" />
-                <span>{displayedProgressPercentage}% viewed</span>
+                <span className="num">{displayedProgressPercentage}%</span>
+                <span>viewed</span>
               </div>
             </div>
           </div>
         </div>
 
         {/* Search bar */}
-        <div className="border-t border-zinc-800/70 bg-zinc-950/86">
-          <div className={`mx-auto max-w-7xl px-4 sm:px-6 transition-[padding] duration-100 ${filtersCollapsed ? 'py-2.5' : 'py-4'}`}>
-            <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center">
+        <div className="border-t border-line-soft">
+          <div className={`mx-auto max-w-7xl px-4 sm:px-6 transition-[padding] duration-300 ${filtersCollapsed ? 'py-2.5' : 'py-4'}`}>
+            <div className="flex flex-col items-stretch gap-3 sm:flex-row sm:items-center">
               <div className="relative flex-1">
-                <Search className="absolute left-4 top-3.5 h-4 w-4 text-zinc-500" />
+                <Search className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-low" />
                 <input
                   id="search-input"
                   type="text"
                   value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
+                  onChange={(e) => updateSearchTerm(e.target.value)}
+                  onFocus={() => setSearchFocused(true)}
+                  onBlur={() => setSearchFocused(false)}
                   placeholder="Search questions and answers..."
-                  className="search-input w-full rounded-xl pl-11 pr-10 py-3 placeholder:text-zinc-600 focus:ring-0"
+                  aria-label="Search questions and answers"
+                  className="search-input w-full pl-11 pr-11"
                 />
-                {searchTerm && (
-                  <button
-                    onClick={() => setSearchTerm('')}
-                    className="absolute right-3 top-3.5 text-zinc-500 hover:text-zinc-300"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                )}
+                <div className="search-slot">
+                  {searchTerm ? (
+                    <button
+                      onClick={() => {
+                        updateSearchTerm('');
+                        document.getElementById('search-input')?.focus();
+                      }}
+                      className="search-clear"
+                      aria-label="Clear search"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  ) : !searchFocused ? (
+                    <kbd aria-hidden="true">/</kbd>
+                  ) : null}
+                </div>
               </div>
 
               <div className="flex flex-wrap items-center justify-end gap-2">
                 <button
                   onClick={goToRandomQuestion}
-                  className="minimal-primary-action flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-zinc-100 px-4 py-3 text-sm font-semibold text-zinc-950 transition-colors"
+                  className="btn-primary"
                   title="Load a random question (great for practice)"
                 >
                   <Shuffle className="h-4 w-4" />
                   <span className="hidden sm:inline">Random</span>
                 </button>
-                <button
-                  onClick={expandAll}
-                  className="soft-btn flex items-center gap-1.5 rounded-lg px-4 py-3 text-sm font-medium transition-colors"
-                >
+                <button onClick={expandAll} className="btn-soft">
                   <ChevronDown className="h-4 w-4" /> <span className="hidden sm:inline">Expand</span>
                 </button>
-                <button
-                  onClick={collapseAll}
-                  className="soft-btn flex items-center gap-1.5 rounded-lg px-4 py-3 text-sm font-medium transition-colors"
-                >
-                  <ChevronUp className="h-4 w-4" /> <span className="hidden sm:inline">Collapse</span>
+                <button onClick={collapseAll} className="btn-soft">
+                  <ChevronDown className="h-4 w-4 rotate-180" /> <span className="hidden sm:inline">Collapse</span>
                 </button>
                 <button
                   onClick={() => setShowMobileToc(!showMobileToc)}
-                  className="soft-btn flex items-center gap-2 rounded-lg px-3 py-3 text-sm sm:hidden"
+                  className="btn-soft !px-3 sm:hidden"
                   aria-label="Open sections"
+                  aria-expanded={showMobileToc}
                 >
                   <Menu className="h-4 w-4" />
                 </button>
@@ -593,22 +831,18 @@ export default function AIInterviewPrep() {
             {/* Compact active-filter hint when collapsed */}
             {filtersCollapsed && (searchTerm || showFavoritesOnly) && (
               <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                {showFavoritesOnly && (
-                  <span className="rounded-full border border-zinc-700 bg-zinc-900 px-2.5 py-0.5 text-zinc-300">
-                    Favorites only
-                  </span>
-                )}
+                {showFavoritesOnly && <span className="filter-pill">Favorites only</span>}
                 {searchTerm && (
-                  <span className="rounded-full border border-zinc-700 bg-zinc-900 px-2.5 py-0.5 text-zinc-400">
+                  <span className="filter-pill">
                     Search: “{searchTerm.length > 24 ? `${searchTerm.slice(0, 24)}…` : searchTerm}”
                   </span>
                 )}
                 <button
                   onClick={() => {
-                    setSearchTerm('');
+                    updateSearchTerm('');
                     setShowFavoritesOnly(false);
                   }}
-                  className="text-zinc-500 underline hover:text-white"
+                  className="text-btn underline underline-offset-4"
                 >
                   Clear
                 </button>
@@ -619,52 +853,52 @@ export default function AIInterviewPrep() {
             <div className={`header-filters ${filtersCollapsed ? 'header-filters-collapsed' : ''}`}>
               <div className="header-filters-inner">
                 <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2.5">
                     {isSearching ? (
                       <span>
-                        <span className="text-zinc-200 font-medium">{visibleQuestionCount}</span>
-                        <span className="text-zinc-500"> result{visibleQuestionCount === 1 ? '' : 's'} for “{searchTerm}”</span>
+                        <span className="font-medium text-ink-hi">{visibleQuestionCount}</span>
+                        <span className="text-ink-low"> result{visibleQuestionCount === 1 ? '' : 's'} for “{searchTerm}”</span>
                       </span>
                     ) : showFavoritesOnly ? (
-                      <span className="text-zinc-200 font-medium">
+                      <span className="font-medium text-ink-hi">
                         {visibleQuestionCount} favorite{visibleQuestionCount === 1 ? '' : 's'}
                       </span>
                     ) : (
-                      <span className="text-zinc-500">
-                        Showing <span className="text-zinc-300">{visibleQuestionCount}</span> / {data.stats.totalQuestions}
+                      <span className="text-ink-low">
+                        Showing <span className="text-ink-mid">{visibleQuestionCount}</span> / {data.stats.totalQuestions}
                       </span>
                     )}
 
-                    {expandedCount > 0 && (
-                      <span className="stat-pill">
-                        {expandedCount} open
-                      </span>
-                    )}
+                    {expandedCount > 0 && <span className="stat-pill">{expandedCount} open</span>}
                   </div>
 
                   {/* Favorites toggle */}
                   <button
-                    onClick={() => setShowFavoritesOnly(!showFavoritesOnly)}
-                    className={`flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium border transition-all ${
+                    onClick={() => {
+                      setIntroDone(true);
+                      setShowFavoritesOnly(!showFavoritesOnly);
+                    }}
+                    aria-pressed={showFavoritesOnly}
+                    className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors duration-200 ${
                       showFavoritesOnly
-                        ? 'bg-zinc-800 text-zinc-100 border-zinc-600'
-                        : 'bg-zinc-900/80 border-zinc-800 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-300'
+                        ? 'border-line-strong bg-surface-3 text-ink-hi'
+                        : 'border-line-soft bg-surface-2 text-ink-low hover:border-line-strong hover:text-ink-mid'
                     }`}
                   >
-                    <Heart className={`h-3.5 w-3.5 ${showFavoritesOnly ? 'fill-current' : ''}`} />
+                    <Heart className={`h-3.5 w-3.5 ${showFavoritesOnly ? 'fill-current text-ember' : ''}`} />
                     Favorites
                     {isMounted && favorites.size > 0 && (
-                      <span className="ml-0.5 px-1.5 rounded bg-zinc-950/60">{favorites.size}</span>
+                      <span className="ml-0.5 rounded bg-page/60 px-1.5 font-mono tabular-nums">{favorites.size}</span>
                     )}
                   </button>
 
                   {(searchTerm || showFavoritesOnly) && (
                     <button
                       onClick={() => {
-                        setSearchTerm('');
+                        updateSearchTerm('');
                         setShowFavoritesOnly(false);
                       }}
-                      className="text-xs text-zinc-400 hover:text-white underline"
+                      className="text-btn underline underline-offset-4"
                     >
                       Clear all filters
                     </button>
@@ -674,42 +908,43 @@ export default function AIInterviewPrep() {
             </div>
           </div>
         </div>
+
+        {/* Ambient session progress — pinned to the header's bottom edge */}
+        <div
+          className="header-progress"
+          style={{ transform: `scaleX(${displayedProgressPercentage / 100})` }}
+          aria-hidden="true"
+        />
       </header>
 
       <div className="mx-auto max-w-7xl px-4 sm:px-6">
-        <div className="flex flex-col lg:flex-row gap-8 pt-6 pb-24">
+        <div className="flex flex-col gap-8 pt-6 pb-24 lg:flex-row">
           {/* Sidebar TOC */}
           <aside
-            className={`sidebar-aside hidden shrink-0 transition-[width] duration-100 ease-out lg:block ${
-              sidebarCollapsed ? 'w-11' : 'w-72'
-            }`}
+            className={`sidebar-aside hidden shrink-0 lg:block ${shownSidebarCollapsed ? 'w-12' : 'w-72'}`}
           >
             <div
-              className="sidebar-panel sticky overflow-y-auto overscroll-contain rounded-lg border border-zinc-800/70 bg-zinc-950/38 p-2"
+              className="toc-panel sticky overflow-y-auto overscroll-contain p-2"
               style={{
-                top: 'var(--site-header-height, 7rem)',
-                maxHeight: 'calc(100vh - var(--site-header-height, 7rem) - 1rem)',
+                top: 'calc(var(--site-header-height, 7rem) + 0.75rem)',
+                maxHeight: 'calc(100vh - var(--site-header-height, 7rem) - 1.75rem)',
               }}
             >
               <div
                 className={`mb-3 flex items-center ${
-                  sidebarCollapsed ? 'justify-center px-1' : 'justify-between px-2'
+                  shownSidebarCollapsed ? 'justify-center px-1' : 'justify-between px-2'
                 }`}
               >
-                {!sidebarCollapsed && (
-                  <div className="px-1 text-[11px] font-medium uppercase tracking-wide text-zinc-600">
-                    Contents
-                  </div>
-                )}
+                {!shownSidebarCollapsed && <div className="kicker px-1 pt-1">Contents</div>}
                 <button
                   type="button"
                   onClick={() => setSidebarCollapsed((prev) => !prev)}
-                  className="flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 transition-colors hover:border-zinc-700 hover:bg-zinc-800 hover:text-zinc-200"
-                  title={sidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
-                  aria-label={sidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
-                  aria-expanded={!sidebarCollapsed}
+                  className="icon-btn"
+                  title={shownSidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
+                  aria-label={shownSidebarCollapsed ? 'Expand contents sidebar' : 'Collapse contents sidebar'}
+                  aria-expanded={!shownSidebarCollapsed}
                 >
-                  {sidebarCollapsed ? (
+                  {shownSidebarCollapsed ? (
                     <PanelLeftOpen className="h-4 w-4" />
                   ) : (
                     <PanelLeftClose className="h-4 w-4" />
@@ -717,9 +952,9 @@ export default function AIInterviewPrep() {
                 </button>
               </div>
 
-              {!sidebarCollapsed ? (
+              {!shownSidebarCollapsed ? (
                 <>
-                  <nav className="space-y-0.5">
+                  <nav className="toc-nav-full space-y-0.5">
                     {data.sections.map((section) => {
                       const originalCount = section.questions.length;
                       const isActive = activeSection === section.id;
@@ -738,30 +973,47 @@ export default function AIInterviewPrep() {
                         <button
                           key={section.id}
                           onClick={() => scrollToSection(section.id)}
-                          className={`toc-link flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm ${
-                            isActive
-                              ? 'active text-zinc-200 bg-zinc-900'
-                              : 'text-zinc-500 hover:text-zinc-300'
+                          className={`toc-link flex w-full items-center justify-between px-3 py-2 text-left text-[13.5px] ${
+                            isActive ? 'active' : ''
                           }`}
                         >
+                          {isActive && (
+                            <motion.div
+                              layoutId="toc-rail"
+                              className="toc-rail"
+                              transition={reduceMotion ? { duration: 0 } : RAIL_SPRING}
+                            />
+                          )}
                           <span className="truncate pr-3">
                             {section.number}. {section.title}
                           </span>
-                          <span className="font-mono text-[10px] text-zinc-600 tabular-nums shrink-0">
-                            {showFavoritesOnly ? displayCount : `${sectionProgress}%`}
-                          </span>
+                          {showFavoritesOnly ? (
+                            <span className="shrink-0 font-mono text-[10px] tabular-nums text-ink-low">
+                              {displayCount}
+                            </span>
+                          ) : sectionProgress >= 100 ? (
+                            <Check className="h-3 w-3 shrink-0 text-sage-400" aria-label="Section complete" />
+                          ) : (
+                            <span className="toc-track">
+                              <span
+                                className="toc-track-fill block"
+                                style={{ transform: `scaleX(${sectionProgress / 100})` }}
+                              />
+                            </span>
+                          )}
                         </button>
                       );
                     })}
                   </nav>
 
-                  <div className="mt-8 px-3 text-[11px] text-zinc-500 leading-relaxed">
-                    Press <kbd className="rounded bg-zinc-900 px-1.5 py-px font-mono text-[10px]">/</kbd> to search<br />
-                    <span className="text-zinc-600">Click cards to expand • Heart to favorite</span>
+                  <div className="mt-8 px-3 pb-2 text-[11px] leading-relaxed text-ink-low">
+                    Press <kbd>/</kbd> to search
+                    <br />
+                    <span className="opacity-70">Click cards to expand · Heart to favorite</span>
                   </div>
                 </>
               ) : (
-                <nav className="flex flex-col items-center gap-1 px-1">
+                <nav className="toc-nav-mini flex flex-col items-center gap-1 px-1 pb-1">
                   {data.sections.map((section) => {
                     const isActive = activeSection === section.id;
 
@@ -770,11 +1022,7 @@ export default function AIInterviewPrep() {
                         key={section.id}
                         onClick={() => scrollToSection(section.id)}
                         title={`${section.number}. ${section.title}`}
-                        className={`toc-mini-link flex h-7 w-7 items-center justify-center rounded-md border text-[10px] font-mono tabular-nums transition-colors ${
-                          isActive
-                            ? 'border-zinc-500 bg-zinc-800 text-zinc-100'
-                            : 'border-zinc-800 bg-zinc-900 text-zinc-500 hover:border-zinc-700 hover:bg-zinc-800 hover:text-zinc-300'
-                        }`}
+                        className={`toc-mini ${isActive ? 'active' : ''}`}
                       >
                         {section.number}
                       </button>
@@ -786,286 +1034,322 @@ export default function AIInterviewPrep() {
           </aside>
 
           {/* Mobile TOC drawer */}
-          {showMobileToc && (
-            <div className="lg:hidden fixed inset-0 z-[60] bg-black/60" onClick={() => setShowMobileToc(false)}>
-              <div
-                className="absolute left-0 top-0 bottom-0 w-[min(18rem,85vw)] max-w-full bg-zinc-950 border-r border-zinc-800 p-4 overflow-y-auto overscroll-contain"
-                onClick={(e) => e.stopPropagation()}
+          <AnimatePresence>
+            {showMobileToc && (
+              <motion.div
+                key="drawer-overlay"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.25 }}
+                className="focus-overlay fixed inset-0 z-[60] lg:hidden"
+                onClick={() => setShowMobileToc(false)}
               >
-                <div className="flex justify-between items-center mb-4">
-                  <div className="text-sm font-medium text-zinc-300">Sections</div>
-                  <button onClick={() => setShowMobileToc(false)}>
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-                <div className="space-y-1">
-                  {data.sections.map((section) => (
+                <motion.div
+                  key="drawer-panel"
+                  initial={reduceMotion ? { opacity: 0 } : { x: '-100%' }}
+                  animate={reduceMotion ? { opacity: 1 } : { x: 0 }}
+                  exit={reduceMotion ? { opacity: 0 } : { x: '-100%' }}
+                  transition={reduceMotion ? { duration: 0.2 } : MODAL_SPRING}
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="Sections"
+                  className="drawer-panel absolute bottom-0 left-0 top-0 w-[min(18rem,85vw)] max-w-full overflow-y-auto overscroll-contain p-4"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="mb-4 flex items-center justify-between">
+                    <div className="kicker">Sections</div>
                     <button
-                      key={section.id}
-                      onClick={() => scrollToSection(section.id)}
-                      className="flex w-full items-center justify-between rounded-md px-3 py-2.5 text-sm hover:bg-zinc-900 text-left text-zinc-300"
+                      ref={drawerCloseRef}
+                      onClick={() => setShowMobileToc(false)}
+                      className="icon-btn"
+                      aria-label="Close sections"
                     >
-                      <span>
-                        {section.number}. {section.title}
-                      </span>
-                      <span className="text-xs text-zinc-600">{section.questions.length}</span>
+                      <X className="h-4 w-4" />
                     </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
+                  </div>
+                  <div className="space-y-1">
+                    {data.sections.map((section) => (
+                      <button
+                        key={section.id}
+                        onClick={() => scrollToSection(section.id)}
+                        className="toc-link flex w-full items-center justify-between px-3 py-2.5 text-left text-sm"
+                      >
+                        <span>
+                          {section.number}. {section.title}
+                        </span>
+                        <span className="font-mono text-xs tabular-nums text-ink-low">{section.questions.length}</span>
+                      </button>
+                    ))}
+                  </div>
+                </motion.div>
+              </motion.div>
+            )}
+          </AnimatePresence>
 
           {/* Main content */}
-          <main className="flex-1 min-w-0">
+          <main className="min-w-0 flex-1">
+            {/* Keep an h1 in the tree while the hero is filtered away */}
+            {(isSearching || showFavoritesOnly) && (
+              <h1 className="sr-only">AI Engineering Interview Prep</h1>
+            )}
             {/* Intro banner */}
             {!isSearching && !showFavoritesOnly && (
-              <div className="minimal-hero mb-8 rounded-lg border border-zinc-800/80 bg-zinc-900/80 px-5 py-5 sm:px-6 sm:py-6">
-                <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_22rem] xl:items-end">
+              <motion.div
+                variants={heroStagger}
+                initial={introDone ? false : 'hidden'}
+                animate="show"
+                className={`hero-card mb-10 px-6 py-8 sm:px-10 sm:py-10 ${introDone ? 'no-intro' : ''}`}
+              >
+                <div className="grid gap-8 xl:grid-cols-[minmax(0,1fr)_20rem] xl:items-end">
                   <div>
-                    <h1 className="max-w-3xl text-balance text-2xl font-semibold leading-tight text-zinc-50 sm:text-3xl">
+                    <motion.h1 variants={heroChild} className="hero-title max-w-2xl text-balance">
                       Practice high-signal AI engineering interview questions.
-                    </h1>
-                    <p className="mt-3 max-w-3xl text-[15px] leading-7 text-zinc-400">
-                      Search, drill random prompts, mark favorites, and use focus mode across LLMs, RAG, Agents, Fine-Tuning, Vector DBs, System Design, LLMOps, Evaluation, Safety, Infrastructure, and more.
-                    </p>
-                    <div className="mt-5 flex flex-wrap gap-2 text-xs">
-                      <div className="rounded-full border border-zinc-800 bg-zinc-950/80 px-3 py-1 text-zinc-400">{data.stats.totalQuestions} curated questions</div>
-                      <div className="rounded-full border border-zinc-800 bg-zinc-950/80 px-3 py-1 text-zinc-400">Favorites saved locally</div>
-                      <div className="rounded-full border border-zinc-700 bg-zinc-950/80 px-3 py-1 text-zinc-300">Random drill mode</div>
-                    </div>
+                    </motion.h1>
+                    <motion.div variants={heroChild}>
+                      <div className="hero-rule mt-5" aria-hidden="true" />
+                      <p className="mt-5 max-w-2xl text-[15px] leading-7 text-ink-mid">
+                        Search, drill random prompts, mark favorites, and use focus mode across LLMs, RAG,
+                        Agents, Fine-Tuning, Vector DBs, System Design, LLMOps, Evaluation, Safety,
+                        Infrastructure, and more.
+                      </p>
+                    </motion.div>
+                    <motion.div variants={heroChild} className="mt-6 flex flex-wrap gap-2 text-xs">
+                      <div className="hero-chip">{data.stats.totalQuestions} curated questions</div>
+                      <div className="hero-chip">Favorites saved locally</div>
+                      <div className="hero-chip">Random drill mode</div>
+                    </motion.div>
                   </div>
-                  <div className="grid grid-cols-3 gap-2 sm:gap-3 xl:grid-cols-1">
-                    <div className="minimal-metric">
-                      <span>Viewed</span>
-                      <strong>{displayedViewedCount}</strong>
+                  <motion.div variants={heroChild} className="grid grid-cols-3 gap-2 sm:gap-3 xl:grid-cols-1">
+                    <div className="stat-tile">
+                      <span className="label">Viewed</span>
+                      <span className="value">
+                        <CountUp value={displayedViewedCount} animateIn={!introDone} />
+                      </span>
                     </div>
-                    <div className="minimal-metric">
-                      <span>Favorites</span>
-                      <strong>{isMounted ? favorites.size : 0}</strong>
+                    <div className="stat-tile">
+                      <span className="label">Favorites</span>
+                      <span className="value">
+                        <CountUp value={isMounted ? favorites.size : 0} animateIn={!introDone} />
+                      </span>
                     </div>
-                    <div className="minimal-metric">
-                      <span>Progress</span>
-                      <strong>{displayedProgressPercentage}%</strong>
+                    <div className="stat-tile">
+                      <span className="label">Progress</span>
+                      <span className="value">
+                        <CountUp value={displayedProgressPercentage} suffix="%" animateIn={!introDone} />
+                      </span>
+                      <div className="stat-track">
+                        <div
+                          className="stat-fill"
+                          style={{ transform: `scaleX(${displayedProgressPercentage / 100})` }}
+                        />
+                      </div>
                     </div>
-                  </div>
+                  </motion.div>
                 </div>
-              </div>
+              </motion.div>
             )}
 
             {filteredSections.length === 0 && (
-              <div className="rounded-lg border border-zinc-800 bg-zinc-900/80 p-10 text-center">
+              <div className="hero-card p-10 text-center">
                 {showFavoritesOnly ? (
                   <>
-                    <Heart className="mx-auto h-8 w-8 text-zinc-700 mb-3" />
-                    <p className="text-lg">No favorites yet</p>
-                    <p className="mt-1 text-sm text-zinc-500">Click the heart icon on any question to save it for later.</p>
-                    <button 
-                      onClick={() => setShowFavoritesOnly(false)} 
-                      className="mt-4 text-sm text-zinc-200 underline underline-offset-4 hover:text-white"
+                    <Heart className="mx-auto mb-3 h-8 w-8 text-ink-low opacity-60" />
+                    <p className="text-lg text-ink-hi">No favorites yet</p>
+                    <p className="mt-1 text-sm text-ink-low">
+                      Click the heart icon on any question to save it for later.
+                    </p>
+                    <button
+                      onClick={() => setShowFavoritesOnly(false)}
+                      className="text-btn mt-4 !text-sm underline underline-offset-4"
                     >
                       Browse all questions →
                     </button>
                   </>
                 ) : (
                   <>
-                    <p className="text-lg">No matches found.</p>
-                    <p className="mt-1 text-sm text-zinc-500">Try different keywords or clear your filters.</p>
+                    <p className="text-lg text-ink-hi">No matches found.</p>
+                    <p className="mt-1 text-sm text-ink-low">Try different keywords or clear your filters.</p>
                   </>
                 )}
               </div>
             )}
 
-            {filteredSections.map((section) => (
-              <div key={section.id} id={section.id} className="section-header mb-12">
+            {filteredSections.map((section, sectionIdx) => (
+              <div key={section.id} id={section.id} className="section-block mb-24">
                 {/* Section header */}
-                <div className="mb-4 flex flex-col gap-3 border-b border-zinc-800/80 pb-3 sm:flex-row sm:items-end sm:justify-between">
-                  <div className="min-w-0">
-                    <div className="font-mono text-xs text-zinc-500 tracking-[1.5px]">
-                      SECTION {section.number}
-                    </div>
-                    <h2 className="text-lg sm:text-xl font-semibold text-zinc-100 break-words">{section.title}</h2>
+                <div className="section-plate mb-5">
+                  <div className="ghost-folio" aria-hidden="true">
+                    {String(section.number).padStart(2, '0')}
                   </div>
+                  <div className="flex flex-col gap-3 pb-4 sm:flex-row sm:items-end sm:justify-between">
+                    <div className="min-w-0">
+                      <div className="kicker section-kicker mb-1.5">
+                        Section {String(section.number).padStart(2, '0')} · {section.questions.length} questions
+                      </div>
+                      <h2 className="section-title break-words">{section.title}</h2>
+                    </div>
 
-                  <div className="flex shrink-0 items-center gap-2 self-start sm:self-auto">
-                    <div className="text-xs text-zinc-500 font-mono mr-1">
-                      {section.questions.length} Q{section.questions.length === 1 ? '' : 's'}
+                    <div className="flex shrink-0 items-center gap-4 self-start sm:self-auto">
+                      <button onClick={() => toggleSection(section.id, true)} className="text-btn">
+                        Expand all
+                      </button>
+                      <button onClick={() => toggleSection(section.id, false)} className="text-btn">
+                        Collapse
+                      </button>
                     </div>
-                    <button
-                      onClick={() => toggleSection(section.id, true)}
-                      className="section-expand-btn"
-                    >
-                      Expand all
-                    </button>
-                    <button
-                      onClick={() => toggleSection(section.id, false)}
-                      className="section-expand-btn"
-                    >
-                      Collapse
-                    </button>
                   </div>
+                  <div className="section-rule" />
                 </div>
 
                 {/* Questions */}
-                <div className="space-y-3">
+                <div className="space-y-4">
                   {section.questions.map((q, idx) => {
                     const isExpanded = effectiveExpandedIds.has(q.id);
                     const isFavorited = favorites.has(q.id);
+                    const enters = showEntrance && sectionIdx === 0 && idx < 6;
 
                     return (
                       <div
                         id={`card-${q.id}`}
                         key={q.id}
-                        className={`question-card group rounded-lg border overflow-hidden ${isExpanded ? 'expanded' : ''}`}
+                        className={`question-card group overflow-hidden ${isExpanded ? 'expanded' : ''} ${
+                          enters ? 'card-enter' : ''
+                        }`}
+                        style={enters ? { animationDelay: `${350 + idx * 40}ms` } : undefined}
                       >
-                        {/* Question header */}
+                        <div className="card-spine" aria-hidden="true" />
+                        {/* Question header — the title is a real <button>
+                            (accordion pattern) so keyboard users can operate
+                            the row AND the action buttons independently */}
                         <div
-                          role="button"
-                          tabIndex={0}
-                          aria-expanded={isExpanded}
                           onClick={() => toggleQuestion(q.id)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' || e.key === ' ') {
-                              e.preventDefault();
-                              toggleQuestion(q.id);
-                            }
-                          }}
-                          className="question-header w-full px-4 py-4 text-left cursor-pointer sm:px-5 sm:py-[17px]"
+                          className="question-header w-full cursor-pointer px-4 py-4 text-left sm:px-6 sm:py-5"
                         >
                           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-4">
                             <div className="flex min-w-0 items-start gap-3 sm:contents">
-                              <div className="shrink-0 mt-0.5">
-                                <div className="question-index flex h-7 w-7 items-center justify-center rounded-md text-[11px] font-mono">
+                              <div className="mt-0.5 shrink-0">
+                                <div className="q-index">
                                   {idx + 1}
+                                  {isMounted && viewedQuestions.has(q.id) && (
+                                    <>
+                                      <span className="viewed-dot" aria-hidden="true" />
+                                      <span className="sr-only">viewed</span>
+                                    </>
+                                  )}
                                 </div>
                               </div>
 
-                              <div className="flex-1 min-w-0 pr-1">
-                                <div className="question-text group-hover:text-zinc-100 break-words">
-                                  {highlightText(q.question, searchTerm)}
-                                </div>
+                              <div className="min-w-0 flex-1 pr-1">
+                                <h3 className="question-text break-words">
+                                  <button
+                                    type="button"
+                                    className="question-toggle"
+                                    aria-expanded={isExpanded}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      toggleQuestion(q.id);
+                                    }}
+                                  >
+                                    {highlightText(q.question, searchTerm)}
+                                  </button>
+                                </h3>
 
-                                {/* Answer preview when collapsed - hugely improves readability/scannability */}
                                 {!isExpanded && (
                                   <div className="question-preview">
-                                    {getAnswerPreview(q.answer)}
-                                  </div>
-                                )}
-
-                                {/* Viewed indicator (only after client mount to avoid hydration mismatch) */}
-                                {isMounted && viewedQuestions.has(q.id) && !isExpanded && (
-                                  <div className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
-                                    <Check className="h-3 w-3" /> viewed
+                                    {highlightText(getAnswerPreview(q.answer, searchTerm), searchTerm)}
                                   </div>
                                 )}
                               </div>
                             </div>
 
-                            <div className="flex shrink-0 items-center justify-end gap-0.5 border-t border-zinc-800/60 pt-3 sm:border-0 sm:pt-0.5">
-                            {/* Focus / Read mode (very interactive) */}
-                            <button
-                              onClick={(e) => openFocus(q, e)}
-                              className="share-btn flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 transition-all"
-                              title="Open in focus mode for easier reading"
-                            >
-                              <Eye className="h-4 w-4" />
-                            </button>
+                            <div className="flex shrink-0 items-center justify-end gap-0.5 border-t border-line-soft pt-3 sm:border-0 sm:pt-0.5">
+                              <button
+                                onClick={(e) => openFocus(q, e)}
+                                className="icon-btn"
+                                title="Open in focus mode for easier reading"
+                              >
+                                <Eye className="h-4 w-4" />
+                              </button>
 
-                            {/* Share link */}
-                            <button
-                              onClick={(e) => shareQuestion(q, e)}
-                              className="share-btn flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100 transition-all"
-                              title="Copy direct link to this question"
-                            >
-                              <Link2 className="h-4 w-4" />
-                            </button>
+                              <button
+                                onClick={(e) => shareQuestion(q, e)}
+                                className="icon-btn"
+                                title="Copy direct link to this question"
+                              >
+                                <Link2 className="h-4 w-4" />
+                              </button>
 
-                            {/* Favorite */}
-                            <button
-                              onClick={(e) => toggleFavorite(q.id, e)}
-                              className={`flex h-8 w-8 items-center justify-center rounded-md transition-all ${
-                                isFavorited 
-                                  ? 'text-zinc-100 hover:text-white'
-                                  : 'text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800/70'
-                              }`}
-                              title={isFavorited ? "Remove from favorites" : "Save for later"}
-                            >
-                              <Heart className={`h-4 w-4 ${isFavorited ? 'fill-current' : ''}`} />
-                            </button>
+                              <button
+                                onClick={(e) => toggleFavorite(q.id, e)}
+                                className={`icon-btn ${isFavorited ? 'favorited' : ''}`}
+                                title={isFavorited ? 'Remove from favorites' : 'Save for later'}
+                              >
+                                <motion.span
+                                  key={isFavorited ? 'fav' : 'unfav'}
+                                  initial={reduceMotion || !isMounted ? false : { scale: 1 }}
+                                  animate={
+                                    reduceMotion || !isMounted
+                                      ? {}
+                                      : isFavorited
+                                        ? { scale: [1, 1.3, 1], transition: { duration: 0.35, ease: EASE_OUT } }
+                                        : {}
+                                  }
+                                  className="flex"
+                                >
+                                  <Heart className={`h-4 w-4 ${isFavorited ? 'fill-current' : ''}`} />
+                                </motion.span>
+                              </button>
 
-                            {/* Copy */}
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                copyQA(q);
-                              }}
-                              className="flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 opacity-70 hover:bg-zinc-800 hover:text-white hover:opacity-100 transition-all action-btn"
-                              title="Copy question + answer"
-                            >
-                              <Copy className="h-4 w-4" />
-                            </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  copyQA(q);
+                                }}
+                                className="icon-btn"
+                                title="Copy question + answer"
+                              >
+                                <Copy className="h-4 w-4" />
+                              </button>
 
-                            {/* Chevron */}
-                            <div className="flex h-8 w-8 items-center justify-center text-zinc-500 ml-0.5">
-                              {isExpanded ? (
-                                <ChevronUp className="h-4 w-4" />
-                              ) : (
-                                <ChevronDown className="h-4 w-4" />
-                              )}
-                            </div>
+                              <div className="ml-0.5 flex h-8 w-8 items-center justify-center text-ink-low" aria-hidden="true">
+                                <ChevronDown className="chevron h-4 w-4" />
+                              </div>
                             </div>
                           </div>
                         </div>
 
-                        {/* Answer - rendered instantly for faster expansion */}
-                        {isExpanded && (
-                          <div className="overflow-hidden border-t border-zinc-800 bg-zinc-950/70">
-                            <div className="answer-panel px-5 py-5">
-                              <div className="answer-header">
-                                <span>ANSWER</span>
-                              </div>
-                              <div className="answer-content prose max-w-none">
-                                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                                  {q.answer}
-                                </ReactMarkdown>
-                              </div>
+                        {/* Answer — paper first, ink second */}
+                        <AnswerReveal open={isExpanded}>
+                          <div className="answer-zone px-5 py-5 sm:px-6 sm:py-6">
+                            <div className="answer-overline">Answer</div>
+                            <div className="answer-overline-rule" aria-hidden="true" />
+                            <div className="prose">
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{q.answer}</ReactMarkdown>
+                            </div>
 
-                              <div className="mt-6 flex flex-wrap gap-2 border-t border-zinc-800 pt-4">
-                                <button
-                                  onClick={() => copyQA(q)}
-                                  className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-1.5 text-xs font-medium hover:bg-zinc-800 hover:border-zinc-600 active:bg-black action-btn"
-                                >
-                                  <Copy className="h-3.5 w-3.5" /> Copy full answer
-                                </button>
-                                <button
-                                  onClick={() => copyQuestion(q)}
-                                  className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-1.5 text-xs font-medium hover:bg-zinc-800 hover:border-zinc-600 active:bg-black action-btn"
-                                >
-                                  Copy question only
-                                </button>
+                            <div className="mt-7 flex flex-wrap gap-2 border-t border-line-soft pt-5">
+                              <button onClick={() => copyQA(q)} className="btn-soft !h-8 !text-xs">
+                                <Copy className="h-3.5 w-3.5" /> Copy full answer
+                              </button>
+                              <button onClick={() => copyQuestion(q)} className="btn-soft !h-8 !text-xs">
+                                Copy question only
+                              </button>
 
-                                <button
-                                  onClick={(e) => openFocus(q, e)}
-                                  className="inline-flex items-center gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 transition-colors"
-                                >
-                                  <Eye className="h-3.5 w-3.5" /> Read in focus mode
-                                </button>
+                              <button onClick={(e) => openFocus(q, e)} className="btn-soft !h-8 !text-xs">
+                                <Eye className="h-3.5 w-3.5" /> Read in focus mode
+                              </button>
 
-                                <button
-                                  onClick={(e) => toggleFavorite(q.id, e)}
-                                  className={`ml-auto inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                                    isFavorited
-                                      ? 'border-zinc-600 bg-zinc-800 text-zinc-100'
-                                      : 'border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-400'
-                                  }`}
-                                >
-                                  <Heart className={`h-3.5 w-3.5 ${isFavorited ? 'fill-current' : ''}`} />
-                                  {isFavorited ? 'Favorited' : 'Favorite'}
-                                </button>
-                              </div>
+                              <button
+                                onClick={(e) => toggleFavorite(q.id, e)}
+                                className={`btn-soft !h-8 !text-xs ml-auto ${isFavorited ? '!text-ink-hi' : ''}`}
+                              >
+                                <Heart className={`h-3.5 w-3.5 ${isFavorited ? 'fill-current text-ember' : ''}`} />
+                                {isFavorited ? 'Favorited' : 'Favorite'}
+                              </button>
                             </div>
                           </div>
-                        )}
+                        </AnswerReveal>
                       </div>
                     );
                   })}
@@ -1074,89 +1358,107 @@ export default function AIInterviewPrep() {
             ))}
 
             {/* Footer info */}
-            <div className="mt-12 mb-10 border-t border-zinc-800 pt-8 text-center text-sm">
-              <p className="text-zinc-500 max-w-md mx-auto">
+            <div className="mb-10 mt-16 border-t border-line-soft pt-8 text-center text-sm">
+              <p className="mx-auto max-w-md text-ink-low">
                 Built for serious AI engineering interview preparation.
               </p>
-              <div className="mt-3 flex justify-center gap-4 text-xs text-zinc-600">
+              <div className="kicker mt-4 flex justify-center gap-3">
                 <span>{data.stats.totalQuestions} questions</span>
-                <span>•</span>
+                <span className="opacity-40">·</span>
                 <span>{data.stats.totalSections} sections</span>
-                <span>•</span>
-                <span>Favorites saved locally</span>
+                <span className="opacity-40">·</span>
+                <span>Saved locally</span>
               </div>
             </div>
           </main>
         </div>
       </div>
+      </div>
 
-      {/* Focus / Read Modal - greatly improves readability for long answers */}
+      {/* Focus / Read Modal — the sanctum */}
       <AnimatePresence>
         {focusQuestion && (
-          <div 
-            className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-black/80 p-4 sm:p-6"
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.25 }}
+            className="focus-overlay fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto p-4 sm:p-6"
             onClick={closeFocus}
           >
             <motion.div
-              initial={{ opacity: 0, y: 30, scale: 0.985 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: 20, scale: 0.985 }}
-              transition={FAST_MODAL_TRANSITION}
-              className="focus-modal my-auto flex w-full max-w-4xl max-h-[min(90vh,calc(100dvh-2rem))] flex-col rounded-2xl p-5 shadow-2xl sm:p-9"
+              initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 28, scale: 0.97 }}
+              animate={reduceMotion ? { opacity: 1 } : { opacity: 1, y: 0, scale: 1 }}
+              exit={
+                reduceMotion
+                  ? { opacity: 0 }
+                  : { opacity: 0, y: 12, transition: { duration: 0.2, ease: 'easeIn' } }
+              }
+              transition={reduceMotion ? { duration: 0.2 } : MODAL_SPRING}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="focus-question-title"
+              className="focus-modal my-auto flex max-h-[min(90vh,calc(100dvh-2rem))] w-full max-w-3xl flex-col p-6 sm:p-10"
               onClick={(e) => e.stopPropagation()}
             >
-              <div className="mb-5 flex shrink-0 items-start justify-between gap-4">
-                <div className="pr-2 text-base font-medium leading-snug text-zinc-200 break-words sm:pr-6 sm:text-lg">
-                  {focusQuestion.question}
+              <motion.div
+                initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 6 }}
+                animate={reduceMotion ? { opacity: 1 } : { opacity: 1, y: 0 }}
+                transition={{ duration: 0.25, ease: EASE_OUT, delay: 0.06 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <div className="mb-5 flex shrink-0 items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    {focusSection && (
+                      <div className="kicker mb-2">
+                        Section {String(focusSection.number).padStart(2, '0')} · {focusSection.title} · ~
+                        {focusReadMinutes} min read
+                      </div>
+                    )}
+                    <div id="focus-question-title" className="modal-question break-words pr-2 sm:pr-6">
+                      {focusQuestion.question}
+                    </div>
+                  </div>
+                  <button
+                    ref={modalCloseRef}
+                    onClick={closeFocus}
+                    className="icon-btn shrink-0"
+                    aria-label="Close focus mode"
+                  >
+                    <X className="h-5 w-5" />
+                  </button>
                 </div>
-                <button 
-                  onClick={closeFocus} 
-                  className="shrink-0 p-1 text-zinc-400 hover:text-white"
-                  aria-label="Close focus mode"
-                >
-                  <X className="h-5 w-5" />
-                </button>
-              </div>
 
-              <div className="prose max-w-none min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {focusQuestion.answer}
-                </ReactMarkdown>
-              </div>
+                <div className="prose min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{focusQuestion.answer}</ReactMarkdown>
+                </div>
 
-              <div className="mt-8 flex shrink-0 flex-wrap gap-2 border-t border-zinc-800 pt-6">
-                <button
-                  onClick={() => copyQA(focusQuestion)}
-                  className="flex items-center gap-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 px-4 py-2 text-sm font-medium transition-colors"
-                >
-                  <Copy className="h-4 w-4" /> Copy full answer
-                </button>
-                <button
-                  onClick={() => copyQuestion(focusQuestion)}
-                  className="flex items-center gap-2 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 px-4 py-2 text-sm font-medium transition-colors"
-                >
-                  Copy question
-                </button>
-                <button
-                  onClick={() => {
-                    toggleFavorite(focusQuestion.id);
-                  }}
-                  className={`ml-auto flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-colors ${
-                    favorites.has(focusQuestion.id) 
-                      ? 'border-zinc-600 bg-zinc-800 text-zinc-100'
-                      : 'border-zinc-700 hover:bg-zinc-900 text-zinc-300'
-                  }`}
-                >
-                  <Heart className={`h-4 w-4 ${favorites.has(focusQuestion.id) ? 'fill-current' : ''}`} />
-                  {favorites.has(focusQuestion.id) ? 'Remove from favorites' : 'Add to favorites'}
-                </button>
-              </div>
+                <div className="mt-8 flex shrink-0 flex-wrap gap-2 border-t border-line-soft pt-6">
+                  <button onClick={() => copyQA(focusQuestion)} className="btn-soft">
+                    <Copy className="h-4 w-4" /> Copy full answer
+                  </button>
+                  <button onClick={() => copyQuestion(focusQuestion)} className="btn-soft">
+                    Copy question
+                  </button>
+                  <button
+                    onClick={() => {
+                      toggleFavorite(focusQuestion.id);
+                    }}
+                    className={`btn-soft ml-auto ${favorites.has(focusQuestion.id) ? '!text-ink-hi' : ''}`}
+                  >
+                    <Heart
+                      className={`h-4 w-4 ${favorites.has(focusQuestion.id) ? 'fill-current text-ember' : ''}`}
+                    />
+                    {favorites.has(focusQuestion.id) ? 'Remove from favorites' : 'Add to favorites'}
+                  </button>
+                </div>
 
-              <div className="text-center text-[10px] text-zinc-600 mt-6">
-                Press <kbd className="px-1.5 py-px bg-zinc-900 rounded">Esc</kbd> to close • <kbd className="px-1.5 py-px bg-zinc-900 rounded">C</kbd> to copy answer
-              </div>
+                <div className="mt-6 text-center text-[11px] text-ink-low">
+                  Press <kbd>Esc</kbd> to close · <kbd>C</kbd> to copy answer
+                </div>
+              </motion.div>
             </motion.div>
-          </div>
+          </motion.div>
         )}
       </AnimatePresence>
     </div>
