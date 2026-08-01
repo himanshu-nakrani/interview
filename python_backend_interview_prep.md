@@ -78,12 +78,12 @@ CPython preallocates the integers **-5 through 256** at startup and reuses them 
 Constant folding makes this confusing at the REPL:
 
 ```python
-s1 = "hello world"
-s2 = "hello" + " world"   # folded at compile time -> same object as s1
+s1 = "hello_world"        # identifier-like, so the compiler auto-interns it
+s2 = "hello" + "_world"   # folded at compile time -> same object as s1
 s1 is s2                  # True
-s3 = " ".join(["hello", "world"])
+s3 = "_".join(["hello", "world"])
 s3 is s1                  # False -- built at runtime
-sys.intern(s3) is s1      # True
+sys.intern(s3) is s1      # True -- now it finds the compiler's entry in the intern table
 ```
 
 Where it matters: **memory and comparison speed in high-cardinality workloads**. If you are parsing ten million log lines with a `level` field, `sys.intern(level)` collapses ten million string objects into five, and dict lookups keyed on interned strings hit the pointer-equality fast path in `unicode_eq` before doing a memcmp. I have used this on a Kafka consumer parsing JSON where interning six repeated keys cut RSS by ~30%.
@@ -242,7 +242,7 @@ Two extras worth naming. `numpy` arrays and pandas objects raise `ValueError: tr
 All three are singletons of their own types (`NoneType`, `NotImplementedType`, `ellipsis`), so identity comparison is correct and cheap for all of them.
 
 - **`None`** is the absence-of-value sentinel and the implicit return of every function without a `return`. Compare with `is None`.
-- **`NotImplemented`** is the value a binary dunder *returns* to tell the interpreter "I don't know how to handle this operand type — try the reflected operation." It is **not** an error and must never be raised. `NotImplementedError` is the exception you raise from an abstract method; confusing the two is a classic screen-out. Using `NotImplemented` in a boolean context has been deprecated since 3.9 and raises `TypeError` on current CPython, which catches the bug where a `__eq__` returns it and the caller does `if a == b:`.
+- **`NotImplemented`** is the value a binary dunder *returns* to tell the interpreter "I don't know how to handle this operand type — try the reflected operation." It is **not** an error and must never be raised. `NotImplementedError` is the exception you raise from an abstract method; confusing the two is a classic screen-out. Using `NotImplemented` in a boolean context has been deprecated since 3.9, but it still only warns — `bool(NotImplemented)` emits a `DeprecationWarning` and returns **`True`**. So a `__eq__` that leaks a bare `NotImplemented` to `if a == b:` silently takes the truthy branch; run tests with `-W error::DeprecationWarning` if you want that to be loud.
 - **`Ellipsis`** (`...`) is a general-purpose placeholder with no built-in semantics. Real uses: numpy multidimensional slicing (`arr[..., 0]`), function/protocol stubs (`def f() -> int: ...`), `Callable[..., int]` in typing, and — the one that shows up in FastAPI code every day — `Field(...)` in Pydantic to mark a field as **required with no default**.
 
 ```python
@@ -554,10 +554,11 @@ class Money:
     currency: str = "USD"
 
     def __post_init__(self) -> None:
+        # normalize BEFORE validating, or "usd" fails the check it was meant to pass
+        # frozen blocks normal assignment; object.__setattr__ is the sanctioned escape hatch
+        object.__setattr__(self, "currency", self.currency.upper())
         if self.currency not in _ISO_4217:
             raise ValueError(f"unknown currency {self.currency!r}")
-        # frozen blocks normal assignment; this is the sanctioned escape hatch
-        object.__setattr__(self, "currency", self.currency.upper())
 
     def __add__(self, other: "Money") -> "Money":
         if not isinstance(other, Money):
@@ -1183,7 +1184,7 @@ Default to the **comprehension**. It compiles to a tight bytecode loop with a de
 ```python
 # Filter + transform, one pass, no intermediate list:
 total = sum(row.amount for row in rows if row.status == "settled")
-# 3.12+: walrus avoids computing an expensive f(x) twice
+# walrus (3.8+) avoids computing an expensive f(x) twice
 kept = [y for x in xs if (y := expensive(x)) is not None]
 ```
 
@@ -1204,7 +1205,7 @@ Tuples are not magically faster to *iterate* (same bytecode, same pointer deref)
 ### When would you reach for `NamedTuple` vs `dataclass` vs `TypedDict` vs a plain dict for a record type?
 
 - **`typing.NamedTuple`** — immutable, hashable, tuple-compatible (unpacks, indexes, compares positionally), lowest memory (no `__dict__`). Use for small value objects that flow through pure functions or become dict keys: `Point(NamedTuple)`, a cache key, a coordinate. Free `_replace`, `_asdict`.
-- **`@dataclass(slots=True, frozen=True)`** — my default for domain records. `slots=True` (3.10+) removes the instance `__dict__`, cutting memory ~40% and speeding attribute access; `frozen=True` gives you `__hash__`. Supports defaults, `__post_init__`, inheritance, and field-level metadata — everything namedtuple makes awkward.
+- **`@dataclass(slots=True, frozen=True)`** — my default for domain records. `slots=True` (3.10+) removes the instance `__dict__`, cutting per-instance memory ~5-6x once that dict would have been materialized, and speeding attribute access; `frozen=True` gives you `__hash__`. Supports defaults, `__post_init__`, inheritance, and field-level metadata — everything namedtuple makes awkward.
 - **`TypedDict`** — a typed *view* over an actual dict. Use at JSON boundaries where the runtime object must stay a dict (e.g. what you hand to `json.dumps` or a driver), and you only want static checking.
 - **Pydantic `BaseModel`** — when you need runtime validation/coercion at a trust boundary (covered in the Pydantic section). It costs more per instance than a slotted dataclass, so don't use it for internal hot-path structures.
 - **Plain dict** — dynamic keys only. Losing attribute access, typo protection, and `__slots__`-level memory efficiency is not worth it for a known schema.
@@ -1217,7 +1218,7 @@ class CacheKey(NamedTuple):          # hashable, comparable, 1 allocation
     tenant: str
     resource_id: int
 
-@dataclass(slots=True, frozen=True)  # ~40% less memory than a plain class
+@dataclass(slots=True, frozen=True)  # ~5-6x less memory than a plain class
 class Invoice:
     id: int
     cents: int
@@ -1391,7 +1392,7 @@ The classic runtime error: **mutating a dict while iterating a view** raises `Ru
 
 ### `{**a, **b}` vs `a | b` vs `a.update(b)` vs `ChainMap` — which one and when?
 
-- **`a | b`** (PEP 584, Python 3.9+) — my default for merging two mappings into a new dict. Reads as an expression, right operand wins on conflicts, and it returns the type of the *left* operand for dict subclasses in most cases. `a |= b` mutates `a` in place and, unlike `a = a | b`, accepts any iterable of pairs.
+- **`a | b`** (PEP 584, Python 3.9+) — my default for merging two mappings into a new dict. Reads as an expression, right operand wins on conflicts, and it returns a plain `dict` for an ordinary `dict` subclass (the inherited `dict.__or__` copies), though stdlib subclasses that define their own `__or__` — `defaultdict`, `OrderedDict`, `Counter` — do preserve their type. `a |= b` mutates `a` in place and, unlike `a = a | b`, accepts any iterable of pairs.
 - **`{**a, **b}`** — works pre-3.9 and lets you interleave literals: `{**defaults, "override": 1, **user}`. Slightly more flexible, slightly noisier.
 - **`a.update(b)`** — in-place, no new allocation. Use in hot loops or when merging many maps into an accumulator: N `update` calls beat `functools.reduce(operator.or_, maps)`, which allocates N intermediate dicts.
 - **`collections.ChainMap(user, env, defaults)`** — no merge at all: a **layered lookup** that searches maps left to right. O(k) per lookup in the number of layers, but O(1) to construct even if the layers hold a million keys, and later mutations to the underlying maps are visible. This is the right tool for **config precedence** (CLI > env > file > defaults) and for scoped namespaces: `ctx = base.new_child({"request_id": rid})` gives a cheap child scope where writes land only in the front map and `ctx.parents` pops back out.
@@ -1444,7 +1445,7 @@ Since 3.7 there's a neat trick that leans on dict ordering: **`list(dict.fromkey
 
 Since Python 3.3, `str` has **three internal representations chosen by the widest code point present**: 1 byte/char (Latin-1 range), 2 bytes/char (BMP), or 4 bytes/char. There is no UTF-8 or UTF-16 in the internal buffer, so **`s[i]` is genuinely O(1)** — unlike languages that store UTF-8 and pay O(n) to index. A pure-ASCII string additionally uses the "compact ASCII" form where the data follows the header in the same allocation.
 
-Measured on 64-bit CPython 3.12: `sys.getsizeof("")` is 49 bytes and each ASCII char adds 1; a single non-Latin-1 char jumps the whole string to 2 or 4 bytes per char. (3.13/3.14 trimmed the header to ~41 bytes.) The production consequence is the **kind-promotion cliff**: one emoji in a 1 MB log line makes that string 4 MB. If you cache millions of user-supplied strings in memory, a few 4-byte-kind strings can blow the budget in a way that's invisible to `len()`.
+Measured on 64-bit CPython 3.11: `sys.getsizeof("")` is 49 bytes and each ASCII char adds 1; a single non-Latin-1 char jumps the whole string to 2 or 4 bytes per char. (PEP 623 dropped the legacy `wstr` members in 3.12, trimming the header to 41 bytes.) The production consequence is the **kind-promotion cliff**: one emoji in a 1 MB log line makes that string 4 MB. If you cache millions of user-supplied strings in memory, a few 4-byte-kind strings can blow the budget in a way that's invisible to `len()`.
 
 Other consequences:
 
@@ -1490,7 +1491,7 @@ Formatting choice: **f-strings are fastest** (compiled to `FORMAT_VALUE`/`BUILD_
 - `x in s`, `s.find(x)`, `s.replace(a, b)`: naive worst case O(n·m), but CPython uses a **Bloom-filter-style bad-character skip** and, since 3.10, switches to the **two-way (Crochemore–Perrin) algorithm** for long needles, giving O(n+m) worst case. So `in` on a 10 MB string is fine; you rarely need `re` for a literal.
 - `s.startswith(prefix)` accepts a **tuple** — `s.startswith(("http://", "https://"))` is one C call, far better than chained `or`s or a regex.
 - `s.split(sep)` allocates a list of new string objects: splitting a 100 MB CSV line-by-line into `str` costs several times the file size in RAM (each string has ~41–49 bytes of header). Use `maxsplit` when you only need the first field: `key, _, rest = line.partition(":")` is one pass and no list.
-- `s.strip("abc")` strips a **character set**, not a suffix — `"example.com".strip("moc.")` returns `"exa"`. Use `removeprefix`/`removesuffix` (3.9+).
+- `s.strip("abc")` strips a **character set**, not a suffix — `"example.com".strip("moc.")` returns `"example"` (it stops at the first char not in the set, from each end). Use `removeprefix`/`removesuffix` (3.9+).
 - `re` compiled patterns are cached (512 entries) but the cache is keyed on the pattern *string*; build patterns once at module scope. For a fixed set of literals, a `set` lookup or `str.startswith(tuple)` beats a regex by 5–20x.
 - Case-insensitive comparison: use `.casefold()`, not `.lower()`, for non-English text (`"ß".casefold() == "ss"`).
 
@@ -1688,7 +1689,8 @@ merged = heapq.merge(*(map(json.loads, f) for f in chunks), key=keyfn)  # stream
 | appendleft / insert(0) | O(n) | O(1) | — | — | — |
 | pop() (end) | O(1) | O(1) | O(1) `popitem` | O(1) `pop` | — |
 | pop(0) / popleft | O(n) | O(1) | — | — | — |
-| delete by value | O(n) | O(n) | O(1) `del d[k]` | O(1) `discard` | — |
+| delete by value | O(n) | O(n) | O(n) (scan `.values()`) | O(1) `discard` | — |
+| delete by key/index | O(n) | O(1) ends | O(1) `del d[k]` | — | — |
 | iterate | O(n) | O(n) | O(n) | O(n) | O(n) |
 | copy / slice | O(k) | O(n) | O(n) | O(n) | O(k) |
 | min/max | O(n) | O(n) | O(n) | O(n) | O(n) |
@@ -1737,7 +1739,7 @@ The sharing **breaks** (the dict "unshares" into a normal combined dict, and eve
 
 So the practical rule is: **set every attribute in `__init__`, in a consistent order**. This is invisible until you profile a service holding a million ORM-ish objects and find 300 MB of attribute dicts.
 
-`__slots__` goes further: it replaces the instance dict entirely with a fixed array of descriptors — no dict at all, ~40–50% less memory, and faster attribute access (a direct offset instead of a hash lookup). The costs are no dynamic attributes, care needed with multiple inheritance, and no `__weakref__` unless you declare it. In 3.11+ CPython also added "managed dicts" with lazily-created instance dicts stored in a pre-header, so plain classes got cheaper — but slots still win. (Descriptor mechanics are covered in the OOP section.)
+`__slots__` goes further: it replaces the instance dict entirely with a fixed array of descriptors — no dict at all, ~5-6x less per-instance memory once a dict would have been materialized, and faster attribute access (a direct offset instead of a hash lookup). The costs are no dynamic attributes, care needed with multiple inheritance, and no `__weakref__` unless you declare it. In 3.11+ CPython also added "managed dicts" with lazily-created instance dicts stored in a pre-header, so plain classes got cheaper — but slots still win. (Descriptor mechanics are covered in the OOP section.)
 
 ### When do built-in functions beat a hand-written Python loop, and by how much?
 
@@ -1839,25 +1841,21 @@ resolve(frozenset(user.permissions))   # {"read","write"} and {"write","read"} h
 
 `hash(frozenset)` is O(n) and order-independent (it combines the member hashes commutatively, with extra scrambling so that small sets of small ints don't all collide), so for large sets cache the frozenset object rather than rebuilding it per call. Alternative for the ordered case: `tuple(sorted(items))`, which is O(n log n) to build but hashes like any tuple.
 
-### What's the difference between shallow and deep copy, and which do you use in a request handler?
+### Which containers actually give you a cheap independent copy, and which only look like they do?
 
-`copy.copy(x)` (and `list(x)`, `x[:]`, `dict(x)`, `set(x)`) creates a new **top-level container** whose slots point at the *same* child objects. `copy.deepcopy(x)` recursively copies everything, using a memo dict so shared references stay shared and cycles don't infinite-loop.
+Shallow-vs-deep semantics are in §1. The container-level question is which of the many copy spellings gives you independence *from what*, because the answer differs per type and the syntax hides it.
 
-```python
-import copy
-cfg = {"db": {"pool": 5}, "tags": ["a"]}
-s = dict(cfg);            s["db"]["pool"] = 99   # cfg is now mutated too
-d = copy.deepcopy(cfg);   d["db"]["pool"] = 99   # cfg untouched
-```
+`list(x)`, `x[:]`, `x.copy()`, `dict(x)`, `set(x)`, and `copy.copy(x)` are all the **same** operation: a new top-level container, C-speed, O(n) pointer copies, sharing every element. That is genuinely independent for a container of **immutable** elements — `list[int]`, `dict[str, str]`, `set[str]` — and independence is an illusion the moment an element is itself mutable. `list(rows)` where rows are dicts protects you against `append`/`remove` on the outer list and against nothing else.
 
-`deepcopy` is **slow** — it's pure Python, goes through `__reduce_ex__` for unknown types, and can be 100x the cost of a shallow copy. Deep-copying a request payload per request is a real latency line item. What I actually do:
+The types with sharp edges:
 
-- Prefer **immutability**: frozen dataclasses, tuples, and functions that return new objects. Then no copy is needed at all.
-- For known shapes, write an explicit constructor or `dataclasses.replace(obj, field=new)` instead of `deepcopy`.
-- For nested config, a small recursive merge that builds new dicts.
-- Define `__deepcopy__`/`__copy__` on classes holding non-copyable resources (a DB connection, a socket, a lock) — otherwise `deepcopy` will happily try to clone them, which either explodes or, worse, succeeds and gives you a duplicated connection object.
+- **`defaultdict`** — `dict(dd)` gives a plain `dict` and drops the factory; `dd.copy()` and `copy.copy(dd)` keep it. Silently losing the factory turns a working `d[k].append(v)` into a `KeyError` several call frames later.
+- **`Counter`** — `Counter(c)` and `c.copy()` both give a `Counter`, but `dict(c)` does not, and arithmetic (`c1 + c2`) already builds a new one, so an explicit copy before arithmetic is wasted work.
+- **`deque`** — `copy.copy(dq)` preserves `maxlen`; building `deque(dq)` without passing `maxlen` does not, and the bound you relied on to cap memory is quietly gone.
+- **Nested lists via `*`** — `[[0] * 3] * 3` is three references to one row, the classic grid bug; `[[0] * 3 for _ in range(3)]` is three rows.
+- **Slices of `bytearray`/`memoryview`** — a `bytearray` slice copies, a `memoryview` slice does **not**, which is the entire point of `memoryview` and a surprise if you treat them interchangeably.
 
-The mutable-default class attribute is the same bug in another costume: `class C: tags = []` shares one list across all instances. Use `field(default_factory=list)`.
+The rule I apply: if the elements are immutable, use the cheap copy and move on. If they aren't, either freeze the elements (tuples, frozen dataclasses, Pydantic models with `frozen=True`) or write an explicit constructor for the shape you want — reaching for `deepcopy` on a request payload is usually the point where somebody has stopped reasoning about ownership.
 
 ### `sys.getsizeof` says my dict of 10k small records is 500 KB but the process uses 400 MB. What's going on?
 
@@ -1885,7 +1883,7 @@ Consequences worth stating:
 Stream the file, and pick the structure by cardinality:
 
 ```python
-import csv
+import csv, sys
 from collections import defaultdict
 
 def distinct_counts(path: str, cols: list[str]) -> dict[str, int]:
@@ -1897,7 +1895,7 @@ def distinct_counts(path: str, cols: list[str]) -> dict[str, int]:
     return {c: len(v) for c, v in seen.items()}
 ```
 
-Key decisions: `csv.reader`/`DictReader` are **lazy iterators** (never `f.readlines()`); a `set` per column gives exact counts at ~60–100 bytes per distinct string; `sys.intern` collapses the many duplicate string objects the parser creates, which on a high-repetition column cuts memory several-fold.
+Key decisions: `csv.reader`/`DictReader` are **lazy iterators** (never `f.readlines()`); a `set` per column gives exact counts at ~60–100 bytes per distinct string; `sys.intern` collapses the many duplicate string objects the parser creates, which on a high-repetition column cuts memory several-fold — but only interning *low-cardinality* columns (status, region, enum-ish fields), because the intern table is never garbage-collected and interning a high-cardinality column is an unbounded leak.
 
 The scaling answer: if a column has 100M distinct values, an exact set is tens of GB — switch to **HyperLogLog** (`datasketch`, or Redis `PFADD`/`PFCOUNT`), which gives ~0.8% error in 12 KB regardless of cardinality. And if this is a recurring need, the honest answer is "load it into DuckDB/Postgres and run `COUNT(DISTINCT)`" — Python is the wrong engine for a full-scan aggregation over half a gigabyte.
 
@@ -2117,20 +2115,21 @@ Three consequences that matter in production:
 - Closures **keep the captured objects alive**. A closure that captures a request object, a DataFrame, or a DB session and gets stored in a module-level registry or a long-lived callback list is a textbook memory leak; `gc` will not help because the reference is real, not cyclic-garbage.
 - Cell lookup (`LOAD_DEREF`) is slightly slower than `LOAD_FAST` but much faster than `LOAD_GLOBAL` before specialization.
 
-### Why does this loop print `3, 3, 3`, and what are the three ways to fix it?
+### Why do all three of these closures return the same value, and what are the three ways to fix it?
 
 ```python
 fns = [lambda: i for i in range(3)]
-print([f() for f in fns])   # [2, 2, 2] for a comprehension; 3-element loop var case is analogous
+print([f() for f in fns])   # [2, 2, 2] -- every lambda sees the LAST value of i, not its own
 ```
 
 Python closes over the **variable, not the value**. All three lambdas share one cell for `i`; by the time they're called, the loop has finished and the cell holds its final value. This is **late binding**, and it bites hardest with event-handler registration, retry callbacks, and `asyncio.create_task` in a loop.
 
-Fixes, best first:
+Three fixes, shortest first (my preference order is the reverse — see below):
 
 ```python
 fns = [lambda i=i: i for i in range(3)]              # 1. default arg: evaluated at def time
-fns = [functools.partial(operator.itemgetter, i) for i in range(3)]  # 2. partial freezes args
+fns = [functools.partial(lambda v: v, i) for i in range(3)]  # 2. partial freezes the argument
+                                                     #    (in real code the callable is a real fn)
 def make(i): return lambda: i                        # 3. new scope per iteration -> new cell
 fns = [make(i) for i in range(3)]
 ```
@@ -2353,7 +2352,7 @@ class Service:
     def parse(payload): ...
 ```
 
-`classmethod` and `staticmethod` return **descriptor objects, not functions**. Put your decorator on the outside and it receives a `classmethod` object: `functools.wraps` raises `AttributeError: 'classmethod' object has no attribute '__name__'` (until 3.10, where these objects gained `__wrapped__`/callability, turning a loud failure into a subtler one — `staticmethod` objects became directly callable in 3.10, `classmethod` objects still are not). Keeping the builtin outermost means your decorator wraps a real function and the builtin wraps your wrapper. Same rule for `@property`: `@property` outermost, your decorator on the getter.
+`classmethod` and `staticmethod` return **descriptor objects, not functions**. Put your decorator on the outside and it receives a `classmethod` object: since 3.10 those objects carry `__name__`/`__wrapped__`, so `functools.wraps` succeeds *silently* and the failure is deferred to call time as `TypeError: 'classmethod' object is not callable` — a much subtler break than the `AttributeError` you used to get at decoration time. (`staticmethod` objects did become directly callable in 3.10; `classmethod` objects did not.) Keeping the builtin outermost means your decorator wraps a real function and the builtin wraps your wrapper. Same rule for `@property`: `@property` outermost, your decorator on the getter.
 
 ### Show me a production-grade retry decorator.
 
@@ -3246,13 +3245,17 @@ class Invoice:
 Rules I hold teams to: a property must not do I/O or take unbounded time — `order.customer` firing a lazy SQL query is exactly how N+1 problems hide behind innocent-looking attribute access; a property that can raise on read makes `repr` and debuggers dangerous; and a setter that silently coerces rather than rejects surprises everyone. When the work is expensive but genuinely cacheable, use `functools.cached_property`. When you need the same validation on ten fields, do not write ten properties — write one descriptor.
 
 ### What is `functools.cached_property` and what should you watch out for in a server?
-`cached_property` is a **non-data descriptor** that computes the value once and then writes it into `instance.__dict__` under the same name; because it is non-data, the instance dict wins on every subsequent lookup and the descriptor is never consulted again — that is what makes it fast (no per-access function call) and also what defines its limits.
+The descriptor mechanics and the `__slots__`/invalidation/3.12-locking caveats are in §3. What matters *in a server* is narrower: `cached_property` is a per-instance cache with no TTL and no bound, so its correctness depends entirely on how long the instance lives and how many of them you make.
 
-Four production concerns:
-- **It requires `__dict__`.** With `__slots__` or `@dataclass(slots=True)` you get `TypeError: No '__dict__' attribute on 'S' instance to cache 'y' property`. Add `"__dict__"` to slots (defeating much of the point) or cache manually in a slot.
-- **There is no invalidation API.** You clear it with `instance.__dict__.pop("name", None)`. If the underlying state can change, cached_property is the wrong tool.
-- **Locking changed.** Before 3.12, `cached_property` held a **single per-descriptor lock shared across all instances**, which serialized every thread computing that property on *any* instance — a real throughput cliff in threaded WSGI servers. Python 3.12 removed the lock, so the factory may now run more than once concurrently on the same instance; that is fine for pure computations, not for "create a connection" side effects.
-- **Lifetime.** Caching a large object on a long-lived instance (a settings singleton, a module-level client) keeps it alive forever. Use `functools.lru_cache` with an explicit `maxsize` for bounded caching, and never `lru_cache` on a method — it keys on `self` and pins every instance in memory.
+**Request-scoped instances are the safe case, and the only one I reach for by default.** A `cached_property` on an object created per request — a permissions resolver, a computed pricing context — is really just memoization within one request. It dies with the request, cannot go stale, and cannot leak.
+
+**Application-scoped instances are where it becomes a config bug.** A `cached_property` on a settings singleton or a module-level client is computed once at first access and then frozen for the process lifetime. That is fine for genuinely immutable derived config, and wrong for anything that should follow a secret rotation, a feature-flag change, or a replica failover — you get a value that is correct at boot and silently stale for the next six weeks, with no invalidation hook and nothing in the logs.
+
+**Anything in between leaks.** A cached_property holding a DataFrame, a compiled model, or a large response body on an instance that lives in a registry, a cache, or an in-memory session store keeps that memory alive as long as the instance is reachable. This is a common slow-RSS-growth shape: the objects are all individually reasonable and none of them are garbage.
+
+**And it is not a lazy connection.** Since 3.12 there is no lock, so two threads racing on first access can both run the factory. For a pure computation that is wasted work; for `self._conn = connect()` it is two connections where you accounted for one. Lazy singletons need an explicit lock or `functools.lru_cache` on a module-level function.
+
+The rule: `cached_property` for pure, cheap-to-hold, instance-lifetime-scoped derivations. For anything shared, use an explicit cache with a bound and a TTL, so eviction and staleness are decisions rather than accidents.
 
 ### What is a descriptor, and what problem does it solve that a property does not?
 A descriptor is any object whose type defines `__get__`, `__set__`, or `__delete__`, placed as a **class attribute**; the attribute-lookup machinery then routes access through it. `property` is a descriptor, but a property is bound to one attribute on one class — a descriptor class is **reusable across many attributes and many classes**, which is exactly the difference. When you find yourself writing the same validating getter/setter pair for `price`, `quantity`, and `weight`, that is the signal.
@@ -3547,7 +3550,7 @@ async def fetch_profile(user_id: str, cache: Cache) -> dict: ...
 My default: **Protocol for interfaces my code consumes** (repositories, caches, clients, notifiers) — best testability, zero coupling, no metaclass conflicts, no MRO. **ABC when I need shared concrete behavior**, when I want runtime enforcement that a plugin author cannot forget a method, or when the hierarchy is a genuine closed family I own. They compose: a Protocol for the boundary, an ABC as a convenience base for implementers. Note Protocols do have runtime cost characteristics worth knowing — a class can explicitly inherit from a Protocol to get `__init_subclass__`-style checking and to make the intent obvious, and that is often the pragmatic middle ground.
 
 ### What are the limits of `@runtime_checkable` Protocols?
-`@runtime_checkable` only enables `isinstance`, and the check is **shallow: it verifies attribute/method presence by name only**. It does not check signatures, parameter counts, or types, so a class with `def get(self)` taking no arguments passes an `isinstance(x, Cache)` check and then fails at call time. For non-method members, `isinstance` against a runtime-checkable Protocol with **data attributes** raises `TypeError` on older versions and, since 3.12, works but only via `hasattr` — which means a property that raises still "passes" or fails unpredictably.
+`@runtime_checkable` only enables `isinstance`, and the check is **shallow: it verifies attribute/method presence by name only**. It does not check signatures, parameter counts, or types, so a class with `def get(self)` taking no arguments passes an `isinstance(x, Cache)` check and then fails at call time. Data attributes are fine for `isinstance` (it just does a `hasattr`), but `issubclass` against a Protocol with any non-method member raises `TypeError: Protocols with non-method members don't support issubclass()` — and because the `isinstance` check is a `hasattr`, a property whose getter raises makes the check fail rather than report membership.
 
 `issubclass` against a runtime-checkable Protocol is only allowed for **method-only** Protocols; if the Protocol declares any non-callable member you get `TypeError: Protocols with non-method members don't support issubclass()`. Performance also matters: pre-3.12 `isinstance` on Protocols was notoriously slow (a `hasattr` loop with no caching) and showed up in profiles of hot request paths; 3.12 made it substantially faster but it is still an order of magnitude more expensive than a concrete `isinstance`. Practical stance: use Protocols for **static** checking, and reach for `runtime_checkable` only in plugin-loading or adapter code where a clear error message at boot is worth it — not in request-path branching.
 
@@ -3581,7 +3584,7 @@ The decorator reads `__annotations__` from the class body, builds a list of `Fie
 Two things a dataclass does **not** do: it does not validate anything at runtime (annotations are inert — `x: int` accepts `"nope"`), and it does not deep-copy defaults. If you need runtime validation of external input, that is Pydantic's job; dataclasses are for internal, already-trusted data.
 
 ### How do you give a dataclass field a mutable default, and why is the obvious way an error?
-`field(default_factory=...)`. Writing `tags: list[str] = []` raises `ValueError: mutable default <class 'list'> for field tags is not allowed` at class-creation time, because the default would be a single shared object across all instances — dataclasses turned the classic bug into a hard error by rejecting any default whose type is unhashable (pre-3.11) or that is a `list`/`dict`/`set` (3.11+ checks `__hash__ is None`).
+`field(default_factory=...)`. Writing `tags: list[str] = []` raises `ValueError: mutable default <class 'list'> for field tags is not allowed` at class-creation time, because the default would be a single shared object across all instances — dataclasses turned the classic bug into a hard error by rejecting a hardcoded `list`/`dict`/`set` default (pre-3.11), broadened in 3.11+ to any default whose type has `__hash__ is None`.
 
 ```python
 from dataclasses import dataclass, field
@@ -4183,10 +4186,12 @@ with open("dump.bin", "rb") as f:
     for block in iter(lambda: f.read(65536), b""):
         digest.update(block)
 
-# Drain a queue without blocking forever.
+# Drain a queue without blocking forever. get_nowait() RAISES on empty rather than
+# returning a sentinel, so two-arg iter() needs the exception caught, not a sentinel.
 from queue import Queue, Empty
-for item in iter(lambda: q.get_nowait(), None):
-    handle(item)
+with contextlib.suppress(Empty):
+    while True:
+        handle(q.get_nowait())
 
 # Consume a DB-API cursor in batches.
 for rows in iter(lambda: cur.fetchmany(1000), []):
@@ -4347,11 +4352,13 @@ list(take_pairs([1, 2, 3]))
 The fix is to make termination explicit — `next(it, sentinel)` with a default, or catch and `return`:
 
 ```python
+_END = object()                     # a private sentinel, NOT None: None may be a real element
+
 def take_pairs(src):
     it = iter(src)
-    while (a := next(it, None)) is not None:
-        b = next(it, None)
-        if b is None:
+    while (a := next(it, _END)) is not _END:
+        b = next(it, _END)
+        if b is _END:
             return                  # clean end; odd trailing element dropped
         yield a, b
 ```
@@ -4401,7 +4408,7 @@ def running_average():
         try:
             x = yield avg                # value goes out, next value comes in
         except ValueError:               # consumer signalling "reset"
-            total = count = 0
+            total = count = avg = 0          # reset avg too, or throw() hands back the stale one
             continue
         total += x
         count += 1
@@ -4411,7 +4418,7 @@ a = running_average()
 next(a)              # prime: advance to the first yield — required
 a.send(10)           # 10.0
 a.send(20)           # 15.0
-a.throw(ValueError)  # resets window, returns None
+a.throw(ValueError)  # resets window, returns 0
 a.close()
 ```
 
@@ -4603,7 +4610,7 @@ Ranked by how often they show up in real services:
 - **`product`, `permutations`, `combinations`** — test matrices, feature-flag grids, pairwise comparison.
 - **`tee`** — the one with a memory trap; usually the wrong answer.
 
-All of them are C-implemented, lazy, and constant-memory except `tee`, `groupby`'s buffering of a group you materialize, `product` (which materializes its inputs), and the combinatorics ones (which buffer the input pool).
+All of them are C-implemented, lazy, and constant-memory except `tee`, `cycle` (which saves every element it has yielded), `groupby`'s buffering of a group you materialize, `product` (which materializes its inputs), and the combinatorics ones (which buffer the input pool).
 
 ### What is the memory trap with `itertools.tee`?
 
@@ -4637,7 +4644,7 @@ The **subtler trap**: the group iterator is a *view* into the shared source and 
 ```python
 groups = list(groupby(rows, key=lambda r: r[0]))
 [(k, list(g)) for k, g in groups]
-# [('a', []), ('b', [])]  ← every group is empty
+# [('a', []), ('b', []), ('a', [])]  ← every group is empty (3 runs: rows are unsorted)
 ```
 
 You must consume each group inside the loop: `for k, g in groupby(...): items = list(g)`.
@@ -4770,7 +4777,7 @@ Why `it = iter(it)` is not optional: if you pass a `list`, `islice(list, size)` 
 
 Why `while batch := ...` and not a `for` with a `break`: the walrus makes the empty-batch termination explicit, and `list()` forces the `islice` so we can test emptiness — a bare `islice` object is always truthy.
 
-On 3.12+ prefer `itertools.batched` (C-implemented, ~2x faster, yields tuples). Where chunking matters in practice: **bulk DB inserts** (batch of 500–1000 rows is the sweet spot for Postgres before parameter limits and statement size bite — libpq caps at 65535 bound parameters, so 1000 rows × 20 columns already exceeds it), **SQS/Kafka producer batching** (SQS `SendMessageBatch` caps at 10 messages / 256 KB), and **API fan-out** where you want bounded concurrency per wave.
+On 3.12+ prefer `itertools.batched` (C-implemented, ~2x faster, yields tuples). Where chunking matters in practice: **bulk DB inserts** (batch of 500–1000 rows is the sweet spot for Postgres before parameter limits and statement size bite — libpq caps at 65535 bound parameters, so 1000 rows × 20 columns uses 20,000 of them and ~3,200 rows is the hard ceiling at that width), **SQS/Kafka producer batching** (SQS `SendMessageBatch` caps at 10 messages / 256 KB), and **API fan-out** where you want bounded concurrency per wave.
 
 ### Which `itertools` recipes are worth memorizing?
 
@@ -5337,7 +5344,7 @@ Second, **`finally` runs after the return expression is evaluated but before the
 
 Bare `except:` is `except BaseException:` — it catches `KeyboardInterrupt`, `SystemExit`, and `asyncio.CancelledError`. In a service that means Ctrl-C stops working, `sys.exit()` in a worker becomes a no-op, and a cancelled asyncio task keeps running past its deadline. Use `except Exception:` when you genuinely want a catch-all (top-level request handler, worker task loop), and always re-raise or log with a traceback.
 
-Ordering matters because dispatch is first-match, not most-specific-match. `except OSError:` before `except FileNotFoundError:` makes the second clause dead code — and neither mypy nor the interpreter warns you; only Ruff's `B014`/`flake8-bugbear` and some linters catch the subclass-shadowing case. Order **specific to general**, and put the catch-all last:
+Ordering matters because dispatch is first-match, not most-specific-match. `except OSError:` before `except FileNotFoundError:` makes the second clause dead code — and neither mypy nor the interpreter warns you; pylint's `bad-except-order` (E0701) catches the subclass-shadowing case; Ruff's `B014` only flags redundancy *within one* handler tuple like `except (OSError, FileNotFoundError):`. Order **specific to general**, and put the catch-all last:
 
 ```python
 try:
@@ -5499,7 +5506,7 @@ except* InsufficientFunds as eg:
     raise DomainRejected(eg.exceptions[0].args[0]) from eg
 ```
 
-Hard rules to state in an interview: you cannot mix `except` and `except*` in the same `try`; you cannot use `except*` with a bare exception-less form; and `ExceptionGroup` may only wrap `Exception` instances — wrap a `BaseException` (like `CancelledError`) and the constructor returns a `BaseExceptionGroup` instead. Programmatically, `eg.subgroup(pred)` and `eg.split(pred)` give you the same partitioning without the syntax, which is what you use inside a library that must stay 3.9-compatible via the `exceptiongroup` backport.
+Hard rules to state in an interview: you cannot mix `except` and `except*` in the same `try`; you cannot use `except*` with a bare exception-less form; and `ExceptionGroup` may only wrap `Exception` instances — pass it a `BaseException` (like `CancelledError`) and the constructor raises `TypeError: Cannot nest BaseExceptions in an ExceptionGroup`. The narrowing runs the other way: `BaseExceptionGroup` returns an `ExceptionGroup` when every leaf happens to be an `Exception`. Programmatically, `eg.subgroup(pred)` and `eg.split(pred)` give you the same partitioning without the syntax, which is what you use inside a library that must stay 3.9-compatible via the `exceptiongroup` backport.
 
 ### Where do exception groups show up in asyncio, and what changes about error handling with `TaskGroup`?
 
@@ -5628,17 +5635,19 @@ async def create_payment(session: AsyncSession, key: str, req: PaymentIn) -> Pay
             .on_conflict_do_nothing(index_elements=["key"])
             .returning(IdempotencyKey.id))
     if (await session.execute(stmt)).scalar_one_or_none() is None:
-        existing = await session.get(IdempotencyKey, key)      # replay
+        existing = (await session.execute(                     # replay: `key` is a unique
+            select(IdempotencyKey).where(IdempotencyKey.key == key)   # index, not the PK, so
+        )).scalar_one()                                        # session.get() won't find it
         if existing.request_hash != hash_body(req):
             raise Conflict("idempotency key reused with a different body")
         if existing.status == "in_progress":
-            raise RetryLater("original request still running")  # 409/425, do NOT double-charge
+            raise RetryLater("original request still running")  # 409, do NOT double-charge
         return PaymentOut.model_validate_json(existing.response_body)
     payment = await charge(session, req)                        # same transaction
     ...
 ```
 
-Three details interviewers probe. **Store the response, not just the key** — a replay must return the *same* body and status, not a 409. **Hash the request body** so a client reusing a key for a different payload gets a hard error instead of a silently wrong replay. And **handle the in-flight case**: two concurrent retries hitting different pods must not both charge; the unique index makes the second one lose, and it should get a 409/425 rather than waiting on a row lock indefinitely. Keys expire (24h is typical) via a partial index + cleanup job.
+Three details interviewers probe. **Store the response, not just the key** — a replay must return the *same* body and status, not a 409. **Hash the request body** so a client reusing a key for a different payload gets a hard error instead of a silently wrong replay. And **handle the in-flight case**: two concurrent retries hitting different pods must not both charge; the unique index makes the second one lose, and it should get a 409 rather than waiting on a row lock indefinitely. Keys expire (24h is typical) via a partial index + cleanup job.
 
 Cross-service, the same idea is a **transactional outbox**: write the domain row and the "event to publish" row in one transaction, and let a relay publish at-least-once — consumers dedupe on event id. Any design where you commit a DB transaction and *then* publish has a failure window that no retry can fix.
 
@@ -5716,7 +5725,7 @@ Use `traceback.TracebackException.from_exception(exc)` — it eagerly converts f
 ```python
 import traceback
 te = traceback.TracebackException.from_exception(exc)
-payload = {"type": te.exc_type_str, "message": str(te),
+payload = {"type": te.exc_type.__qualname__,   # 3.13+ has te.exc_type_str "message": str(te),
            "frames": [{"file": f.filename, "line": f.lineno, "fn": f.name}
                       for f in te.stack][-20:]}   # cap depth: recursion errors are 1000 frames
 ```
@@ -6056,7 +6065,9 @@ from contextlib import asynccontextmanager, AsyncExitStack
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with AsyncExitStack() as stack:
-        app.state.db = await stack.enter_async_context(engine.begin())
+        app.state.engine = engine        # NOT engine.begin(): that would pin one pooled
+                                         # connection in an open transaction for the whole
+                                         # process lifetime ('idle in transaction')
         app.state.redis = await stack.enter_async_context(redis.from_url(URL))
         app.state.http = await stack.enter_async_context(httpx.AsyncClient(timeout=5.0))
         stack.push_async_callback(flush_metrics)     # awaited on shutdown, LIFO
@@ -6134,7 +6145,7 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 async def create_order(body: OrderIn, session: SessionDep) -> OrderOut: ...
 ```
 
-Behaviour details worth knowing. FastAPI runs dependency exit code **after the response is generated** (since 0.106 it happens before the response is *sent* for non-streaming responses, and exceptions raised there can no longer alter the response) — practically, this means you must not rely on a `yield` dependency's resource inside a `BackgroundTask`; the session will be closed. Starlette runs the whole thing inside an `AsyncExitStack` per request, which is why dependencies unwind LIFO.
+Behaviour details worth knowing. FastAPI runs dependency exit code **after the response is generated**. The exact point moved twice: 0.106 pulled teardown to before the response was sent, and 0.118 moved it back to after the response (and after background tasks) — so on current FastAPI a `BackgroundTask` *can* still see a `yield` dependency's resource. Pin the behaviour you rely on, because a version bump silently changes it, and either way exceptions raised in teardown cannot alter a response that has already been generated. Starlette runs the whole thing inside an `AsyncExitStack` per request, which is why dependencies unwind LIFO.
 
 The three real leak sources in production: **(1)** creating a session manually inside an endpoint and returning early on a validation error; **(2)** starting a background `asyncio.create_task` that captures the request-scoped session — the request finishes, the session closes, and the task explodes or holds a dead connection; **(3)** a long-running `await httpx.get(...)` *inside* the `async with session.begin()` block, which holds a pooled connection open for the duration of a network call. That last one is not a leak but it is how a 10-connection pool serves 3 requests per second.
 
@@ -6142,7 +6153,7 @@ The three real leak sources in production: **(1)** creating a session manually i
 
 That message means all 15 checked-out connections are busy for 30 seconds straight. Four causes, in the order I'd check them:
 
-1. **Leaked sessions** — code that checks out a connection and never returns it. Confirm with `engine.pool.status()` (`Pool size: 5 Connections in pool: 0 Current Overflow: 10 Current Checked out: 15`) and, decisively, `create_engine(..., echo_pool="debug")` or `SQLALCHEMY_WARN_20`-style logging plus `pool_events`. The definitive tool is `AsyncAdaptedQueuePool` with `echo_pool` plus setting `pool_use_lifo` off and grabbing a `py-spy dump --pid <pid>` to see where the threads/tasks are parked.
+1. **Leaked sessions** — code that checks out a connection and never returns it. Confirm with `engine.pool.status()` (`Pool size: 5 Connections in pool: 0 Current Overflow: 10 Current Checked out: 15`) and, decisively, `create_engine(..., echo_pool="debug")` plus `PoolEvents.checkout`/`checkin` listeners that log a stack for every checkout held beyond a threshold. The definitive tool is `AsyncAdaptedQueuePool` with `echo_pool` plus setting `pool_use_lifo` off and grabbing a `py-spy dump --pid <pid>` to see where the threads/tasks are parked.
 2. **Slow queries holding connections** — a missing index turning a 5ms query into 8s. Check `pg_stat_activity` for `state='active'` and long `query_start`, and your p99 DB latency metric. Fix with the index; the pool error is a symptom.
 3. **Blocking I/O inside a transaction** — HTTP calls, S3 uploads, or `time.sleep` between `begin()` and `commit()`. Connections are held for the whole external call. Restructure so the external call happens outside the transaction (and make the write idempotent).
 4. **Genuine undersizing** — pool math. Each pod gets `pool_size + max_overflow` connections; total across replicas must stay under Postgres `max_connections` (often 100 on managed instances, minus superuser reserve). With 20 pods, `pool_size=5, max_overflow=10` is 300 connections — you'll hit `too_many_connections` first. Put PgBouncer in transaction mode in front and shrink the app pools.
@@ -6840,10 +6851,11 @@ Options for a real number, in the order I reach for them:
 - **A quick RSS delta** — often the most honest measurement:
 
 ```python
-import os, resource
+import os
 def rss_mb() -> float:
-    # ru_maxrss is KB on Linux, bytes on macOS
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    # ru_maxrss is a PEAK (high-water mark) and never comes back down, so it cannot
+    # measure a delta -- read current RSS out of /proc instead.
+    return int(open("/proc/self/statm").read().split()[1]) * 4096 / 1024**2  # pages -> MiB
 
 before = rss_mb(); data = load_everything(); print(rss_mb() - before)
 ```
@@ -6886,7 +6898,7 @@ d = {k: v for k, v in d.items() if keep(k)}   # rebuild is the only reliable shr
 lst = lst[:n]                                  # slicing creates a right-sized new list
 ```
 
-**Sets do shrink** on deletion in some cases (they resize down when sparse), which is one of the few places set and dict behaviour diverge.
+**Sets do not shrink on deletion either** — `set_discard_entry` just writes a dummy and decrements `used`; the table only ever compacts on a later *insertion* that triggers `set_table_resize`, exactly like dicts.
 
 And even after you rebuild, the freed blocks go back to pymalloc's pools, not to the kernel — so RSS stays flat. If you need the memory back from a one-off bulk operation, do it in a **subprocess** and let `exit()` reclaim it.
 
@@ -6899,7 +6911,7 @@ Options in the order I'd try them:
 1. **Don't hold them.** Stream: a generator over a server-side cursor (`Session.execute(stmt).yield_per(1000)`, psycopg's named cursor, `pandas.read_sql(chunksize=)`). Constant memory. If your aggregation can be done in SQL, do it in SQL.
 2. **Columnar in-process** — `pyarrow.Table`, `polars.DataFrame`, or a DuckDB in-memory table. Contiguous typed buffers, dictionary-encoded strings, zero per-row Python objects, and you get vectorized filtering for free. This is my default for analytical work.
 3. **`array.array` / `numpy` structured dtypes** for homogeneous numeric data — `array('q')` is 8 bytes/element versus ~36 for a list slot plus int object.
-4. **`__slots__` or `NamedTuple` for objects you genuinely need** — `NamedTuple` is a tuple (56 bytes for 1 field, +8/field) with no per-instance dict, and it's the cheapest "record" that still supports attribute access.
+4. **`__slots__` or `NamedTuple` for objects you genuinely need** — `NamedTuple` is a tuple (40-byte base, +8/field, so 48 bytes for one field) with no per-instance dict, and it's the cheapest "record" that still supports attribute access.
 5. **`sys.intern` the repeated strings** (see above) — on categorical columns this alone can halve memory.
 6. **Spill to disk** — SQLite, `shelve`, `mmap`, or an on-disk Arrow/Parquet file with lazy scanning. Modern SSDs plus the OS page cache make this far less bad than people assume.
 
@@ -7067,7 +7079,7 @@ def heap_report(top: int = 15) -> dict:
     gc.collect()
     counts = Counter(type(o).__qualname__ for o in gc.get_objects())
     return {
-        "rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+        "rss_mb": int(open("/proc/self/statm").read().split()[1]) * 4096 / 1024**2,  # current, not peak
         "tracked_objects": len(gc.get_objects()),
         "gc_stats": gc.get_stats(),
         "top_types": counts.most_common(top),
@@ -7297,7 +7309,7 @@ The result is that a *single* CPU-bound thread can collapse the throughput of I/
 
 ### Is `counter += 1` thread-safe? Which operations are actually atomic?
 
-**No.** It compiles to `LOAD_FAST`/`LOAD_GLOBAL` → `BINARY_OP` → `STORE`, and the GIL can be released between any two bytecodes, so two threads can read the same value and both write back `n+1`. Empirically, 100 threads each incrementing a shared counter 100k times reliably loses tens of thousands of increments.
+**No.** It compiles to `LOAD_FAST`/`LOAD_GLOBAL` → `BINARY_OP` → `STORE`, and a thread switch between the load and the store lets two threads read the same value and both write back `n+1`. Be careful how you demonstrate this, though: since 3.10 the eval breaker is only checked at `RESUME`/`JUMP_BACKWARD`/`CALL`, so a *tight* `n += 1` loop contains no switch point between the load and the store and will usually print the correct total — a naive demo "passes" and proves nothing. Losses show up reliably once anything in the read-modify-write makes a call (an attribute lookup on a Python object, a `__hash__`, a method call). The operation is unsafe either way; its safety is an accident of where the interpreter happens to preempt.
 
 What *is* effectively atomic is anything that completes inside a single C-level call that doesn't re-enter Python:
 
@@ -7573,7 +7585,7 @@ The GIL is a single mutex protecting interpreter state; a thread must hold it to
 
 First, **pure-Python CPU work does not scale with threads**; adding threads to a CPU-bound loop typically makes it slightly *slower* because of switch overhead and cache thrash. Second, the GIL makes individual bytecodes indivisible but **not sequences of bytecodes**, which is why `+=`, check-then-act, and read-modify-write on shared state still need locks. Third, there is a **convoy/latency effect**: one CPU-bound thread holding the GIL for a full 5 ms slice adds up to 5 ms of tail latency to every I/O thread that wakes up needing the GIL. In a Flask/Gunicorn-threads service, one slow `json` serialization of a 20 MB payload will show up as a p99 spike on completely unrelated endpoints.
 
-Mitigations in order of preference: move CPU work out of process; use GIL-releasing C libraries; lower `sys.setswitchinterval(0.001)` to trade throughput for latency fairness; run more single-threaded worker processes instead of fewer multi-threaded ones. Python 3.13's **free-threaded build** (PEP 703, `python3.13t`; officially supported in 3.14) removes the GIL entirely but is not the default and costs roughly 5–20% single-threaded performance, so it is not yet a production answer for most shops.
+Mitigations in order of preference: move CPU work out of process; use GIL-releasing C libraries; lower `sys.setswitchinterval(0.001)` to trade throughput for latency fairness; run more single-threaded worker processes instead of fewer multi-threaded ones. The **free-threaded build** (PEP 703, `python3.13t`; officially supported in 3.14) removes the GIL entirely but is not the default and carries a single-threaded cost — ~35-40% in 3.13's early builds, down to roughly 5-10% in 3.14 — so it is only now becoming a production answer.
 
 ### Walk me through the lifecycle of a `threading.Thread`. What does `daemon=True` really do?
 A `Thread` object is inert until `start()`, which creates the OS thread and invokes `run()` (which calls `target(*args, **kwargs)`). `start()` may be called exactly once — a second call raises `RuntimeError`. `is_alive()` is true from just before `run()` begins until just after it returns. `join(timeout=None)` blocks the caller until the thread terminates; **`join` never tells you whether it succeeded — you must check `is_alive()` after a timed join**, because `join(5)` returns silently on timeout.
@@ -7607,7 +7619,9 @@ def bump():
 
 ts = [threading.Thread(target=bump) for _ in range(4)]
 [t.start() for t in ts]; [t.join() for t in ts]
-print(counter)            # 800000 expected; typically 300k-600k observed
+print(counter)            # 800000 expected; a tight loop like this usually prints 800000
+                          # anyway (no eval-breaker check between load and store since 3.10)
+                          # -- it is still a race, just one you cannot reliably reproduce here
 ```
 
 The interleaving that loses an update: thread A executes `LOAD_GLOBAL` (reads 41), the interpreter's eval-loop check fires at the switch interval, A drops the GIL, B runs a full read-modify-write and stores 42, A resumes, computes 41+1, and `STORE_GLOBAL` writes 42 over B's 42. One increment vanished. Nothing about the GIL prevents this — the GIL guarantees only that **a single bytecode does not interleave**, not that a source-level statement is atomic.
@@ -7622,18 +7636,18 @@ with lock:            # ~50-100 ns uncontended; the correct default
 
 Two follow-ups interviewers like: this is *not* a memory-visibility problem the way it would be in Java (the GIL provides the barrier), it is purely a **lost-update** problem; and the bug's probability scales with the switch interval, so `sys.setswitchinterval(1e-6)` in a test makes it reproduce almost every run.
 
-### Which operations are actually atomic in CPython, and should you rely on that?
-Operations implemented as a single C-level call that never releases the GIL and never invokes arbitrary Python code are effectively atomic: `list.append(x)`, `list.pop()`, `d[k] = v` and `del d[k]` for built-in key types, `d.setdefault(k, v)`, `d.popitem()`, `set.add`, `x = L[i]`, and `L1.extend(L2)` when `L2` is a list. `next(itertools.count())` is atomic too, which makes it the canonical **lock-free thread-safe ID generator**:
+### Where does relying on CPython's atomic operations actually go wrong in a real service?
+The catalogue of which operations are atomic is covered above; the interesting question is why teams that know that list still ship races.
 
-```python
-from itertools import count
-_next_id = count(1).__next__     # bound method; each call is one C-level increment
-request_id = _next_id()          # no lock needed in CPython
-```
+**The operation grows a second step in review.** `counts[k] = compute(v)` is atomic. Six months later someone needs "only if absent" and it becomes `if k not in counts: counts[k] = compute(v)` — two operations, no lock, no reviewer comment, because the diff looks like a guard rather than a concurrency change. This is the single most common path from correct to broken, and it is why I want the lock present from the start on anything that will grow conditions.
 
-What is *not* atomic: anything that is a read then a write (`d[k] += 1`, `L[i] = L[i] + 1`), anything that is a check then an act (`if k not in d: d[k] = ...`), `d.get(k) or compute()`, and any operation whose keys or values have Python-level `__hash__`/`__eq__`/`__del__`, because those can re-enter the interpreter and drop the GIL mid-operation. `queue.Queue.qsize()` is atomic but its answer is stale the instant you look at it, so `if q.qsize() < N: q.put(...)` is a race.
+**The key or value is not a builtin.** `d[k] = v` is atomic for `str`/`int` keys. Make the key a dataclass with `__eq__`/`__hash__`, or the *value* an object with a `__del__`, and the operation now re-enters the interpreter mid-way and can be preempted. Nothing about the call site changed; the atomicity silently evaporated when someone changed a type two modules away.
 
-Should you rely on it? For internal, performance-sensitive code, yes — these guarantees hold in the free-threaded build too, where CPython uses per-object critical sections to preserve them. But they are **CPython implementation details, not language guarantees** (PyPy makes weaker promises), and they collapse the moment the operation grows a second step. My rule in review: lock-free is acceptable only for `list.append`, `deque.append/popleft`, and `itertools.count`; everything else gets a `Lock` or a `queue.Queue`.
+**It is atomic but still wrong.** `queue.qsize()`, `len(d)`, and `dict.keys()` snapshots are each individually atomic and each stale by the time you branch on them. Atomicity buys you "no torn state", never "no race" — `if q.qsize() < N: q.put(x)` is a bug written by someone who checked the atomic list and stopped there.
+
+**It does not survive the port.** These are CPython implementation details, not language guarantees: PyPy promises less, and code that leaned on them is exactly the code that breaks when someone tries an alternative runtime or, historically, a subinterpreter.
+
+My rule in review: lock-free is acceptable for `list.append`, `deque.append`/`popleft`, and `itertools.count`, on builtin types, where the operation is genuinely one step and will stay that way. Everything else gets a `Lock` or a `queue.Queue` — the throughput difference is unmeasurable in a service that also talks to a database, and the failure mode of getting it wrong is a corruption bug you will debug for a week.
 
 ### `Lock` vs `RLock` — when do you need the reentrant one, and what does it cost?
 `threading.Lock` is a **non-owned binary semaphore**: any thread may `release()` it, and a thread that calls `acquire()` twice deadlocks against itself. `RLock` is **owned and counted**: it records the owning thread ident and a recursion depth, so the owner can re-acquire freely and must release the same number of times; a non-owner calling `release()` raises `RuntimeError`.
@@ -7753,7 +7767,7 @@ For cross-process or cross-host work, none of these are the answer — `queue.Qu
 Bound the queue, use a fixed worker pool, and signal termination explicitly rather than relying on daemon threads:
 
 ```python
-import queue, threading, contextlib
+import logging, queue, threading
 
 _SENTINEL = object()
 
@@ -7763,6 +7777,10 @@ class Pipeline:
         self.stopping = threading.Event()
         self.workers = [threading.Thread(target=self._run, name=f"w{i}", daemon=False)
                         for i in range(n_workers)]
+
+    def start(self) -> None:
+        for t in self.workers:
+            t.start()          # nothing consumes the queue until this runs
 
     def _run(self) -> None:
         while True:
@@ -8080,7 +8098,7 @@ In the free-threaded build (`python3.13t`, experimental in 3.13, officially supp
 
 What does **not** change: every race condition you already had. In fact they get worse, because the GIL was accidentally serializing your unsynchronized code at a 5 ms granularity, and now the interleaving window is a single instruction. `counter += 1` was already broken; under free-threading it is broken far more often. Check-then-act, lazy singletons, and unsynchronized cache dicts that "never failed in five years" will start failing.
 
-What CPython does preserve: built-in container operations remain individually atomic, implemented with **per-object critical sections** and biased reference counting rather than the GIL, so `list.append` is still safe. There is a single-threaded performance cost — roughly 5–20% depending on workload, narrowing with each release — and **every C extension must be rebuilt** and declare `Py_GIL_DISABLED` support, otherwise importing it re-enables the GIL at runtime, silently erasing your parallelism.
+What CPython does preserve: built-in container operations remain individually atomic, implemented with **per-object critical sections** and biased reference counting rather than the GIL, so `list.append` is still safe. There is a single-threaded performance cost — ~35-40% in 3.13's early builds, roughly 5-10% by 3.14 — and **every C extension must be rebuilt** and declare `Py_mod_gil = Py_MOD_GIL_NOT_USED` in its module slots, otherwise importing it re-enables the GIL at runtime, silently erasing your parallelism. (`Py_GIL_DISABLED` is the *build* macro extensions test with `#ifdef`, not the declaration.)
 
 Practical advice if asked "would you deploy it?": not yet for a general backend; the wins are largest for CPU-heavy in-process work that currently pays multiprocessing's IPC tax. What I *would* do now is write thread-correct code (real locks, no reliance on GIL-granularity serialization) so the migration is a build-flag change rather than a debugging campaign.
 
@@ -8255,7 +8273,7 @@ if failed:
     log.warning("partial_fetch_failure", extra={"count": len(failed)})
 ```
 
-Second trap: `return_exceptions=True` also swallows `asyncio.CancelledError` into the results list (in 3.8+ `CancelledError` derives from `BaseException`, and `gather` still captures it here), so an outer timeout cancelling your gather can look like "all done, some results are CancelledError" instead of propagating. If you rely on cancellation for shutdown, prefer `TaskGroup` or re-raise on seeing `CancelledError` in the results.
+Second trap: `return_exceptions=True` captures `asyncio.CancelledError` into the results list like any other exception. An *outer* timeout is fine — cancelling the task awaiting the gather propagates normally, because `_GatheringFuture` re-raises rather than returning. The silent case is a child cancelled from **outside** the gather (someone holding a reference to that task calls `.cancel()`): you get `CancelledError('')` sitting in the results and the gather reports success. If you rely on cancellation for shutdown, prefer `TaskGroup`, or check the results for `CancelledError` explicitly.
 
 ### What is structured concurrency, and what does TaskGroup guarantee that gather does not?
 Structured concurrency means **task lifetimes are nested like scopes**: a task cannot outlive the block that created it, exactly like a local variable cannot outlive its function. `TaskGroup` (3.11+, modeled on Trio's nursery and available on older versions via `anyio.create_task_group`) enforces this at the language level with `async with`.
@@ -8606,7 +8624,7 @@ class TokenBucket:
             await asyncio.sleep(wait)        # sleep OUTSIDE the lock
 ```
 
-Details that matter: **`time.monotonic()`, never `time.time()`** — an NTP step backwards would let through an unbounded burst. **Sleep outside the lock**, or you serialize every waiter behind the sleeper. The lock is genuinely needed here because the token computation spans an `await` in the surrounding loop. `burst` lets short spikes through, which is usually what the upstream API's own limiter allows. This limiter is **per-process**; with 10 replicas you have 10x the rate, so a shared limit needs Redis (a Lua-scripted token bucket) — a point interviewers love to push on.
+Details that matter: **`time.monotonic()`, never `time.time()`** — an NTP step backwards would let through an unbounded burst. **Sleep outside the lock**, or you serialize every waiter behind the sleeper. Note the lock is not protecting against interleaving *inside* the critical section — that block has no `await`, so the event loop cannot preempt it. It is there so that the check-then-sleep-then-retry cycle across iterations cannot let two waiters both observe the same token. `burst` lets short spikes through, which is usually what the upstream API's own limiter allows. This limiter is **per-process**; with 10 replicas you have 10x the rate, so a shared limit needs Redis (a Lua-scripted token bucket) — a point interviewers love to push on.
 
 ### How do async database drivers work, and how do you size the pool?
 `asyncpg` speaks the PostgreSQL **binary wire protocol** directly in Cython with no libpq, prepares and caches statements aggressively, and is typically 2-5x faster than psycopg2 on simple selects. SQLAlchemy 2.0's async support layers on top via `create_async_engine("postgresql+asyncpg://...")`.
@@ -8875,7 +8893,8 @@ TNum = TypeVar("TNum", int, float, Decimal)      # constrained: no mixing
 def clamp(v: TNum, lo: TNum, hi: TNum) -> TNum:  # all three must be the same type
     return max(lo, min(v, hi))
 
-clamp(1, 0, 2.5)   # error: cannot satisfy TNum with both int and float
+clamp(1, 0, 2.5)          # OK: int is promoted to float by the numeric tower -> TNum = float
+clamp(1, 0.0, Decimal(2)) # error: no single constraint satisfies int, float AND Decimal
 ```
 The classic trap: people write `bound=` when they mean constrained, then are surprised that `clamp(1, 0.0, Decimal(2))` type-checks against the common supertype.
 
@@ -9034,7 +9053,7 @@ def fetch(url: str, *, stream: Literal[True]) -> Iterator[bytes]: ...
 def fetch(url: str, *, stream: Literal[False] = False) -> bytes: ...
 def fetch(url: str, *, stream: bool = False) -> Iterator[bytes] | bytes: ...
 ```
-Rules and traps: overload stubs have **no body** (`...`), the implementation is **not** decorated and is never matched against calls, and **order matters** — checkers pick the *first* matching overload, so put the more specific one first (a `Literal[True]` overload after a `bool` one is dead). At runtime only the final definition exists; calling an overload stub raises `NotImplementedError`. If overloads overlap with incompatible returns, mypy warns (`overloaded-signature`), and it's usually a sign you should split into two functions with different names — which I prefer whenever the branches don't share meaningful implementation.
+Rules and traps: overload stubs have **no body** (`...`), the implementation is **not** decorated and is never matched against calls, and **order matters** — checkers pick the *first* matching overload, so put the more specific one first (a `Literal[True]` overload after a `bool` one is dead). At runtime only the final definition exists; calling an overload stub raises `NotImplementedError`. If overloads overlap with incompatible returns, mypy warns (`overload-overlap`), and it's usually a sign you should split into two functions with different names — which I prefer whenever the branches don't share meaningful implementation.
 
 ### What are `TypeGuard` and `TypeIs`, and why was `TypeIs` added?
 Both let a user-defined boolean function participate in narrowing. **`TypeGuard[T]` (PEP 647)** narrows the argument to `T` in the `if` branch **only** — the `else` branch is not narrowed, and `T` need not be a subtype of the input. **`TypeIs[T]` (PEP 742, 3.13)** narrows **both branches** and requires `T` to be consistent with the declared parameter type, which is what people intuitively expect:
@@ -9141,7 +9160,9 @@ show_error_codes = true
 
 [[tool.mypy.overrides]]          # strict islands: new + refactored packages
 module = ["app.api.*", "app.domain.*"]
-strict = true
+disallow_untyped_defs = true     # list the flags individually -- `strict` is NOT
+disallow_untyped_calls = true    # per-module, it applies repo-wide from anywhere
+warn_return_any = true
 
 [[tool.mypy.overrides]]          # third-party without stubs
 module = ["legacy_vendor.*"]
@@ -9242,7 +9263,7 @@ A rapid-fire list, each of which I've seen cost real time:
 - **`isinstance` with a `runtime_checkable` Protocol** checks attribute *presence only*; it can't see signatures, and before 3.12 each call did a slow `dir()` walk.
 - **Mutable default arguments** are a runtime bug the type system does not catch: `def f(xs: list[int] = [])` type-checks perfectly and is still wrong.
 - **`tuple[int]` means a 1-tuple**; the variadic form is `tuple[int, ...]`.
-- **`Callable[[int], None]` accepts a function returning anything** — `None` return position is special-cased so any return type is compatible. Deliberate, and surprising.
+- **`Callable[[int], None]` does *not* accept a function returning anything** — return types are ordinarily covariant, so passing a `Callable[[int], int]` is an `arg-type` error. The annotation that accepts any return value is `Callable[[int], object]`; reach for it when you genuinely want to ignore what a callback returns.
 - **`type[T]` vs `T`**: `def build(cls: type[User]) -> User` — annotating the parameter `User` means you're passing an *instance*.
 - **A `TypeVar` used only once in a signature is a bug** — it degenerates to its bound/`object` and signals a misunderstanding.
 - **`@staticmethod`/`@classmethod` ordering with other decorators** breaks `ParamSpec`-typed decorators; apply the decorator inside.
@@ -9290,7 +9311,7 @@ Defence of each choice: **`Protocol` not ABC** so an in-memory fake repository i
 ---
 
 ### How does `__annotations__` work, and how should code read annotations at runtime?
-Annotations live in `__annotations__` on modules, classes, and functions — a plain dict of name to type (or to *string*, under PEP 563). Never read the attribute directly: on a class it **inherits from the base if the subclass declares none** (a genuine footgun that has bitten `dataclasses`-like libraries), and it may hold strings. Use **`typing.get_type_hints(obj)`**, which resolves strings against the right globals/locals and strips `Optional` metadata as needed, or `inspect.get_annotations(obj, eval_str=True)` (3.10+), which does not do the inheritance thing. Pass `include_extras=True` if you need the `Annotated` metadata — `get_type_hints` strips it by default, which is a frequent source of "my FastAPI-style library loses the `Field(...)`" bugs.
+Annotations live in `__annotations__` on modules, classes, and functions — a plain dict of name to type (or to *string*, under PEP 563). Never read the attribute directly: on a class it **inherits from the base if the subclass declares none** (a genuine footgun that has bitten `dataclasses`-like libraries), and it may hold strings. Use **`typing.get_type_hints(obj)`**, which resolves strings against the right globals/locals, or `inspect.get_annotations(obj, eval_str=True)` (3.10+), which does not do the inheritance thing. Pass `include_extras=True` if you need the `Annotated` metadata — `get_type_hints` strips it by default, which is a frequent source of "my FastAPI-style library loses the `Field(...)`" bugs.
 
 In 3.14, `annotationlib.get_annotations(obj, format=Format.FORWARDREF)` is the forward-compatible API: it returns real objects where resolvable and `ForwardRef` placeholders elsewhere, so a library can introspect a class whose annotations reference names not yet defined. If you write a framework that reads annotations, resolve once at class-definition time and cache — `get_type_hints` is not cheap (hundreds of microseconds for a model with many fields) and should never run per request.
 
@@ -9307,7 +9328,7 @@ class Job:
 results: dict[str, list[int]] = {}     # without the annotation, inferred dict[str, list[int]]? No — dict[Any, Any]
 handler: Callable[[int], None] = lambda n: None
 ```
-The empty-container case is the everyday one: `results = {}` gives mypy nothing to work with and it will demand an annotation under `--disallow-any-generics`.
+The empty-container case is the everyday one: `results = {}` gives mypy nothing to work with, and it errors with `Need type annotation for "results" [var-annotated]` — on by default, no flags required.
 
 ### Compare `Protocol` and ABCs for dependency inversion in a service layer. Show the shape you'd ship.
 Both express "this layer depends on an interface, not an implementation". The difference is **who owns the interface and whether the implementation must know about it**. With an ABC, the adapter must import and subclass your abstraction — fine for code you own, impossible for a third-party client. With a Protocol, the abstraction lives next to the *consumer*, and any object with the right shape qualifies, including SDK objects and hand-rolled fakes.
@@ -9354,7 +9375,7 @@ cfg = cast(dict[str, str], raw)            # runtime no-op; you own the correctn
 ```
 **`reveal_type(x)`** is a checker-only pseudo-function (no import; mypy and pyright special-case it) that prints the inferred type during checking and errors at runtime if left in — which is a feature, since CI catches leftovers. `reveal_locals()` does the same for the whole scope in mypy. Pair `assert_type` with a `tests/typing/` directory checked by mypy in CI so signature changes to a published library are caught like any other breaking change.
 
-### Type this decorator that turns a sync function into a cached async one — what's tricky about it?
+### Type this decorator that turns a sync function into an async one — what's tricky about it?
 ```python
 from collections.abc import Callable, Coroutine
 from typing import Any, ParamSpec, TypeVar
@@ -9454,7 +9475,7 @@ def make(cls: type[T], **kw: Any) -> T:        # returns an INSTANCE of whatever
 def retry_on(exc: type[Exception], n: int = 3): ...   # takes the class, not an instance
 handlers: dict[type[Event], Callable[[Event], None]] = {}   # registry keyed by class
 ```
-Two subtleties worth naming. **`type[Abstract]` is accepted by mypy even though instantiating an abstract class fails at runtime** — mypy has a specific error (`type-abstract`) for passing an abstract class where `type[T]` is expected, and it trips people writing DI containers. And **`type[T]` is covariant** (a `type[Dog]` is a `type[Animal]`), unlike `list`, because class objects are immutable in the relevant sense. For "any class at all", `type[Any]` or bare `type` — but bare `type` is flagged under `--disallow-any-generics`.
+Two subtleties worth naming. **mypy rejects an abstract class where `type[T]` is expected**, with a specific error code (`type-abstract`: "Only concrete class can be given where `type[Base]` is expected"), because instantiating it would fail at runtime — this trips people writing DI containers that legitimately only ever store the class. And **`type[T]` is covariant** (a `type[Dog]` is a `type[Animal]`), unlike `list`, because class objects are immutable in the relevant sense. For "any class at all", `type[Any]` or bare `type` — but bare `type` is flagged under `--disallow-any-generics`.
 
 ### How do you type FastAPI dependencies and responses so the checker actually helps you?
 Put dependencies in `Annotated` aliases and let the return annotation drive the response model — then the endpoint is an ordinary, directly-callable, fully typed function:
@@ -10041,7 +10062,7 @@ Freshness comes from automation, not discipline: scheduled Renovate or Dependabo
 Lock-file merge conflicts are the recurring pain. Never hand-edit: take either side and re-run the lock command (`git checkout --theirs uv.lock && uv lock`). Adding `uv.lock -diff` to `.gitattributes` keeps them out of review diffs while still tracking them in git.
 
 ### How do you audit and shrink a bloated dependency tree?
-Start with facts: `uv pip tree` (or `pipdeptree`) shows who pulled in what, and `uv pip list --outdated` shows drift. Then ask three questions of each top-level dependency. Is it used at all? `deptry` and `ruff`'s `TID`/`F401` catch declared-but-unused and used-but-undeclared packages — the second is the dangerous one, because your code imports something only present transitively, and it disappears the day the intermediate dep drops it.
+Start with facts: `uv pip tree` (or `pipdeptree`) shows who pulled in what, and `uv pip list --outdated` shows drift. Then ask three questions of each top-level dependency. Is it used at all? `deptry` catches declared-but-unused and used-but-undeclared *packages* (ruff's `F401` only finds unused imports within a file and reads no dependency manifest) — the second is the dangerous one, because your code imports something only present transitively, and it disappears the day the intermediate dep drops it.
 
 Is it worth its transitive cost? A single `pandas` import for one CSV parse costs ~80 MB RSS and ~300 ms of startup that stdlib `csv` does for free. Is it maintained? Check last release date, open-issue trend, and bus factor — an unmaintained dependency in your runtime closure is a future CVE you cannot patch.
 
@@ -10105,7 +10126,7 @@ The other big trap is **`sys.path` and package identity**. Under the default `pr
 # pyproject.toml
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers --strict-config -p no:randomly"
+addopts = "-q --strict-markers --strict-config"    # leave pytest-randomly ON; opt out per-run
 markers = ["slow: >1s", "integration: needs docker services"]
 filterwarnings = ["error", "ignore::DeprecationWarning:botocore.*"]
 ```
@@ -10116,7 +10137,7 @@ filterwarnings = ["error", "ignore::DeprecationWarning:botocore.*"]
 
 pytest **rewrites the AST of test modules at import time**, replacing `assert expr` with code that captures the subexpression values and builds a rich failure message. So `assert result == expected` on two dicts gives you a colorized structural diff pointing at the one key that differs — no need to remember `assertDictEqual` vs `assertCountEqual` vs `assertItemsEqual`. One operator, full introspection.
 
-The mechanism has consequences worth knowing. Rewriting only happens for **test modules and any module registered via `pytest.register_assert_rewrite("mylib.testing")`** — asserts in your helper/plugin packages get no introspection unless you register them *before* they're imported (put the call in `conftest.py` at the top). Rewritten `.pyc` files are cached, so a stale cache after a Python upgrade can produce weird behavior (`pytest --cache-clear` or delete `__pycache__`). And because rewriting is source-based, asserts inside `python -O` runs are stripped entirely — never run your suite with `-O`.
+The mechanism has consequences worth knowing. Rewriting only happens for **test modules and any module registered via `pytest.register_assert_rewrite("mylib.testing")`** — asserts in your helper/plugin packages get no introspection unless you register them *before* they're imported (put the call in `conftest.py` at the top). Rewritten `.pyc` files are cached, so a stale cache after a Python upgrade can produce weird behavior (delete `__pycache__` — note `--cache-clear` wipes `.pytest_cache`, which is a different thing entirely). And because rewriting is source-based, asserts inside `python -O` runs are stripped entirely — never run your suite with `-O`.
 
 Practical corollary: for domain-specific comparisons write a plain helper that itself asserts, and mark the frame with `__tracebackhide__ = True` so the failure points at the caller's line rather than inside your helper.
 
@@ -10269,10 +10290,11 @@ Indirect parametrization routes the parameter into a **fixture** rather than the
 
 ```python
 @pytest.fixture
-def api_client(request, app) -> TestClient:
+def api_client(request, app) -> Iterator[TestClient]:
     role = getattr(request, "param", "user")          # default when not parametrized
     app.dependency_overrides[get_current_user] = lambda: User(role=role)
-    return TestClient(app)
+    yield TestClient(app)                             # yield, not return, so that...
+    app.dependency_overrides.clear()                  # ...the override cannot leak to later tests
 
 @pytest.mark.parametrize("api_client,status", [("admin", 200), ("user", 403)],
                          indirect=["api_client"])      # only api_client is indirect
@@ -10321,10 +10343,12 @@ The dangerous property of both is that **any attribute access succeeds**. `mock.
 
 ```python
 with patch("app.services.billing.charge", autospec=True) as m:
-    m.return_value = ChargeResult(id="ch_1", status="ok")
-    m.side_effect = [RateLimited(), ChargeResult(id="ch_1", status="ok")]  # or a sequence
+    # a list side_effect supersedes return_value entirely; an exception INSTANCE in the
+    # sequence is raised, so this models "rate-limited once, then succeeds"
+    m.side_effect = [RateLimited(), ChargeResult(id="ch_1", status="ok")]
     checkout(order)
-m.assert_called_once_with(Decimal("42.00"), idempotency_key=ANY)  # mock.ANY for uuids
+assert m.call_count == 2                              # NOT assert_called_once_*: it retried
+m.assert_called_with(Decimal("42.00"), idempotency_key=ANY)   # mock.ANY for uuids
 ```
 
 Also use `mock.seal(m)` (3.7+) to freeze a configured mock so later typo'd attribute access raises. Costs: autospec is slower and can't spec dynamic attributes set in `__init__` (use `instance=True` with `create_autospec` on the class, or spec the instance). Worth it anyway for anything crossing a module boundary.
@@ -10333,7 +10357,7 @@ Also use `mock.seal(m)` (3.7+) to freeze a configured mock so later typo'd attri
 
 `unittest.mock.AsyncMock` (3.8+) returns a coroutine when called, so `await client.fetch()` works. `patch`/`create_autospec` **auto-detect** async functions and substitute `AsyncMock` automatically — so `patch("mod.async_fn", autospec=True)` already gives you the right thing. Assertions get async variants: `assert_awaited_once_with`, `await_count`, `await_args_list`. Note `called` and `awaited` differ: calling without awaiting increments `call_count` but not `await_count`, which is precisely how you catch a forgotten `await`.
 
-Async context managers and iterators need `MagicMock`'s async cousin: `MagicMock` doesn't support `__aenter__`; use `AsyncMock` or `MagicMock(__aenter__=AsyncMock(return_value=conn))`. For `async for`, set `mock.__aiter__.return_value = iter([...])` on a `MagicMock`.
+Async context managers and iterators mostly just work: since 3.8 `MagicMock` configures `__aenter__`/`__aexit__`/`__aiter__`/`__anext__` as `AsyncMock`s, so `async with MagicMock() as c:` runs. You only reach for `MagicMock(__aenter__=AsyncMock(return_value=conn))` when you need `c` to be a *specific* object. For `async for`, set `mock.__aiter__.return_value = iter([...])`.
 
 The bigger async testing point: for the event loop itself, `pytest-asyncio` (`asyncio_mode = "auto"` in config, so you don't decorate every test) or **`anyio`'s pytest plugin** if your app uses AnyIO/trio-compatible code. The classic pitfall is **scope mismatch between the event loop and session-scoped async fixtures** — pytest-asyncio historically gave each test a fresh loop, so a session-scoped async engine created on loop A blows up with "attached to a different loop" on loop B. Fix with `loop_scope="session"` on the fixture/test (pytest-asyncio 0.24+) and make sure your `AsyncEngine` and any `asyncio.Lock`/`Queue` are created inside the same loop scope they're used in.
 
@@ -10769,7 +10793,7 @@ st.print_callers("json.encoder")   # who is calling the encoder?
 st.print_callees("build_response") # where does build_response spend its time?
 ```
 
-`print_callers` / `print_callees` are the underused ones — they turn a flat list into a call graph and answer "which of my 14 call sites is responsible for the 1,200 `execute` calls". For visual work, dump with `cProfile.run(..., "prof.out")` and open in **snakeviz** (`snakeviz prof.out`) for an icicle view, or convert with `gprof2dot`/`flameprof`. The gotcha in `pstats` output: the `percall` column next to `tottime` is per *primitive* call, so recursive functions show misleading per-call figures.
+`print_callers` / `print_callees` are the underused ones — they turn a flat list into a call graph and answer "which of my 14 call sites is responsible for the 1,200 `execute` calls". For visual work, dump with `cProfile.run(..., "prof.out")` and open in **snakeviz** (`snakeviz prof.out`) for an icicle view, or convert with `gprof2dot`/`flameprof`. The gotcha in `pstats` output: there are *two* `percall` columns — the one next to `tottime` divides by **total** calls, while the one next to `cumtime` divides by **primitive** (non-recursive) calls. On a recursive function those differ by orders of magnitude, so read the header, not the position.
 
 ### Deterministic vs sampling profilers — when do you reach for each?
 
@@ -10987,7 +11011,7 @@ pandas traps that matter in interviews:
 
 ### `json` vs `orjson` vs `msgspec` vs `pickle` vs protobuf — how do you choose?
 
-- **stdlib `json`**: pure-C scanner for decode but a substantially Python encoder path when you use any customization (`default=`, `indent`, non-`str` keys). Fine below a few KB per response; the default for interop.
+- **stdlib `json`**: pure-C scanner for decode but a pure-Python encoder path when you pass `indent` (a `default=` callable, `sort_keys`, and non-`str` scalar keys all still take the C path). Fine below a few KB per response; the default for interop.
 - **`orjson`**: Rust, returns `bytes`, natively serializes `datetime`/`UUID`/`dataclass`/`numpy`. **Roughly 3–6× faster encode, 1.5–2× faster decode** than stdlib. Drop-in for responses; my default for any API doing >100 KB/s of JSON.
 - **`msgspec`**: Rust, fastest of the three for **decode-into-typed-struct** because it validates and constructs in one pass with no intermediate dict — often 5–15× faster than `json.loads` + Pydantic validation. Use it when you own both ends or on very hot internal endpoints; it lacks Pydantic's ecosystem and validator ergonomics.
 - **`pickle`**: fastest for arbitrary *Python* objects; protocol 5 supports out-of-band buffers for zero-copy numpy. **Never accept pickle from an untrusted source** — deserialization is arbitrary code execution. Fine for a trusted internal cache; an incident waiting to happen on a public queue.
@@ -11149,7 +11173,7 @@ Practical advice: **upgrading is the cheapest performance work you will ever do*
 
 ### What are subinterpreters, and would you use them for parallelism today?
 
-Subinterpreters are independent Python interpreters inside one process. **PEP 684 (3.12)** gave each one its own GIL, so they can genuinely run Python bytecode in parallel on multiple cores in a single process; **PEP 734 (3.13)** exposed the `interpreters` stdlib module, and 3.14 added `concurrent.futures.InterpreterPoolExecutor` to make the API ergonomic.
+Subinterpreters are independent Python interpreters inside one process. **PEP 684 (3.12)** gave each one its own GIL, so they can genuinely run Python bytecode in parallel on multiple cores in a single process; **PEP 734 (3.14)** exposed the `concurrent.interpreters` stdlib module (3.13 had only the private `_interpreters`), and 3.14 added `concurrent.futures.InterpreterPoolExecutor` to make the API ergonomic.
 
 The pitch versus `multiprocessing`: much cheaper startup than fork/spawn and no OS-level IPC. The pitch versus threads: real parallelism for CPU-bound Python.
 
@@ -11167,15 +11191,18 @@ The parts of your real stack the benchmarks omit are usually where the overhead 
 
 So: use them to choose *between* categories (ASGI vs WSGI matters; FastAPI vs Litestar mostly does not), then **benchmark your own endpoint with your own middleware** and profile the top 10 frames. That measurement takes an afternoon and is worth more than every leaderboard.
 
-### How do you run a load test that produces trustworthy numbers?
+### A load test says the service handles 2,000 RPS. Why might that number be a lie?
 
-Pick the right tool for the shape: **k6** (JS scripting, great thresholds/CI integration) or **wrk2**/**vegeta** for constant-rate HTTP, **Locust** when you need complex Python-expressed user journeys with state. Then get the methodology right, because that is where the value is:
+Tool choice and open-loop methodology are in §12; assume both are right and the number is still wrong. Six reasons, in the order I check them.
 
-- **Open-loop, constant arrival rate.** Closed-loop generators (fixed virtual users, each sending the next request only after the previous returns) suffer **coordinated omission**: when the server stalls the generator stops sending, so the stall never enters the histogram. Real users do not wait politely. `wrk2` and `vegeta` model a fixed arrival rate; Locust's default is closed-loop, so read its tails carefully.
-- **Realistic data and cardinality.** Hitting one user id measures your cache. Use a production-shaped key distribution (Zipfian, not uniform) and a production-sized dataset — a 10k-row table gets entirely different plans than a 50M-row one.
-- **Ramp, then hold** for ≥10 minutes so you see GC, cache churn, connection recycling, autoscaling, and memory growth. A 60-second test never reaches the gen-2 collection or the pool exhaustion.
-- **Measure the system, not just the client.** Correlate client percentiles with server CPU, GC, DB connections/locks, and container throttling — and check the **load generator is not itself the bottleneck**.
-- **Find the knee.** Step the arrival rate up until latency degrades non-linearly; that RPS is your capacity number. "We handled 1,000 RPS" is meaningless without the latency at which you handled it.
+- **The generator was the bottleneck.** A single-box Python or Node driver saturates its own CPU, event loop, or ephemeral port range long before your service does. Check the driver's own CPU and its connection-error count; if the client is above ~70% CPU, the number measures the client.
+- **Nothing was cold.** Warm caches, a warm JIT-less-but-warm buffer pool, an already-primed connection pool, and a fully populated CDN produce a number you can never reproduce after a deploy. The honest figure comes from a run that includes a rolling restart.
+- **The data was too small or too uniform.** A 10k-row table gets a completely different plan from a 50M-row one, and hammering one key measures Redis. Production key distributions are Zipfian; uniform random traffic both understates cache hit rate and hides hot-key contention.
+- **A downstream was faked.** Stubbed payment providers, an empty queue, and an idle replica mean you measured your service in a world that does not exist. Any dependency you mocked has to be called out next to the number.
+- **The test never held long enough to hit a cliff.** Gen-2 GC, pool recycling, log-volume-driven disk pressure, autoscaler reaction, and memory growth all land after minutes, not seconds. A 60-second run reports the pre-cliff plateau.
+- **It was measured at the wrong latency.** "2,000 RPS" with no percentile attached is not a capacity number. The number that matters is the arrival rate at which p99 crosses your SLO — past the knee, throughput keeps climbing while latency goes vertical, and a test that reports only RPS will happily report the post-knee figure.
+
+The way I state a result so it survives scrutiny: "2,000 RPS sustained for 20 minutes at p99 = 180 ms, on production-shaped data, with the payment provider stubbed at a fixed 40 ms, generator at 45% CPU." Every clause there is one of the lies above, pre-empted.
 
 ### How do you do capacity planning for a Python service?
 
@@ -11382,7 +11409,7 @@ Any swap changes edge-case behavior (NaN, integer bounds, key ordering, `Decimal
 
 What pickles: built-ins, most instances (via `__dict__` or `__getstate__`/`__setstate__`), dataclasses, numpy arrays. What does not: file handles, sockets, DB connections, locks, generators, lambdas and dynamically created functions — functions pickle **by reference**, so the receiver must import the same module path. That is why `multiprocessing` with `spawn` rejects a lambda passed to `Pool.map`, and why `cloudpickle` exists.
 
-**Protocol 5 (PEP 574) is both the default and the highest since Python 3.8**, adding out-of-band buffers for zero-copy transfer of large numpy/Arrow data. Pickles are not a storage format: not portable across Python versions, broken by renaming or moving a class, and permanently coupled to your code layout. Legitimate uses are `multiprocessing`/`concurrent.futures` IPC, short-lived internal caches, and ML checkpoints where you accept the trust boundary.
+**Protocol 5 (PEP 574) has been the highest since Python 3.8, but the default is still 4 on 3.11-3.13** (it only becomes the default in 3.14), so you must pass `protocol=5` explicitly to get its out-of-band buffers for zero-copy transfer of large numpy/Arrow data. Pickles are not a storage format: not portable across Python versions, broken by renaming or moving a class, and permanently coupled to your code layout. Legitimate uses are `multiprocessing`/`concurrent.futures` IPC, short-lived internal caches, and ML checkpoints where you accept the trust boundary.
 
 ### Naive vs aware `datetime` — what is your rule, and why is `utcnow()` deprecated?
 
@@ -11395,7 +11422,9 @@ from datetime import datetime, UTC
 from zoneinfo import ZoneInfo
 
 now = datetime.now(UTC)                          # aware, correct
-legacy = datetime(2026, 3, 8, 2, 30)             # naive value from an old system
+legacy = datetime(2026, 3, 8, 9, 30)             # naive value from an old system
+                                                 # (avoid 02:30 here -- it is in that day's
+                                                 #  US spring-forward gap; see the next answer)
 aware = legacy.replace(tzinfo=ZoneInfo("America/New_York"))  # attach the zone it was recorded in
 ```
 
@@ -12036,7 +12065,7 @@ Sizing: for sync CPU-adjacent workloads the folk formula is `(2 × cores) + 1`, 
 **`--graceful-timeout`** (default 30s) is how long the master waits after SIGTERM for workers to finish in-flight requests before sending SIGKILL. On SIGTERM the master stops accepting, tells workers to finish current requests and exit, and the workers close the listening socket. For zero-downtime this must exceed your slowest normal request, and your Kubernetes `terminationGracePeriodSeconds` must exceed *that* (otherwise the kubelet SIGKILLs mid-request). `--timeout` is different: it's the per-request watchdog that kills a worker whose heartbeat stalls — and note it measures wall-clock silence, so a legitimately long request gets its worker killed and the client gets a 502.
 
 ### Uvicorn, Hypercorn, Granian — what distinguishes them and how do you run uvicorn in production?
-**Uvicorn** is the de facto ASGI server: `uvloop` (a Cython wrapper over libuv, ~2-4x faster event loop than asyncio's default) plus `httptools` (a wrapper over the Node.js HTTP parser). It's HTTP/1.1 and WebSockets only. Production invocation is `uvicorn app:app --workers 4 --loop uvloop --http httptools --proxy-headers --forwarded-allow-ips='*' --timeout-keep-alive 75`. `--workers` uses a built-in multiprocess supervisor; it does not have gunicorn's `max_requests` or preload, so if you need worker recycling you still reach for gunicorn's supervision or an external one. Keep `--limit-concurrency` in mind: it returns 503 above a threshold, which is real load shedding and better than unbounded queueing.
+**Uvicorn** is the de facto ASGI server: `uvloop` (a Cython wrapper over libuv, ~2-4x faster event loop than asyncio's default) plus `httptools` (a wrapper over the Node.js HTTP parser). It's HTTP/1.1 and WebSockets only. Production invocation is `uvicorn app:app --workers 4 --loop uvloop --http httptools --proxy-headers --forwarded-allow-ips="10.0.0.0/8" --timeout-keep-alive 75` (scope the trusted range to your load balancer's subnet; `'*'` trusts client-supplied `X-Forwarded-For` and reintroduces the spoofing hole). `--workers` uses a built-in multiprocess supervisor; it does not have gunicorn's `max_requests` or preload, so if you need worker recycling you still reach for gunicorn's supervision or an external one. Keep `--limit-concurrency` in mind: it returns 503 above a threshold, which is real load shedding and better than unbounded queueing.
 
 **Hypercorn** is the feature-complete option: HTTP/1.1, **HTTP/2 (including h2c), HTTP/3 over QUIC**, WebSockets, and multiple worker types (asyncio, uvloop, trio). Pick it when you need end-to-end HTTP/2 without an edge proxy, or you're on trio. It's somewhat slower than uvicorn on plain HTTP/1.1.
 
@@ -12085,7 +12114,7 @@ async def lifespan(app: FastAPI):
 The layer people forget is the **database**: a rolling deploy runs old and new code simultaneously, so migrations must be backwards-compatible (expand/contract — add nullable column, deploy code that writes both, backfill, deploy code that reads new, drop old). A migration that renames a column in one step guarantees 500s during the rollout regardless of how perfect your HTTP handling is.
 
 ### How do idempotency keys work at the protocol level, and how would you implement one?
-The client generates a UUID per logical operation and sends `Idempotency-Key: <uuid>` on POST. The server atomically claims the key; if it's new it processes the request and stores the response; if it's a replay it returns the **stored** response without re-executing. Stripe popularized this and the semantics are worth copying exactly: keys scoped per API key (so one tenant can't collide with another), a 24-hour retention window, and a **409 (or 425) if a request with the same key is still in flight**, so a retry during processing doesn't double-execute.
+The client generates a UUID per logical operation and sends `Idempotency-Key: <uuid>` on POST. The server atomically claims the key; if it's new it processes the request and stores the response; if it's a replay it returns the **stored** response without re-executing. Stripe popularized this and the semantics are worth copying exactly: keys scoped per API key (so one tenant can't collide with another), a 24-hour retention window, and a **409 if a request with the same key is still in flight**, so a retry during processing doesn't double-execute.
 
 The critical detail people miss: you must also **fingerprint the request body**. If the same key arrives with a different payload, that's a client bug — return 422, do not silently return the first response. And the claim must be atomic: `SET key val NX EX 86400` in Redis, or a unique index insert in Postgres (which additionally lets you commit the key and the business row in **one transaction**, closing the crash-between-write-and-record window that Redis leaves open).
 
@@ -12490,17 +12519,14 @@ The cache is strictly per-request; there is no cross-request memoization. For ge
 A dependency that `yield`s gives you setup/teardown around the request. FastAPI wraps it in an `AsyncExitStack`; code before `yield` runs during dependency resolution, code after `yield` runs when the stack unwinds — **after the response is generated and serialized**, in reverse order of setup (LIFO). So if `get_session` is entered before `get_current_user`, the session closes after the user dependency's teardown.
 
 ```python
-async def get_uow() -> AsyncIterator[AsyncSession]:
-    async with SessionLocal() as session:
-        try:
-            yield session
-            await session.commit()       # commit only if the endpoint didn't raise
-        except Exception:
-            await session.rollback()
-            raise
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with SessionLocal() as session:    # closes (and rolls back if needed) on unwind
+        yield session                        # NOTE: no commit here -- see below
 ```
 
-Two behaviors people get wrong. First, **exceptions from the endpoint propagate into the `yield`**, so `try/except/finally` around the yield works as you'd expect — but since FastAPI 0.106, you can no longer use a yield-dependency's resource inside a **background task**, because teardown has already run by then. Second, `HTTPException` raised *after* the yield (in teardown) is too late to become a nice error response in older versions and generally should be avoided; raise before yielding.
+The tempting version of this commits after the `yield`. Don't: teardown runs *after* the response has been generated, so a commit that fails there cannot change the status code the client already got — you return `200` and persist nothing. Commit inside the endpoint or the service, where the failure can still become a `5xx`.
+
+Two behaviors people get wrong. First, **exceptions from the endpoint propagate into the `yield`**, so `try/except/finally` around the yield works as you'd expect — the availability of a yield-dependency's resource inside a **background task** depends on your FastAPI version — 0.106 tore it down first, 0.118 restored teardown-after-background-tasks — so don't build on either without pinning. Second, `HTTPException` raised *after* the yield (in teardown) is too late to become a nice error response in older versions and generally should be avoided; raise before yielding.
 
 The exit stack also means the DB session is still open while `response_model` serialization happens. That is convenient (lazy loads resolve) and dangerous (hidden N+1 in serialization). I prefer to convert ORM objects to Pydantic explicitly in the endpoint so the serialization step touches no ORM attributes.
 
@@ -12664,7 +12690,7 @@ app = FastAPI(lifespan=lifespan)
 
 `@app.on_event("startup"/"shutdown")` is deprecated because it cannot share state between the two halves — you end up with module-level globals and `global` statements — it has no clean way to guarantee cleanup on a startup failure, and it does not compose (you cannot nest lifespans from sub-applications or libraries). A lifespan is just a context manager, so libraries can hand you one and you can nest them with `AsyncExitStack`.
 
-Two operational notes. If startup raises, the ASGI server refuses to serve — that is desirable for a bad config, undesirable if you eagerly connect to a flaky dependency, so prefer lazy connections plus a readiness probe over hard-failing on a downstream. And `TestClient`/`ASGITransport` only run lifespan if you use them as a context manager (`with TestClient(app) as c:`), which is why "works in prod, `app.state.redis` missing in tests" is such a common bug.
+Two operational notes. If startup raises, the ASGI server refuses to serve — that is desirable for a bad config, undesirable if you eagerly connect to a flaky dependency, so prefer lazy connections plus a readiness probe over hard-failing on a downstream. And the two test clients differ here: `TestClient` runs lifespan **only** when used as a context manager (`with TestClient(app) as c:`), while httpx's `ASGITransport` does not implement the lifespan protocol at all and never runs it — for async tests you need `LifespanManager` from `asgi-lifespan`. That asymmetry is why "works in prod, `app.state.redis` is `None` in tests" is such a common bug.
 
 ### Why store shared clients on `app.state`, and how do you access them in an endpoint?
 
@@ -12742,7 +12768,7 @@ async def create_order(payload: OrderIn, bg: BackgroundTasks, svc: SvcDep):
     return {"id": order.id}
 ```
 
-The limits are what interviews probe. There is **no persistence** — a pod restart or SIGKILL during deploy loses every queued task silently. **No retries, no dead-letter, no visibility**; an exception is logged (or swallowed) and the client already got a 200. **No backpressure** — tasks compete with request handling for the same event loop and threadpool, so a slow task degrades your latency. Since FastAPI 0.106, resources from `yield` dependencies are already torn down when the task runs, so you must open a *new* DB session inside the task. And graceful shutdown does wait for in-flight tasks, but only within uvicorn's timeout.
+The limits are what interviews probe. There is **no persistence** — a pod restart or SIGKILL during deploy loses every queued task silently. **No retries, no dead-letter, no visibility**; an exception is logged (or swallowed) and the client already got a 200. **No backpressure** — tasks compete with request handling for the same event loop and threadpool, so a slow task degrades your latency. Whether a `yield` dependency's resources are still alive when the task runs is version-dependent (torn down first in 0.106, restored in 0.118), so open a *new* DB session inside the task rather than depending on it. And graceful shutdown does wait for in-flight tasks, but only within uvicorn's timeout.
 
 Rule of thumb: if losing the work would require an apology, a refund, or a manual data fix, use **Celery / RQ / arq / a broker with an outbox table** instead. Anything longer than ~1 second, anything needing retry, and anything needing horizontal scale belongs in a queue.
 
@@ -13069,8 +13095,9 @@ The clean implementation is a service method wrapped in an explicit transaction 
 
 ```python
 class OrderService:
-    def __init__(self, session: AsyncSession, orders: OrderRepo, stock: StockRepo):
-        self.session, self.orders, self.stock = session, orders, stock
+    def __init__(self, session: AsyncSession, orders: OrderRepo, stock: StockRepo,
+                 outbox: Outbox):
+        self.session, self.orders, self.stock, self.outbox = session, orders, stock, outbox
 
     async def place(self, cmd: PlaceOrder) -> Order:
         async with self.session.begin():          # commit on exit, rollback on raise
@@ -13111,7 +13138,7 @@ def get_http(request: Request) -> httpx.AsyncClient:
 HttpDep = Annotated[httpx.AsyncClient, Depends(get_http)]
 ```
 
-`httpx` has **no default timeout guard against a hung server on read**? It does default to 5s, but the trap is `timeout=None` copied from a tutorial: one unresponsive upstream then parks event-loop tasks forever and your service dies without a single error log. Also note `lifespan` runs **per worker process**, not once per deployment — so a pool of 50 Redis connections across 8 gunicorn workers is 400 connections; size against the server's `maxclients`. boto3 is sync and not async-safe on the loop; use `aioboto3`, or wrap calls in `run_in_threadpool`, and reuse a single boto3 client since client construction parses JSON service models and costs ~100–300 ms.
+`httpx` does default to a 5 s timeout on all four phases, so the trap is not the default but `timeout=None` copied from a tutorial: one unresponsive upstream then parks event-loop tasks forever and your service dies without a single error log. Also note `lifespan` runs **per worker process**, not once per deployment — so a pool of 50 Redis connections across 8 gunicorn workers is 400 connections; size against the server's `maxclients`. boto3 is sync and not async-safe on the loop; use `aioboto3`, or wrap calls in `run_in_threadpool`, and reuse a single boto3 client since client construction parses JSON service models and costs ~100–300 ms.
 
 ---
 
@@ -13287,8 +13314,10 @@ async def events(request: Request, user: CurrentUser) -> AsyncIterator[bytes]:
     # send a comment line ": ping\n\n" every ~15s to defeat idle proxy timeouts
 
 @router.get("/stream")
-async def stream(gen: Annotated[AsyncIterator[bytes], Depends(events)]):
-    return StreamingResponse(gen, media_type="text/event-stream",
+async def stream(request: Request, user: CurrentUser):
+    # call the generator directly. Depends(events) would make FastAPI treat it as a
+    # *yield dependency* and hand you the first chunk, not the iterator.
+    return StreamingResponse(events(request, user), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 ```
 
@@ -13385,7 +13414,7 @@ async def correlate(request: Request, call_next):
 
 Log **JSON** (structlog or `python-json-logger`) with stable field names: `timestamp`, `level`, `logger`, `message`, `request_id`, `trace_id`, `user_id`, `tenant_id`, `duration_ms`, `status`. Ship to stdout and let the platform collect — writing log files inside a container is an anti-pattern that ends with a full disk. Two things that bite: uvicorn installs its own loggers, so `uvicorn.access` will emit unstructured lines unless you override `LOGGING_CONFIG` or disable access logs and log them yourself in middleware; and if you accept an inbound `X-Request-ID` from the public internet, validate/truncate it — unbounded attacker-controlled strings in your log index is a log-injection and cost problem.
 
-Note `BaseHTTPMiddleware` (the `@app.middleware("http")` form) wraps the response in an anyio task and historically has rough edges with streaming responses and background tasks; for hot paths, pure ASGI middleware is measurably cheaper (BaseHTTPMiddleware adds roughly 0.5–1 ms and extra task overhead per request).
+The snippet above uses `@app.middleware("http")` for readability, but **ship the contextvar version as pure ASGI middleware**. `BaseHTTPMiddleware` (which is what that decorator builds) runs `call_next` in a separate anyio task, so a `ContextVar` set in the middleware is set in the *wrong* context and the endpoint still sees the default — silently breaking exactly the request-ID propagation this answer is about. It also has rough edges with streaming responses and background tasks, and costs roughly 0.5–1 ms plus task overhead per request. A pure ASGI middleware (`async def __call__(self, scope, receive, send)`) sets the contextvar in the same task the endpoint runs in, which is the only version that works.
 
 ### Which metrics do you export from a FastAPI service, and what's the cardinality trap?
 The **RED** method: **R**ate (requests/sec), **E**rrors (5xx rate), **D**uration (latency histogram) — per route and per method. Add saturation signals: DB pool checked-out connections, queue depth, event-loop lag. `prometheus-fastapi-instrumentator` gives you the RED basics in three lines and correctly uses the **route template** (`/users/{id}`) rather than the raw path.
@@ -13461,7 +13490,7 @@ Config from env vars (12-factor); **secrets never from env vars in the repo and 
 Per-environment differences should be **values**, not branches — `if settings.env == "prod"` scattered through the code means staging doesn't test the code that runs in production. Also plan for rotation: if a DB password rotates, does your app pick it up, or does it need a restart? Usually a restart, which is fine if you know it.
 
 ### How do you actually run FastAPI in production — gunicorn+uvicorn workers or `uvicorn --workers`?
-Both spawn N processes running uvicorn; the difference is the supervisor. **Gunicorn with `-k uvicorn.workers.UvicornWorker`** gives you battle-tested process management: worker timeout with automatic restart of a wedged worker, `--max-requests` with jitter to recycle workers that leak memory, graceful reload. `uvicorn --workers N` is simpler and has fewer moving parts, and modern uvicorn handles signals well, but it won't kill a worker stuck in an infinite loop.
+Both spawn N processes running uvicorn; the difference is the supervisor. **Gunicorn with `-k uvicorn_worker.UvicornWorker`** (the `uvicorn-worker` package, since the in-tree `uvicorn.workers` module is deprecated) gives you battle-tested process management: worker timeout with automatic restart of a wedged worker, `--max-requests` with jitter to recycle workers that leak memory, graceful reload. `uvicorn --workers N` is simpler and has fewer moving parts, and modern uvicorn handles signals well, but it won't kill a worker stuck in an infinite loop.
 
 In Kubernetes I usually run **one uvicorn process per container** and let the orchestrator do the scaling — it gives per-pod metrics, clean rolling deploys, and HPA that actually works, at the cost of more per-pod memory overhead. On VMs or a single big node, gunicorn with `workers = 2 × cores + 1` (async workloads can go lower; the event loop keeps a core busy) is the classic. Measure memory per worker: a typical FastAPI app with SQLAlchemy and Pydantic sits around 120–250 MB RSS, so 8 workers is ~1.5–2 GB before traffic. Multiply pool sizes by worker count when sizing Postgres `max_connections`.
 
@@ -13469,7 +13498,7 @@ Knobs worth knowing by name:
 
 - `--limit-concurrency N` — return 503 above N concurrent requests instead of queueing unboundedly and blowing latency; this is load shedding and it's how you avoid a death spiral.
 - `--backlog 2048` — the listen queue depth; too small drops SYNs under burst.
-- `--timeout-keep-alive 5` — must be **lower** than the upstream LB's idle timeout, or the LB reuses a connection your server just closed and the client gets a 502. AWS ALB defaults to 60 s, so set uvicorn to 65 for ALB, not 5.
+- `--timeout-keep-alive 5` — must be **higher** than the upstream LB's idle timeout, or the LB reuses a connection your server just closed and the client gets a 502. AWS ALB defaults to 60 s, so set uvicorn to 65 for ALB, not 5.
 - `--limit-max-requests` / gunicorn `--max-requests 10000 --max-requests-jitter 1000` — mitigates slow memory growth; jitter prevents all workers recycling at once.
 - `--proxy-headers --forwarded-allow-ips` — required for correct client IP and scheme behind a proxy; without it, generated URLs come out `http://` behind TLS termination.
 
@@ -13507,12 +13536,16 @@ async def client(app) -> AsyncIterator[AsyncClient]:
 
 ---
 
-### How would you version this API?
-URL path versioning (`/v1/orders`) as the default. It's ugly to purists but it's greppable, cacheable, trivially routable at the gateway, and unambiguous in logs. Header versioning (`Accept: application/vnd.acme.v2+json`) is theoretically cleaner but breaks browser testing, complicates CDN cache keys, and every client library gets it wrong.
+### You've shipped v2 and v1 still has traffic. How do you actually run both, and how do you kill v1?
+Which versioning scheme to pick is §16's question; this is the part that takes six months. The code is never the hard bit — running two contracts against one database is.
 
-In FastAPI, mount separate routers per version and let v2 handlers delegate to shared services — the version boundary lives in the router and schema layer, never in the domain. Duplicating a `UserOutV1`/`UserOutV2` schema is cheap; duplicating business logic is not.
+**Keep exactly one write path.** v1 and v2 routers get their own schemas and their own translation, and both call the same service against the same tables. The failure everyone walks into is letting v2 add a column that v1's serializer cannot produce a value for: if v2 introduces `orders.fulfilment_mode` and v1's `OrderOutV1` has no field for it, that is fine, but if v2 makes it *required on write*, v1 writes now violate an invariant v2 readers depend on. So every v2-only field must have a defined meaning for rows written by v1 — a default, a nullable, or a backfill — decided when you design v2, not when v1 dies.
 
-Better still is **not versioning at all for most changes**. Additive changes (new optional field, new endpoint) don't need a version bump if clients tolerate unknown fields — publish that expectation in your API contract. Reserve a major version for genuinely breaking changes, and when you cut one, define the deprecation timeline up front (`Deprecation` and `Sunset` headers, RFC 8594), instrument per-version usage so you know who's left, and email the top 20 consumers. The hard part of versioning is never the code; it's the six months of running both.
+**Instrument before you deprecate.** A per-version request counter labeled by consumer (API key or client ID, not user) is what turns "can we kill v1?" from an argument into a query. Ship it on day one of v2; retrofitting it means another quarter of waiting.
+
+**Then run the sunset as a schedule, not an announcement.** Add `Deprecation` and `Sunset` headers (RFC 8594) the moment v2 is stable; email the top consumers by volume with their own numbers attached; then use **brownouts** — return `410 Gone` for a scheduled hour, widening over weeks. A brownout finds the integrations nobody knew about while it is still cheap to reverse, which a hard cutoff finds at 3 a.m. Keep the error body pointing at the migration guide with a stable `type` URI.
+
+The judgment call worth stating: version the *contract*, not the deployment. Two versions in one service with a shared service layer is far cheaper to operate than two deployments, right up until v1 needs a security patch you cannot apply without touching v2 — at which point the branch has already paid for itself and you should be deleting it.
 
 ### How do you implement multi-tenancy?
 Three models, in increasing isolation and operational cost:
@@ -13525,7 +13558,9 @@ Default to row-level with RLS, and offer database-per-tenant as a premium tier. 
 
 ```python
 async def tenant_session(user: CurrentUser, session: SessionDep) -> AsyncSession:
-    await session.execute(text("SET LOCAL app.tenant_id = :t"), {"t": str(user.tenant_id)})
+    # SET takes no bind parameters -- set_config(..., true) is the transaction-local equivalent
+    await session.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                          {"t": str(user.tenant_id)})
     return session   # SET LOCAL is transaction-scoped, so pooled connections stay clean
 ```
 
@@ -13565,7 +13600,7 @@ My default for a new backend API in 2026 is FastAPI, mostly for ecosystem gravit
 ### Design and code a production order service in FastAPI. Walk me through it end to end.
 Structure: `app/orders/{router,service,repo,models,schemas}.py`, `app/core/{config,db,security,logging,obs}.py`, `app/main.py` for wiring only.
 
-**Wiring.** `main.py` builds the app with `lifespan` creating the engine, httpx client, Redis pool, and the outbox relay task; installs middleware in the right order (outermost first: request-ID → tracing → CORS → GZip); registers exception handlers mapping `DomainError` subclasses to status codes; mounts `/v1` routers, `/healthz`, `/readyz`, `/metrics`.
+**Wiring.** `main.py` builds the app with `lifespan` creating the engine, httpx client, Redis pool, and the outbox relay task; installs middleware in the right order (outermost first: CORS → request-ID → tracing → GZip, so CORS headers survive an error raised anywhere inside); registers exception handlers mapping `DomainError` subclasses to status codes; mounts `/v1` routers, `/healthz`, `/readyz`, `/metrics`.
 
 **Router** — HTTP only, and note every cross-cutting concern is a dependency:
 
@@ -13630,7 +13665,7 @@ Two consequences worth stating in an interview: **`model_validate_json()` is fas
 
 Crucially, strictness is **mode-aware**: in JSON parsing mode, a JSON string is still allowed for `datetime`/`UUID`/`Decimal` even under strict, because JSON has no native representation for them. Strict `int` in JSON mode rejects `"1"` but accepts `1`.
 
-I default to **lax at the HTTP edge** — clients send form-encoded values and query params as strings, and rejecting `?limit=10` because it isn't a JSON integer is user-hostile. I turn **strict on for internal service-to-service contracts and for message-queue payloads**, where a type drift means a bug upstream, not a sloppy client, and silent coercion would hide it. The classic production bug lax mode causes: a field typed `str` receiving `12345` from a partner and being coerced — actually no, v2 removed that; **v2 does not coerce int→str**, which is itself a frequent v1→v2 migration break.
+I default to **lax at the HTTP edge** — clients send form-encoded values and query params as strings, and rejecting `?limit=10` because it isn't a JSON integer is user-hostile. I turn **strict on for internal service-to-service contracts and for message-queue payloads**, where a type drift means a bug upstream, not a sloppy client, and silent coercion would hide it. The classic lax-mode bug is numeric: a field typed `int` receiving the JSON float `1.0` or the string `"1"` is accepted, so a partner silently sending `"00123"` becomes `123` and your ID round-trip stops matching theirs. Note that **v2 does not coerce int→str** (v1 did), which is itself a frequent v1→v2 migration break.
 
 ### How does Pydantic decide which member of a `Union` to use?
 v2 defaults to **smart union mode**. It does a first pass in strict mode across all members looking for an exact type match; only if none matches does it do a second, lax pass, preferring the leftmost success. This fixes the v1 wart where `Union[int, str]` given `"123"` would return `123` because `int` was tried first and coercion succeeded.
@@ -13657,7 +13692,7 @@ class CreateUser(BaseModel):
     created_by: str = Field(frozen=True, description="Immutable after construction")
     api_key: str = Field(repr=False)                       # keeps secrets out of logs
 ```
-`default_factory` is the mutable-default fix — Pydantic actually deep-copies plain defaults so `= []` is *not* the shared-state landmine it is in dataclasses, but `default_factory` is still the honest signal and avoids the copy cost. `exclude=True` drops the field from every `model_dump()`; `repr=False` keeps it out of `__repr__` and therefore out of exception messages and logs, which matters for tokens. `frozen=True` on a single field makes only that field immutable while the rest of the model stays mutable.
+`default_factory` is the mutable-default fix — Pydantic deep-copies plain defaults, so `= []` is *not* the shared-state landmine it is in an ordinary function or class-attribute default (dataclasses take the third option and reject a mutable default outright with `ValueError: mutable default ... use default_factory`), but `default_factory` is still the honest signal and avoids the copy cost. `exclude=True` drops the field from every `model_dump()`; `repr=False` keeps it out of `__repr__` and therefore out of exception messages and logs, which matters for tokens. `frozen=True` on a single field makes only that field immutable while the rest of the model stays mutable.
 
 The `Annotated[int, Field(...)]` form is preferred over `x: int = Field(...)` because it composes with `TypeAdapter`, works inside `list[...]`, and keeps the default slot free for a real default.
 
@@ -13727,7 +13762,7 @@ class DateRange(BaseModel):
             raise ValueError("end must be on or after start")
         return self          # forgetting the return makes the model None
 ```
-Execution order overall: `model_validator(before)` → per-field (`before` → core coercion → `after`) → `model_validator(after)`. Within a single field, multiple `after` validators run **bottom-up in definition order reversed for `before`** — don't rely on subtle ordering; if two validators on one field must be sequenced, merge them. Note that `mode="after"` model validators are skipped entirely when you use `model_construct()`, and that with `validate_assignment=True` they re-run on every attribute set.
+Execution order overall: `model_validator(before)` → per-field (`before` → core coercion → `after`) → `model_validator(after)`. Within a single field, multiple `before` validators run **bottom-up** (reverse definition order) while `after` validators run **top-down** (definition order) — don't rely on subtle ordering; if two validators on one field must be sequenced, merge them. Note that `mode="after"` model validators are skipped entirely when you use `model_construct()`, and that with `validate_assignment=True` they re-run on every attribute set.
 
 ### How do validators interact with inheritance, and how do you share one across models?
 A validator defined on a base class applies to subclasses. A subclass can **override** it by defining a method with the *same name* decorated again — same-name replaces, different-name adds a second validator to the chain. This bites people who copy a validator into a subclass under a new name and end up running both.
@@ -13901,7 +13936,7 @@ UserPage = Page[User]
 ```
 Each parametrization builds a distinct core schema (cached by args), and shows up in OpenAPI as `Page_User_`. This is the standard pagination envelope pattern.
 
-Recursive/self-referencing models work via forward references. If the referenced name isn't resolvable at class-creation time — typically a mutual reference across two classes, or a name defined later in the module — the model stays "incomplete" and the first validation raises `PydanticUndefinedAnnotation`. Fix it with **`model_rebuild()`** after the names exist:
+Recursive/self-referencing models work via forward references. If the referenced name isn't resolvable at class-creation time — typically a mutual reference across two classes, or a name defined later in the module — the model stays "incomplete" and the first validation raises `PydanticUserError`. Fix it with **`model_rebuild()`** after the names exist:
 
 ```python
 class Node(BaseModel):
@@ -13919,7 +13954,7 @@ The real-world version of this bites when models live in a module with `from __f
 ### `conint`/`constr` vs `Annotated[int, Field(...)]` vs `StrictInt` — which do you use?
 Use **`Annotated[int, Field(gt=0, le=100)]`**. The `conint()`/`constr()` factory functions still work but are effectively deprecated in v2 because they synthesize an anonymous type that static type checkers can't reason about — mypy sees `conint(gt=0)` as `int` at best, and IDE navigation is useless. The `Annotated` form keeps the real base type visible to the checker while attaching constraints as metadata.
 
-`StrictInt`/`StrictStr`/`StrictBool` are just `Annotated[int, Strict()]` — handy shorthand, especially `StrictBool` where lax mode's acceptance of `"yes"`, `"on"`, `1` is often unwanted. For the common cases define named aliases once and reuse: `PositiveInt`, `NonNegativeFloat`, `PositiveInt` are already provided by Pydantic; project-specific ones like `Percent = Annotated[float, Field(ge=0, le=100)]` belong in a shared `types.py`.
+`StrictInt`/`StrictStr`/`StrictBool` are just `Annotated[int, Strict()]` — handy shorthand, especially `StrictBool` where lax mode's acceptance of `"yes"`, `"on"`, `1` is often unwanted. For the common cases define named aliases once and reuse: `PositiveInt`, `NonNegativeInt`, `NonNegativeFloat` are already provided by Pydantic; project-specific ones like `Percent = Annotated[float, Field(ge=0, le=100)]` belong in a shared `types.py`.
 
 One gotcha: constraints on the *outer* container apply to the container. `list[Annotated[int, Field(gt=0)]]` constrains elements; `Annotated[list[int], Field(min_length=1)]` constrains the list. Mixing these up produces schemas that pass tests and fail in production.
 
@@ -13968,7 +14003,7 @@ Two things to get right in production. First, **strip `input` before returning i
 
 Legitimate uses: (1) re-hydrating data you *already* validated — e.g. from a trusted cache where you stored the exact `model_dump()`; (2) constructing response models from rows you just read out of your own database, where the DB constraints are the source of truth; (3) hot-loop fan-out where the same validated object is being reshaped.
 
-The danger is that it will happily create an object that **violates its own type annotations** — `User.model_construct(age="not a number")` succeeds, and the bug surfaces three layers away as a `TypeError` in an arithmetic expression, or worse, gets serialized out to a client (v2's serializer will warn but still emit). It also skips `default_factory` for fields you don't pass, leaving them genuinely absent. My rule: `model_construct` is allowed only where the input provenance is a validated in-process object or your own schema-enforced store, and never on anything derived from a network payload.
+The danger is that it will happily create an object that **violates its own type annotations** — `User.model_construct(age="not a number")` succeeds, and the bug surfaces three layers away as a `TypeError` in an arithmetic expression, or worse, gets serialized out to a client (v2's serializer will warn but still emit). Note that it *does* apply field defaults and `default_factory` for fields you omit (they simply stay out of `model_fields_set`) -- what it skips is validation, coercion and validators. My rule: `model_construct` is allowed only where the input provenance is a validated in-process object or your own schema-enforced store, and never on anything derived from a network payload.
 
 ### FastAPI already validates my request body. Should the service layer validate again?
 No — that's **double validation** and it's one of the most common avoidable costs in a FastAPI service. The request body is validated once by FastAPI when it binds the model; if your service function then takes a `dict` and re-constructs a Pydantic model, you pay the full validation cost twice. Worse is the triple pattern: request model → `model_dump()` → service → new domain model → `model_dump()` → ORM.
@@ -14022,7 +14057,8 @@ class Settings(BaseSettings):
     )
     env: Literal["dev", "staging", "prod"] = "dev"
     database_url: PostgresDsn
-    db: DBSettings = DBSettings()
+    db: DBSettings          # NOT `= DBSettings()`: an eager default is constructed during the
+                            # class body, before APP_DB__* nesting can supply its fields
 
 settings = Settings()   # at import: fails fast, at startup, not at 3am
 ```
@@ -14620,11 +14656,12 @@ The consistency risk is that in-memory objects go stale: you bulk-update 10,000 
 ```python
 session.execute(
     update(Order).where(Order.status == "pending").values(status="expired"),
-    execution_options={"synchronize_session": "fetch"},   # or "evaluate" (default) / False
+    execution_options={"synchronize_session": "fetch"},   # or "evaluate" / False; default "auto"
 )
 ```
 
-- `"evaluate"` (default in 2.0) — replays the WHERE clause in Python against in-session objects; fastest, but raises if the criteria can't be evaluated client-side (e.g. a `func.now()` comparison).
+- `"auto"` (default in 2.0) — tries `"evaluate"` and silently falls back to `"fetch"` when the criteria aren't evaluable in Python.
+- `"evaluate"` — replays the WHERE clause in Python against in-session objects; fastest, but raises if the criteria can't be evaluated client-side (e.g. a `func.now()` comparison).
 - `"fetch"` — pre-fetches matching PKs (or uses RETURNING) and expires those objects. Safe and portable.
 - `False` — no synchronization; only when you're about to close the session anyway.
 
@@ -14730,7 +14767,7 @@ print(stmt.compile(engine, compile_kwargs={"literal_binds": True}))   # inspect 
 plan = session.execute(text("EXPLAIN (ANALYZE, BUFFERS) " + sql), params).all()
 ```
 
-Common ORM-specific causes: **`joinedload` on a collection** producing a row explosion (parents x children rows over the wire, then de-duplicated client-side — switch to `selectinload`); **implicit cross joins** from referencing an entity you never joined (SQLAlchemy warns with "SELECT statement has a cartesian product"); **`DISTINCT` added to work around join duplication**, which forces a sort or hash of the full result; **parameterized `IN` with thousands of literals** blowing out the plan cache (use `bindparam(..., expanding=True)` or a temp table / `= ANY(:arr)` on Postgres); and **`column_property` subqueries** silently attached to every entity SELECT.
+Common ORM-specific causes: **`joinedload` on a collection** producing a row explosion (parents x children rows over the wire, then de-duplicated client-side — switch to `selectinload`); **implicit cross joins** from referencing an entity you never joined (SQLAlchemy warns with "SELECT statement has a cartesian product"); **`DISTINCT` added to work around join duplication**, which forces a sort or hash of the full result; **parameterized `IN` with thousands of literals** blowing out the plan cache (a temp table or `= ANY(:arr)` on Postgres actually fixes this; `in_()` is already expanding in 2.0, and expansion happens per-execution so it does not reduce plan variation); and **`column_property` subqueries** silently attached to every entity SELECT.
 
 Beyond that, the fix is usually a database-layer one — the right composite index in FK-then-filter order, a partial index for a soft-delete predicate, keyset pagination instead of `OFFSET 100000` — and the ORM just needs to be told to emit it. Don't rewrite the query in Python; make the SQL correct and let SQLAlchemy render it.
 
@@ -14783,7 +14820,9 @@ The mechanism is a **`Session` bound to multiple engines** with a routing functi
 ```python
 class RoutingSession(Session):
     def get_bind(self, mapper=None, clause=None, **kw):
-        if self._flushing or kw.get("bind_arguments", {}).get("primary"):
+        # Session.execute() splats bind_arguments in as **kw -- there is no nested
+        # "bind_arguments" key, so read the flag directly off kw.
+        if self._flushing or kw.get("primary"):
             return primary_engine
         return replica_engine          # reads default to replica
 ```
@@ -15131,15 +15170,18 @@ Gotchas in the order they bite:
 - It takes a **row lock** on the conflicting row, so concurrent upserts of a hot key serialize; that becomes your throughput ceiling.
 - `DO NOTHING` returns no rows for skipped inserts, so `RETURNING` gives fewer rows than you sent — never zip by position. And it is Postgres-only (MySQL: `on_duplicate_key_update`).
 
-### Explain ORM-enabled UPDATE and DELETE, and what `synchronize_session` does.
-`session.execute(update(User).where(...).values(...))` sends one SQL `UPDATE` instead of loading objects and flushing them — orders of magnitude faster for "set a flag on 50,000 rows". The catch is that objects already in the identity map now hold stale values. `synchronize_session` controls the fix:
+### A bulk `update()` silently did the wrong thing in production. Walk me through the failure modes.
+The `synchronize_session` strategies themselves are in §19. These are the four ways statement-level UPDATE/DELETE bites you *after* you have picked the right strategy, roughly in order of how often I have seen them.
 
-- **`"auto"` (2.0 default)** — `"fetch"` if the backend supports RETURNING, else `"evaluate"`.
-- **`"evaluate"`** — evaluates the `WHERE` criteria against in-memory objects in Python. Zero extra SQL, but raises on criteria it cannot evaluate (subqueries, SQL functions).
-- **`"fetch"`** — a pre-`SELECT` or RETURNING to learn affected PKs, then expires those objects. One extra round trip, always correct.
-- **`False`** — do nothing. Fastest; right for a bulk job whose session holds nothing relevant.
+**Python-side cascades and events do not run.** One SQL statement means no per-row `before_update`/`after_delete` mapper events, no `cascade="all, delete-orphan"`, no validators. A `delete()` against a parent whose children are cleaned up in Python raises an FK violation, or worse, succeeds against a nullable FK and orphans the rows. This is why I want **`ON DELETE CASCADE` in the database** in any system that also does bulk work — the guarantee has to live where the statement executes.
 
-The bigger traps are what `synchronize_session` does **not** solve. Bulk UPDATE/DELETE does not fire `before_update`/`before_delete` mapper events per row, and does not perform Python-side **relationship cascades** — `cascade="all, delete-orphan"` becomes a no-op, so you get an FK violation or orphaned rows unless the database has `ON DELETE CASCADE`. If your delete semantics live in Python, bulk delete quietly breaks them, which is why I prefer **database-level cascades** in any system that also does bulk work.
+**`"evaluate"` can be wrong rather than loud.** It raises on criteria it cannot interpret, which is the safe case. The unsafe case is criteria it *can* interpret but that mean something different in Python than in SQL: collation-dependent string comparison, `NULL` three-valued logic, timezone-naive datetimes, and `func.now()` versus `datetime.now()` skew. In-session objects then get synchronized to a different row set than the database actually touched.
+
+**RETURNING changes the row count you think you have.** `result.rowcount` after a bulk update reflects rows matched by the database — which, with `ON UPDATE` triggers, rules, or a partitioned table, may not be the number of logical entities you meant to change. Assert on an explicit `returning(User.id)` set when the count is load-bearing (billing, quota), never on `rowcount` alone.
+
+**It defeats optimistic concurrency.** A `version_id_col` is enforced by the flush process, so a statement-level UPDATE bypasses it entirely and will happily overwrite a row another transaction just changed. If a table has a version column, bulk-updating it needs the version predicate written into the `WHERE` clause by hand.
+
+The rule I hold: bulk statements are for rows that no session is holding and no Python-side semantics govern — retention sweeps, denormalized counters, backfills. The moment business rules attach to the write, load the objects.
 
 ### How do you iterate a 50-million-row result set without exhausting memory?
 Three things must all hold: the driver must not buffer the whole result, the ORM must not accumulate objects, and the transaction must be able to stay open.
@@ -15282,12 +15324,14 @@ Derive the 64-bit key with a stable digest (`blake2b(name, digest_size=8)`), nev
 
 Prefer the **`_xact_` variants** — they release at transaction end, so a crashed worker cannot leak a lock forever. Session-scoped `pg_advisory_lock` needs an explicit unlock and is actively dangerous behind **pgbouncer in transaction pooling mode**, where the "session" you locked on is handed to a different client afterwards. Namespace keys with the two-int form so unrelated features cannot collide.
 
-### What is `expire_on_commit` and why does it bite people?
-By default `Session.commit()` marks **every object in the identity map as expired**, so the next attribute access emits a refresh `SELECT`. The rationale is correctness: after commit, other transactions' writes are visible.
+### `expire_on_commit=False` is standard for async sessions — so what breaks when you set it?
+The mechanics are covered under §19's `expire_on_commit` question; this is the follow-up interviewers actually push on, because "just turn it off" is the answer everyone gives and almost nobody qualifies.
 
-The costs are two. **Performance**: commit inside a loop then read `obj.id` is one query per object — an N+1 with nothing to do with relationships. And in **async code it is a landmine**: a refresh is I/O, so if it triggers outside an awaited context (say, while FastAPI serializes the response after the session dependency closed) you get `MissingGreenlet` or `DetachedInstanceError`.
+What you give up is **automatic freshness**, and the sharp edge is server-generated state. With expiry off, an object holds the values Python assigned, not what the database now contains: `server_default=func.now()` columns, `Identity()`/sequence PKs on some backends, trigger-computed totals, and anything an `ON CONFLICT DO UPDATE` rewrote are all stale or `None` in memory after the commit that produced them. Reading them and serializing them into a response is a silent data bug, not an exception — which is why it survives code review.
 
-I set `expire_on_commit=False` on essentially every async session factory and often on sync ones. What you give up is automatic freshness — objects hold pre-commit values, including server-side defaults and trigger-computed columns, which will be **wrong** if you read them. The disciplined pattern is `expire_on_commit=False` plus an explicit `session.refresh(obj, ["updated_at", "total"])` where you need server-generated values, or `insert(...).returning(...)` so they come back with the write. Related: build your response DTO *inside* the session scope to avoid `DetachedInstanceError`.
+Three disciplined remedies, in order of preference: **`insert(...).returning(...)`** / `update(...).returning(...)` so generated values come back with the write and nothing needs refetching; an explicit, *column-scoped* **`await session.refresh(obj, ["updated_at", "total"])`** where you genuinely need the round trip; and a re-`SELECT` through the repository if the object has been mutated by other transactions. Note that `refresh()` is itself I/O, so under async it has to happen inside the session's awaited scope — calling it during response serialization is exactly the `MissingGreenlet` you turned expiry off to avoid.
+
+The second-order effect worth naming: with expiry off, an `AsyncSession` that lives longer than one request accumulates an identity map of stale objects that will never re-read. That is fine for the request-scoped session FastAPI hands you and dangerous for a long-lived worker session — there, `expire_on_commit=False` needs an explicit `session.expunge_all()` between units of work.
 
 ---
 
@@ -15332,29 +15376,16 @@ Pool sizing: connections are a **global** resource, so `(pool_size + max_overflo
 
 Two async-only hazards to name: a single blocking call (`requests`, `time.sleep`, `bcrypt`, a large pandas op) stalls *every* concurrent request and is far harder to find than an N+1; and an `AsyncSession` is **not safe to share across concurrent tasks** — `asyncio.gather` over coroutines sharing one session raises `IllegalStateChangeError` or corrupts state, so give each task its own session from the factory.
 
-### How do you build a fast, isolated test suite against a real Postgres?
-A real Postgres in a container (SQLite lies about too much: no `JSONB` operators, no `ARRAY`, different transactional DDL, no real `FOR UPDATE`), schema created once per session, and **per-test rollback** rather than truncate.
+### When does the rollback-per-test fixture stop working, and what do you do instead?
+The fixture itself — session-scoped container, migrations to head, per-test outer transaction with `join_transaction_mode="create_savepoint"` — is in §19. The senior question is where it breaks, because it is not a universal answer.
 
-```python
-@pytest.fixture(scope="session")
-def engine() -> Iterator[Engine]:
-    with PostgresContainer("postgres:16-alpine") as pg:      # testcontainers
-        url = pg.get_connection_url().replace("psycopg2", "psycopg")
-        alembic_upgrade_head(url)          # run real migrations: tests them continuously
-        yield create_engine(url)
+**It breaks whenever the code under test needs a second connection.** Your test data lives in an uncommitted transaction on *one* connection, so nothing else can see it: a background worker or `asyncio.create_task` that opens its own session, `LISTEN`/`NOTIFY`, `dblink`/FDW, a `psql` subprocess, or an HTTP call to your own app running under a separate server process. The symptom is a test that passes in isolation and fails the moment the feature becomes concurrent. The fix is to drop to **`TRUNCATE ... RESTART IDENTITY CASCADE`** between tests (a few ms per table, and it commits, so every connection sees the same world).
 
-@pytest.fixture
-def session(engine) -> Iterator[Session]:
-    conn = engine.connect()
-    trans = conn.begin()                                     # outer txn, never committed
-    s = Session(bind=conn, join_transaction_mode="create_savepoint")
-    try:
-        yield s
-    finally:
-        s.close(); trans.rollback(); conn.close()            # everything vanishes, ~1ms
-```
+**It also breaks on anything that must observe a real commit.** `after_commit` event hooks, outbox rows a poller is supposed to pick up, and `pg_advisory_xact_lock` behaviour all differ inside a savepoint — SAVEPOINT release is not COMMIT. Similarly, tests asserting on **transactional DDL** or on `SERIALIZABLE` conflict/retry behaviour need genuinely separate transactions.
 
-**`join_transaction_mode="create_savepoint"`** (SQLAlchemy 2.0) is the key modern detail: the session's own `commit()` becomes a SAVEPOINT release inside your outer transaction, so code under test can commit normally and you still roll everything back. It replaces the fragile `after_transaction_end` "restart savepoint" recipe everyone copy-pasted in 1.x. Override your session dependency to hand back this bound session — otherwise the app opens a second connection outside the transaction and sees none of your fixture data, the classic "my test data disappeared" bug.
+**And it constrains parallelism.** One container plus one schema means `pytest -n auto` workers share state, so truncate-based suites need a database (or schema) per xdist worker — create `gw0`, `gw1`, … once at session start and route each worker to its own. That is the point at which suite runtime, not isolation, becomes the thing you are optimizing.
+
+My default is the rollback fixture for the 90% of tests that are single-connection repository and service tests, an explicitly-marked truncate fixture for the rest, and never both in the same test.
 
 ---
 
@@ -15397,8 +15428,8 @@ Treat autogenerate as a **draft generator**, never a source of truth. Read every
 Databases auto-name unnamed constraints (`orders_customer_id_fkey` on Postgres, something else elsewhere), and `op.drop_constraint()` needs a name — without a convention your migrations either hardcode backend-specific generated names or cannot be written at all. Set it on day one; retrofitting means renaming every existing constraint.
 
 ```python
-convention = {"ix": "ix_%(column_0_label)s",
-              "uq": "uq_%(table_name)s_%(column_0_name)s",
+convention = {"ix": "ix_%(column_0_N_label)s",       # _N_ forms concatenate every column,
+              "uq": "uq_%(table_name)s_%(column_0_N_name)s",   # so multi-column names stay unique
               "ck": "ck_%(table_name)s_%(constraint_name)s",
               "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
               "pk": "pk_%(table_name)s"}
@@ -15784,7 +15815,7 @@ FROM (SELECT user_id, event_at,
 SELECT email, count(*), array_agg(id ORDER BY created_at) AS ids
 FROM users GROUP BY email HAVING count(*) > 1;
 
--- Delete all but the oldest, using ctid as the physical tiebreak when there's no PK
+-- Delete all but the oldest of each duplicate group, keyed on the table's own PK
 DELETE FROM users u
 USING (
   SELECT id, ROW_NUMBER() OVER (PARTITION BY lower(email) ORDER BY created_at, id) AS rn
@@ -15929,7 +15960,7 @@ A Postgres btree is a balanced multi-way tree of 8KB pages. Each internal page h
 
 Leaf pages store `(key, ctid)` pairs and are **doubly linked**, which is why btrees also serve range scans and `ORDER BY` without a sort: find the left edge, then walk leaves sequentially. That property is what makes `WHERE created_at > x ORDER BY created_at LIMIT 20` nearly free.
 
-Two structural consequences: (1) inserts into a **random** key like UUIDv4 dirty pages all over the index and cause splits everywhere, whereas monotonically increasing keys append to the rightmost leaf (Postgres has a fast-path for that) — this is the case for UUIDv7/ULID over UUIDv4 as a primary key; (2) Postgres 12+ deduplicates repeated keys in leaf pages, dramatically shrinking low-cardinality indexes that used to be bloated.
+Two structural consequences: (1) inserts into a **random** key like UUIDv4 dirty pages all over the index and cause splits everywhere, whereas monotonically increasing keys append to the rightmost leaf (Postgres has a fast-path for that) — this is the case for UUIDv7/ULID over UUIDv4 as a primary key; (2) Postgres 13+ deduplicates repeated keys in leaf pages, dramatically shrinking low-cardinality indexes that used to be bloated.
 
 ### Postgres heap vs InnoDB clustered index — what's the practical difference?
 InnoDB stores the **table itself inside the primary key's B+tree**: leaf pages contain the full row, ordered by PK. Secondary indexes store the PK value, not a physical pointer, so a secondary lookup costs two tree descents (secondary → PK → row). Consequences: PK order is physical order, so range scans on the PK are sequential I/O; a wide PK bloats every secondary index; and a random PK (UUIDv4) causes page splits and write amplification in the table itself, which is why the "use an auto-increment PK in MySQL" advice is much stronger than in Postgres.
@@ -16028,7 +16059,7 @@ Failure modes to know:
 - Adding a UNIQUE constraint without downtime: `CREATE UNIQUE INDEX CONCURRENTLY`, then `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX name` (fast, takes the index).
 
 ### Walk me through reading an EXPLAIN ANALYZE plan.
-```bash
+```sql
 EXPLAIN (ANALYZE, BUFFERS, SETTINGS, FORMAT TEXT) SELECT ...;
 ```
 
@@ -16320,8 +16351,8 @@ Variants interviewers chain on: use a `LEFT JOIN` if you must include employees 
 SELECT user_id, score,
        DENSE_RANK() OVER (ORDER BY score DESC) AS rank
 FROM scores
-ORDER BY score DESC, user_id                -- tiebreak makes the order total
-LIMIT 50 OFFSET 0;
+ORDER BY score DESC, user_id DESC           -- tiebreak makes the order total; both DESC so
+LIMIT 50 OFFSET 0;                          -- the keyset cursor below continues this exact order
 ```
 
 Two things break. First, **OFFSET pagination is O(offset)** — the database must generate and discard every skipped row, so page 10,000 reads 500,000 rows. Use **keyset (seek) pagination** instead: `WHERE (score, user_id) < ($last_score, $last_user_id) ORDER BY score DESC, user_id DESC LIMIT 50`, which is a single index descent with an index on `(score DESC, user_id DESC)`. Row-value comparison is the clean way to express a multi-column cursor and it maps directly onto the composite index. The trade-off is you lose random page access, which is almost always acceptable for infinite-scroll UIs.
@@ -16488,11 +16519,19 @@ CREATE TABLE orders_history (LIKE orders, valid_from timestamptz, valid_to times
 
 CREATE FUNCTION log_order() RETURNS trigger AS $$
 BEGIN
-  UPDATE orders_history SET valid_to = now()
-   WHERE id = OLD.id AND valid_to = 'infinity';        -- close the previous version
-  INSERT INTO orders_history SELECT NEW.*, now(), 'infinity', TG_OP::char(1);
-  RETURN NEW;
+  IF TG_OP <> 'INSERT' THEN                            -- OLD is NULL on INSERT
+    UPDATE orders_history SET valid_to = now()
+     WHERE id = OLD.id AND valid_to = 'infinity';      -- close the previous version
+  END IF;
+  IF TG_OP <> 'DELETE' THEN                            -- NEW is NULL on DELETE, and the
+    INSERT INTO orders_history                         -- close above is the whole record
+      SELECT NEW.*, now(), 'infinity', left(TG_OP, 1);
+  END IF;
+  RETURN NULL;                                         -- AFTER trigger: return value ignored
 END $$ LANGUAGE plpgsql;
+
+CREATE TRIGGER orders_audit AFTER INSERT OR UPDATE OR DELETE ON orders
+  FOR EACH ROW EXECUTE FUNCTION log_order();
 ```
 
 Application-level audit (a service that writes `audit_events` rows) captures *intent* — actor, IP, request id, business action name — which triggers cannot see. In practice you want both: triggers for "what changed", app events for "why and by whom". Wire the request-scoped user into the DB session with `SET LOCAL app.actor_id = ...` so triggers can read it via `current_setting('app.actor_id', true)`.
@@ -16606,7 +16645,9 @@ async def tenant_session(engine, tenant_id: UUID):
     async with AsyncSession(engine) as s:
         # SET LOCAL is transaction-scoped, so it cannot leak to the next checkout
         # of this pooled connection. Plain SET would be a cross-tenant leak.
-        await s.execute(text("SET LOCAL app.tenant_id = :t"), {"t": str(tenant_id)})
+        # SET does not take bind parameters; set_config() is the parameterizable form
+        await s.execute(text("SELECT set_config('app.tenant_id', :t, true)"),
+                        {"t": str(tenant_id)})
         yield s
 ```
 
@@ -16623,7 +16664,7 @@ Never `float`/`double` — `0.1 + 0.2` is not `0.3` in binary floating point, an
 
 Always store the **currency alongside the amount** — `amount numeric(19,4) NOT NULL, currency char(3) NOT NULL REFERENCES currencies(code)` — never a bare number in an implied currency, and never sum across currencies without an explicit conversion. For any converted value, persist the **rate and the rate timestamp** you used (`fx_rate numeric(18,8)`, `fx_as_of timestamptz`) so the historical total is reproducible; recomputing yesterday's report at today's rate is a classic finance bug.
 
-In Pydantic v2, use `condecimal(max_digits=19, decimal_places=4)` or `Decimal` with a field validator, and set `model_config = ConfigDict(ser_json_decimal='string')`-style handling so amounts serialize as strings over JSON. Avoid Postgres's `money` type — it depends on the server's `lc_monetary` locale setting.
+In Pydantic v2, use `condecimal(max_digits=19, decimal_places=4)` or `Decimal` with a field validator; `Decimal` already serializes as a JSON **string** under `model_dump_json()`, so you get exactness over the wire without extra configuration. Avoid Postgres's `money` type — it depends on the server's `lc_monetary` locale setting.
 
 ### How do you handle timestamps and time zones in the schema?
 
@@ -16751,21 +16792,15 @@ The three implementation problems everyone hits: **projection lag** (surface it 
 - **Partition.** Smaller indexes per partition means faster inserts and, crucially, cheap deletes via `DROP PARTITION`.
 - **Vertical scale.** Going from gp3 (3,000 IOPS baseline) to io2 with 64,000 IOPS, or from 16 to 96 vCPUs, is a config change and a maintenance window. Do this before you shard.
 
-### How does declarative partitioning work in Postgres and when should you reach for it?
+### How do you migrate a large existing table to a partitioned one without downtime?
 
-Partitioning splits one logical table into child tables by **range** (dates — by far the most common), **list** (region, tenant tier) or **hash** (even distribution by id). The planner does **partition pruning**: a query with `WHERE created_at >= '2026-07-01'` touches only the relevant partitions, so index depth and scan volume drop proportionally.
+Declarative partitioning itself — range/list/hash, pruning, `DETACH` for retention, `pg_partman` for the midnight-partition outage — is covered in §21. The hard part in practice is that `CREATE TABLE ... PARTITION BY` only works on a **new** table: there is no `ALTER TABLE ... SET PARTITIONED`, so a live 500 GB table has to be moved.
 
-```sql
-CREATE TABLE events (id bigserial, created_at timestamptz NOT NULL, payload jsonb,
-                     PRIMARY KEY (id, created_at))          -- partition key must be in every unique constraint
-PARTITION BY RANGE (created_at);
-CREATE TABLE events_2026_07 PARTITION OF events
-  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
-```
+Two workable routes. The **attach route** is the cheap one when the data is already time-ordered and you only care about *future* rows: create the partitioned parent, then `ALTER TABLE events RENAME TO events_legacy` and `ATTACH PARTITION events_legacy FOR VALUES FROM (MINVALUE) TO ('2026-08-01')`. Attach validates the constraint by scanning unless you pre-add a matching `CHECK` as `NOT VALID` and validate it separately — do that first or you take an `ACCESS EXCLUSIVE` lock for the length of a full scan. History stays in one fat partition, new months land in proper ones, and retention only ever reaches the fat partition last.
 
-The killer feature isn't query speed — it's **lifecycle management**. `ALTER TABLE events DETACH PARTITION events_2025_01` is a metadata operation; deleting a month of data goes from a multi-hour `DELETE` plus a vacuum storm to milliseconds. That alone justifies partitioning any append-only table with a retention policy.
+The **dual-write route** is the general one: create the partitioned table alongside, backfill in batches with a `WHERE id BETWEEN` cursor and a sleep between batches (watch replication lag, not wall time), have the application write to both tables inside the same transaction, verify with a periodic row-count and checksum comparison over a bounded window, then flip reads, bake, and stop writing the old table. That is expand/contract applied to a table rather than a column, and it is the version that survives an audit.
 
-Caveats: use `pg_partman` (or TimescaleDB) to automate partition creation — a missing future partition means failed inserts at midnight, a classic outage. Keep the count in the hundreds, not tens of thousands; planning time grows with partition count even with pruning. Queries that omit the partition key scan everything, so a bad partition key makes things *worse*. Global unique constraints across partitions are impossible unless the key includes the partition column, and cross-partition FKs referencing a partitioned table only work from PG 12+.
+Two traps specific to the migration itself: the partition key **must be in the primary key**, so a table keyed on a bare `id` needs its PK changed to `(id, created_at)` — a rewrite that every FK referencing it must follow. And `INSERT ... ON CONFLICT` against the parent needs the conflict target to include the partition key, which quietly breaks existing upserts. Both of these are why partitioning is a decision to make at design time and an expensive one to retrofit.
 
 ### How do you choose a shard key, and what happens when you choose badly?
 
@@ -16928,7 +16963,7 @@ Trade-offs to state plainly: single-table design gives you fewer round trips, on
 
 **Hot partitions**: each physical partition is capped at roughly 3,000 RCU / 1,000 WCU. If one partition key takes disproportionate traffic (`PK = 'GLOBAL_COUNTER'`, or a celebrity user) you throttle even though table-level capacity is unused. Adaptive capacity absorbs moderate skew automatically, but the durable fix is **write sharding**: append a suffix (`CELEB#123#7` with 10 buckets) and scatter-gather on read. The same applies to GSIs, and a throttled GSI **backpressures onto the base table's writes**, which is a nasty, non-obvious outage mode.
 
-**Capacity modes**: on-demand costs roughly 6-7x per request but requires zero forecasting and instantly absorbs spikes — right for new, spiky, or unpredictable workloads. Provisioned with auto-scaling is much cheaper for steady traffic but scales slowly (minutes), so it throttles on sudden spikes. Common pattern: launch on-demand, measure for a month, switch to provisioned with a floor at your p50 and auto-scaling headroom. Also remember the **400 KB item limit** — large payloads go to S3 with a pointer in the item.
+**Capacity modes**: on-demand costs roughly 3-3.5x per request (it was ~7x before AWS halved on-demand throughput pricing in November 2024) but requires zero forecasting and instantly absorbs spikes — right for new, spiky, or unpredictable workloads. Provisioned with auto-scaling is much cheaper for steady traffic but scales slowly (minutes), so it throttles on sudden spikes. Common pattern: launch on-demand, measure for a month, switch to provisioned with a floor at your p50 and auto-scaling headroom. Also remember the **400 KB item limit** — large payloads go to S3 with a pointer in the item.
 
 ### MongoDB: embed or reference? How do you decide?
 
@@ -17117,7 +17152,9 @@ The failure mode of layering is **stacked staleness**: a 60s browser cache in fr
 ```python
 async def get_user(user_id: int) -> User:
     key = f"user:v3:{user_id}"                      # v3 = schema version, see key-versioning
-    if raw := await redis.get(key):
+    if (raw := await redis.get(key)) is not None:
+        if raw == NEG_SENTINEL:                     # a cached miss is NOT a serialized user;
+            raise NotFound                          # parsing it would 500 on every repeat hit
         return User.model_validate_json(raw)        # Pydantic v2 fast JSON path
     user = await repo.load(user_id)
     if user is None:
@@ -17166,26 +17203,22 @@ The pattern: keep a dict of in-flight futures keyed by cache key. The first call
 ```python
 class SingleFlight:
     def __init__(self) -> None:
-        self._inflight: dict[str, asyncio.Future] = {}
+        self._inflight: dict[str, asyncio.Task] = {}
 
     async def do(self, key: str, coro_factory) -> Any:
-        if (fut := self._inflight.get(key)) is not None:
-            return await fut          # shared result; exception propagates to all waiters
-        fut = asyncio.get_running_loop().create_future()
-        self._inflight[key] = fut     # no await between get() and set() => atomic
-        try:
-            result = await coro_factory()
-        except BaseException as exc:
-            fut.set_exception(exc)
-            raise
-        else:
-            fut.set_result(result)
-            return result
-        finally:
-            self._inflight.pop(key, None)
+        if (task := self._inflight.get(key)) is None:
+            task = asyncio.create_task(coro_factory())   # the load runs in its OWN task, so no
+            self._inflight[key] = task                   # caller owns it (no await between
+                                                         # get() and set() => atomic)
+            def _done(t: asyncio.Task) -> None:
+                self._inflight.pop(key, None)
+                if not t.cancelled():
+                    t.exception()     # retrieve it, or asyncio logs "never retrieved"
+            task.add_done_callback(_done)
+        return await asyncio.shield(task)  # shield: a cancelled caller cancels only its own wait
 ```
 
-Two production notes. Awaiting a future whose exception nobody retrieves logs "Future exception was never retrieved" — make sure every waiter awaits. And if a caller is cancelled, `await fut` raises `CancelledError` in *that* caller only; the leader keeps running, which is what you want (otherwise one impatient client cancels the refresh for everyone).
+Two production notes, and both are why this uses a `Task` plus `shield` rather than a bare `Future`. If the work is awaited directly by whichever caller happened to arrive first, that caller's cancellation cancels the load *for everyone* — one impatient client kills the refresh all the others are waiting on. Running the loader as an independent task and handing every caller an `asyncio.shield` of it means a cancelled caller cancels only its own wait. Second, a task whose exception nobody retrieves logs "Task exception was never retrieved", which is why the done-callback calls `.exception()` — the last waiter may well have gone away.
 
 ### Why is cache invalidation "one of the two hard problems"? What strategies are available?
 It's hard because invalidation is a **distributed consistency problem disguised as a delete call**. The write to the DB and the delete from the cache are two operations across two systems with no shared transaction; any crash, network partition, or reordering between them leaves the cache holding a value that no longer exists in the DB, and nothing will ever notice — caches have no reconciliation loop unless you build one. Worse, the set of keys derived from a row is often unknowable: change one user's `tier` and you may have invalidated 30 cached leaderboards, search results, and permission sets.
@@ -17476,7 +17509,7 @@ My default is Redis, and I'd choose memcached only when the workload is genuinel
 - **Sliding window log** — store every request timestamp in a ZSET, `ZREMRANGEBYSCORE` to drop old ones, `ZCARD` to count. Perfectly accurate, allows no boundary burst. Costs O(limit) memory per client and O(log n) per op — a 10,000/hour limit means 10,000 members per user. Use for small limits or high-value endpoints.
 - **Sliding window counter** — keep the current and previous fixed-window counts and interpolate: `count = prev * (1 - elapsed_fraction) + curr`. ~99.9% as accurate as the log at two counters of memory. This is what Cloudflare uses and what I ship by default.
 - **Token bucket** — a bucket of `capacity` tokens refilling at `rate`/sec; each request takes one. Naturally supports **burst allowance** (capacity > rate) while enforcing a long-run average — the right model for APIs where clients legitimately batch. Two values per client (`tokens`, `last_refill`), refilled lazily in Lua.
-- **Leaky bucket (as a queue)** — requests enter a queue drained at a fixed rate, giving perfectly smooth output. Great for protecting a downstream that cannot absorb bursts at all; bad for user-facing latency because it queues rather than rejecting. Redis 4+ ships `CL.THROTTLE` in the redis-cell module, which is a GCRA leaky bucket.
+- **Leaky bucket (as a queue)** — requests enter a queue drained at a fixed rate, giving perfectly smooth output. Great for protecting a downstream that cannot absorb bursts at all; bad for user-facing latency because it queues rather than rejecting. Redis 4+ added the loadable-module API, and the third-party **redis-cell** module (`loadmodule` it yourself) provides `CL.THROTTLE`, a GCRA leaky bucket.
 
 Ship **token bucket** when clients need burst tolerance (public APIs, SDKs that batch), **sliding window counter** for straightforward per-endpoint protection. Both must be implemented in a Lua script so the read-modify-write is atomic — a Python-side `GET`/compute/`SET` is a classic race that lets N concurrent requests all pass a limit of 1.
 
@@ -17634,7 +17667,7 @@ Key details: the dedup key is **per consumer group**, not global, so two service
 Almost nothing gives global ordering, and you should not want it — global order means a single serialized consumer, i.e. no horizontal scaling. What you get is **per-partition** or **per-key** ordering:
 
 - **Kafka**: strict order within a partition. `partition = hash(key) % num_partitions`, so all events for `key=user_42` land in one partition and are consumed in order by one consumer. Ordering breaks if you change the partition count (the hash remaps) — a classic incident.
-- **SQS FIFO**: order within a `MessageGroupId`; separate groups process in parallel. Throughput is capped (300 msg/s per group without batching, 3000 with; high-throughput mode raises this per-partition).
+- **SQS FIFO**: order within a `MessageGroupId`; separate groups process in parallel. Throughput is capped **per queue, per API action** — not per group (300 msg/s without batching, 3000 with 10-message batches; only high-throughput mode makes the quota per-partition, so adding `MessageGroupId`s buys ordering and consumer parallelism, not headroom).
 - **RabbitMQ**: FIFO per queue *only if* there is a single consumer with prefetch 1 and no requeues. Add a second consumer and order is gone; a `nack`-requeue puts a message back at the head or tail depending on version and destroys ordering anyway.
 
 The design move is to pick the **smallest key that preserves the invariant you actually need** — usually the aggregate id (`account_id`, `order_id`), not `tenant_id`, because a hot tenant then becomes a hot partition and a single-consumer bottleneck. When ordering is only needed for conflict resolution, skip it entirely: put a monotonic `version` on the event and have the consumer do `UPDATE ... WHERE version < :incoming_version`, which makes out-of-order and duplicate delivery both harmless.
@@ -17670,13 +17703,14 @@ Backoff must be **exponential with full jitter**, not fixed and not exponential-
     retry_jitter=True,      # randomize -> spreads the herd
     max_retries=8,          # ~30 min of total retry budget
     retry_kwargs={"countdown": None},
+    acks_late=True,         # REQUIRED for Reject() below to reach the DLX at all
 )
 def charge(self, payment_id: str) -> None:
     try:
         call_psp(payment_id, idempotency_key=payment_id)  # PSP-side dedup
     except httpx.HTTPStatusError as e:
         if 400 <= e.response.status_code < 500 and e.response.status_code != 429:
-            raise Reject(e, requeue=False)  # permanent -> straight to DLQ
+            raise Reject(e, requeue=False)  # permanent -> DLQ (no-op unless acks_late=True)
         raise
 ```
 
@@ -17957,7 +17991,7 @@ Note the run key is the **logical date**, not `now()` — that makes re-firing a
 
 ### What are the standard cron/scheduled-job bugs and how do you avoid them?
 
-- **Overlap.** A job scheduled every 5 minutes that occasionally takes 7 runs concurrently with itself, doubling DB load and corrupting whatever assumes single-writer. Take a distributed lock with a TTL longer than the max runtime (Redis `SET NX EX`, or a Postgres advisory lock — `pg_try_advisory_lock` is free and auto-releases on disconnect, which handles crashed holders correctly where a Redis TTL does not).
+- **Overlap.** A job scheduled every 5 minutes that occasionally takes 7 minutes runs concurrently with itself, doubling DB load and corrupting whatever assumes single-writer. Take a distributed lock with a TTL longer than the max runtime (Redis `SET NX EX`, or a Postgres advisory lock — `pg_try_advisory_lock` is free and auto-releases on disconnect, which handles crashed holders correctly where a Redis TTL does not).
 - **Timezone and DST.** Schedule in **UTC**. A job at 02:30 local time runs twice on the fall-back day and zero times on the spring-forward day. If business logic needs local time ("send at 9am in the user's timezone"), schedule hourly in UTC and filter by user offset, or use `zoneinfo` explicitly and store the intended local time separately from the UTC firing time.
 - **Missed runs are invisible.** A cron that fails to fire produces no logs, no errors, nothing. Implement **dead-man's-switch monitoring**: the job pings a heartbeat endpoint (Healthchecks.io, Prometheus Pushgateway, or a `last_success_at` row) on completion, and you alert when the heartbeat is older than 1.5x the interval. This catches the failure mode that error alerting cannot.
 - **Non-idempotent windows.** `WHERE created_at > now() - interval '1 hour'` skips rows if a run is late and double-counts if it's early. Use explicit watermarks — process `WHERE id > last_processed_id` or a closed `[start, end)` window recorded in a table — so late and repeated runs converge.
@@ -18354,8 +18388,7 @@ Polling is the baseline because it traverses every firewall and demands nothing 
 Sign with **HMAC-SHA256 over a timestamp concatenated with the raw body**, in one header, with a customer-rotatable secret per endpoint:
 
 ```
-Webhook-Timestamp: 1785600000
-Webhook-Signature: v1=5257a869e7...,v1=8a1f0c...   # multiple sigs during rotation
+Webhook-Signature: t=1785600000,v1=5257a869e7...,v1=8a1f0c...   # multiple sigs during rotation
 ```
 
 Signing `f"{timestamp}.{raw_body}"` rather than the body alone buys **replay protection**: the receiver rejects anything outside a tolerance window (5 minutes), so a captured payload can't be redelivered later. Support **two active secrets** during rotation by emitting one signature each; the receiver accepts if any verifies.
@@ -18415,7 +18448,7 @@ oasdiff breaking main-openapi.json openapi.json    # fails specifically on break
 spectral lint openapi.json --ruleset .spectral.yaml
 ```
 
-The pipeline: **spectral** with a custom ruleset (every operation has `operationId`, a description, a documented `4xx` and `5xx`; kebab-case paths; no unbounded arrays), **oasdiff** for breaking-change gating, and **schemathesis** to fuzz the running service (3.1 aligns with JSON Schema 2020-12, so nullability is `type: ["string","null"]`, and Pydantic v2 emits it natively) — it finds `500`s on edge-case inputs hand-written tests never reach.
+The pipeline: **spectral** with a custom ruleset (every operation has `operationId`, a description, a documented `4xx` and `5xx`; kebab-case paths; no unbounded arrays), **oasdiff** for breaking-change gating, and **schemathesis** to fuzz the running service (3.1 aligns with JSON Schema 2020-12, so nullability is expressible as `type: ["string","null"]`, though Pydantic v2 emits the equivalent `anyOf` form) — it finds `500`s on edge-case inputs hand-written tests never reach.
 
 ### Is JSON:API (or HAL, or OData) worth adopting?
 JSON:API gives you a fully specified envelope — `data`/`included`/`errors`/`meta`/`links`, typed resource identifiers (`{"type": "orders", "id": "1"}`), standard `?include=`, `?fields[orders]=`, `?sort=`, `?page[cursor]=` — plus **compound documents** that deduplicate related resources into `included`. The payoff is real: an ecosystem of clients handling relationships and normalization for free, and an end to bikeshedding pagination in every design review.
@@ -18459,8 +18492,8 @@ Three gotchas: any response varying by `Accept`, `Accept-Encoding`, or `Authoriz
 Return limit state on **every** response, not just rejections — clients that can see headroom self-throttle; clients that only learn at `429` hammer you. The IETF `RateLimit` header fields draft standardizes a single-header form:
 
 ```
-RateLimit: limit=1000, remaining=734, reset=42
-RateLimit-Policy: 1000;w=3600
+RateLimit: "default";r=734;t=42
+RateLimit-Policy: "default";q=1000;w=3600
 ```
 
 Most APIs still emit the older `X-RateLimit-*` triple; sending both during a transition is cheap. On rejection return **`429` with `Retry-After: 30`** and a problem-details body with a stable code so SDKs back off automatically.
@@ -18741,17 +18774,17 @@ Also hash a dummy password when the user doesn't exist, or response timing becom
 
 ### What does modern password policy guidance actually say, and how do you check for breached passwords?
 
-**NIST SP 800-63B** inverted the old folklore: minimum 8 characters (12 is a reasonable product choice), *allow* at least 64, accept all Unicode and spaces, allow paste so password managers work, and **drop composition rules and periodic expiry**. Forced rotation and "1 upper, 1 digit, 1 symbol" measurably reduce entropy because users produce `Summer2026!` then `Summer2027!`; rotate only on evidence of compromise. Replace the removed rules with a **blocklist**: breached passwords, dictionary words, the site name, and the user's own email.
+**NIST SP 800-63B** inverted the old folklore: SHALL accept a minimum of 8 characters, and as of -4 (2025) SHOULD require 15, *allow* at least 64, accept all Unicode and spaces, allow paste so password managers work, and **drop composition rules and periodic expiry**. Forced rotation and "1 upper, 1 digit, 1 symbol" measurably reduce entropy because users produce `Summer2026!` then `Summer2027!`; rotate only on evidence of compromise. Replace the removed rules with a **blocklist**: breached passwords, dictionary words, the site name, and the user's own email.
 
 For breach checks use **Have I Been Pwned's k-anonymity range API**: SHA-1 the candidate, send only the first 5 hex characters, match the returned suffixes locally — the server never sees enough to identify the password. Air-gapped alternative: self-host the hash corpus in a Bloom filter (0.1% FPR fits comfortably in memory).
 
 ```python
 import hashlib, httpx
 
-async def is_breached(password: str) -> bool:
+async def is_breached(password: str, client: httpx.AsyncClient) -> bool:
     digest = hashlib.sha1(password.encode()).hexdigest().upper()
     prefix, suffix = digest[:5], digest[5:]
-    r = await httpx.AsyncClient().get(f"https://api.pwnedpasswords.com/range/{prefix}")
+    r = await client.get(f"https://api.pwnedpasswords.com/range/{prefix}")   # shared client
     # body is "SUFFIX:COUNT" lines; ~800 candidates, so the prefix identifies nothing
     return any(line.split(":")[0] == suffix for line in r.text.splitlines())
 ```
@@ -19108,7 +19141,7 @@ def safe_resolve(host: str) -> str:
 
 Where it hides: **cache values** (an unauthenticated internal Redis becomes RCE if you pickle cache entries — the most common real-world path), **Celery with `task_serializer="pickle"`** in legacy configs, session cookies in old frameworks, and **ML model files** (`torch.load` — PyTorch 2.6 flipped `weights_only=True` for exactly this reason; prefer safetensors).
 
-`yaml.load(data)` with the default loader is equivalent: `!!python/object/apply:os.system ["id"]` executes. Use **`yaml.safe_load`**; PyYAML ≥5.1 requires an explicit `Loader` and warns otherwise.
+`yaml.load(data, Loader=yaml.Loader)` (or `UnsafeLoader`) is equivalent: `!!python/object/apply:os.system ["id"]` executes. Use **`yaml.safe_load`**; since PyYAML 6.0 the `Loader` argument is mandatory (a bare `yaml.load(data)` raises `TypeError`), and `FullLoader` rejects that payload rather than running it.
 
 The rule: for untrusted data use a format with **no code semantics** — JSON, msgpack, Protobuf, safetensors. If you must ship pickles between your own workers, **HMAC-sign them** and verify before unpickling, so you're trusting the channel's integrity rather than the format.
 
@@ -19338,7 +19371,7 @@ Serial dependencies **multiply**: five at 99.9% gives 0.999^5 = 0.9950, about 3.
 
 Three passes — traffic, storage, bandwidth — rounding aggressively. Assume 50M DAU × 20 reads and 2 writes per day.
 
-- **QPS**: 1B reads/day ÷ ~10^5 seconds ≈ **12K read QPS average, ~36K at 3x peak**. Writes: 100M/day → ~1.2K/s, ~4K/s peak. A 30:1 ratio says caching and read replicas are the primary tools.
+- **QPS**: 1B reads/day ÷ ~10^5 seconds ≈ **12K read QPS average, ~36K at 3x peak**. Writes: 100M/day → ~1.2K/s, ~4K/s peak. A 10:1 ratio says caching and read replicas are the primary tools.
 - **Storage**: 100M × 1KB = 100GB/day ≈ 36TB/year raw, ~100TB with indexes and replication factor 3. One Postgres node is comfortable to ~2-5TB of hot data, so this design shards or tiers cold data to object storage.
 - **Bandwidth**: 36K × 5KB = 180MB/s ≈ 1.5Gbps egress — cheap in-region, ~$25K/month at $0.05-0.09/GB to the internet, which is your CDN argument.
 - **Cache memory**: if 20% of a 100M-object × 1KB dataset serves 80% of reads, the hot set is ~20GB — one or two Redis nodes, not a fleet.
@@ -19353,7 +19386,7 @@ Throughput: a 10Gbps NIC is 1.25GB/s. A 16-core box running a Python ASGI app do
 
 1. **Single box** (app + Postgres + nginx), fine to ~100 RPS. Move when they contend for CPU and page cache, or you want zero-downtime deploys.
 2. **Separate the database**, add PgBouncer in transaction mode. Trigger: DB CPU/IO saturation.
-3. **Add caching** — Redis for hot reads, cache headers and a CDN for static. Highest ROI at a 30:1 read ratio.
+3. **Add caching** — Redis for hot reads, cache headers and a CDN for static. Highest ROI at a 10:1 read ratio.
 4. **Stateless app tier behind a load balancer.** Trigger: app CPU > 60%, or rolling deploys.
 5. **Read replicas.** Trigger: read QPS saturating the primary. Cost: replication lag and read-your-writes bugs.
 6. **Async processing** (Celery/arq + Redis or SQS) for email, thumbnails, webhooks, exports. Trigger: p99 dominated by work that needn't be synchronous.
@@ -19526,7 +19559,7 @@ Also raise: **data residency** (GDPR, DPDP, China) may *require* per-region homi
 
 **Rolling** deploys replace instances in batches behind a readiness gate — the Kubernetes default, no extra capacity, slow rollback — and require old and new versions to run **simultaneously**, which is what forces backward-compatible schema and API changes. They also require graceful shutdown: on SIGTERM fail readiness first, wait 5-15s for the load balancer to deregister you (the step everyone skips, producing connection resets on every deploy), drain in-flight requests, then exit, with `terminationGracePeriodSeconds` above your longest request. **Blue-green** flips a router between two full environments: instant cutover and rollback, 2x capacity, and an all-or-nothing flip that exposes 100% of users to a subtle bug at once. **Canary** ramps 1% → 5% → 25% → 100% while comparing error rate and latency between cohorts and auto-rolling back (Argo Rollouts, Flagger) — my pick for a high-traffic service, the only strategy that catches what your tests didn't with a bounded blast radius, though it needs enough traffic for signal and per-version metric tagging. **Feature flags** are the orthogonal and often better tool: they decouple deploy from release, ramp per tenant, and give a kill switch that acts in seconds — deploy dark, ramp, then delete the flag, because stale flags become untested code-path combinations.
 
-Breaking schema changes use **expand/contract**, always at least three deploys. Renaming `users.name` to `full_name`: add the new nullable column; deploy code that writes both and reads the old; **backfill** in batches of 1-10K with a sleep between so you don't hold long transactions or blow up replication lag; flip reads and bake; then stop writing the old column and drop it later. The Postgres traps: `ADD COLUMN` with a default is instant since 11, but adding `NOT NULL` or a unique constraint takes an `ACCESS EXCLUSIVE` lock and a full scan, so add it `NOT VALID` then `VALIDATE CONSTRAINT` separately, and build indexes `CONCURRENTLY`. Always `SET lock_timeout = '3s'` on migrations: DDL queued behind one long-running reader blocks every subsequent query on that table, turning a 50ms migration into an outage.
+Breaking schema changes use **expand/contract**, always at least three deploys. Renaming `users.name` to `full_name`: add the new nullable column; deploy code that writes both and reads the old; **backfill** in batches of 1-10K with a sleep between so you don't hold long transactions or blow up replication lag; flip reads and bake; then stop writing the old column and drop it later. The Postgres traps: `ADD COLUMN` with a default is instant since 11, but adding `NOT NULL` or a unique constraint takes an `ACCESS EXCLUSIVE` lock and a full scan. For `NOT NULL`, add a `CHECK (col IS NOT NULL) NOT VALID` then `VALIDATE CONSTRAINT` separately (`NOT VALID` is only legal for CHECK and FK constraints); for uniqueness, `CREATE UNIQUE INDEX CONCURRENTLY` and then `ADD CONSTRAINT ... UNIQUE USING INDEX`. Always `SET lock_timeout = '3s'` on migrations: DDL queued behind one long-running reader blocks every subsequent query on that table, turning a 50ms migration into an outage.
 
 The same discipline applies to APIs and event schemas — additive changes only, never repurpose a field's meaning — and prefer an outbox or CDC feed over application-level dual writes when the target is a different datastore, since two writes diverge on partial failure.
 
@@ -19642,7 +19675,7 @@ Clients **batch** events (20 events or 5 seconds, whichever first) to a lightwei
 
 Two sinks: a **raw sink** to object storage in Parquet partitioned by date and event type (cheap, replayable, the backfill source of truth), and a **serving sink** in a columnar store, where **ClickHouse** is the pragmatic choice (millions of rows/s ingest, sub-second aggregations over billions of rows). Pre-aggregate into 1-minute and 1-hour rollups via materialized views, because scanning raw events per dashboard load will not hold. Handle **late and out-of-order data** by separating `event_time` from `ingest_time`, allowing lateness, and making rollups recomputable over a trailing window.
 
-For the dashboard, don't stream raw events to browsers: serve rollups, push over **SSE or WebSocket** at a 1-5s cadence with a polling fallback, and cap per-panel query cost (bounded range, enforced limit, timeout). For distinct-user counts use **HyperLogLog** — ~2% error, ~12KB per sketch, mergeable across windows — because approximate is nearly always the right trade in analytics.
+For the dashboard, don't stream raw events to browsers: serve rollups, push over **SSE or WebSocket** at a 1-5s cadence with a polling fallback, and cap per-panel query cost (bounded range, enforced limit, timeout). For distinct-user counts use **HyperLogLog** — ~0.81% standard error, ~12KB per sketch, mergeable across windows — because approximate is nearly always the right trade in analytics.
 
 ### How do you design a multi-tenant SaaS backend?
 
@@ -19834,7 +19867,7 @@ Layer three is at the collector (Vector/Fluent Bit scrubbing rules), covering th
 Uvicorn installs its own config by default (`uvicorn`, `uvicorn.error`, `uvicorn.access`) with colored, non-JSON formatters, producing a hybrid stream where half the lines are JSON and half are not — and the collector fails to parse half your logs. Fix it with `log_config=None` and your own `dictConfig` at startup, before the server binds.
 
 ```bash
-gunicorn app.main:app -k uvicorn.workers.UvicornWorker \
+gunicorn app.main:app -k uvicorn_worker.UvicornWorker \
   --access-logfile - --error-logfile - --logger-class app.logconf.GunicornLogger
 ```
 
@@ -20234,7 +20267,7 @@ COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
 COPY --chown=10001:10001 src/ ./src/
 USER 10001
 EXPOSE 8000
-ENTRYPOINT ["gunicorn", "src.main:app", "-k", "uvicorn.workers.UvicornWorker"]
+ENTRYPOINT ["gunicorn", "src.main:app", "-k", "uvicorn_worker.UvicornWorker"]
 CMD ["--bind", "0.0.0.0:8000", "--workers", "4", "--timeout", "60"]
 ```
 
@@ -20267,7 +20300,8 @@ Prefer file mounts over env vars for high-value secrets. Env vars leak through `
 ```python
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(secrets_dir="/run/secrets", env_file=".env")
-    database_url: PostgresDsn          # /run/secrets/database_url wins over env
+    database_url: PostgresDsn          # env wins over /run/secrets/database_url:
+                                       # init > env > dotenv > file_secret_settings
     jwt_signing_key: SecretStr         # SecretStr keeps it out of repr/logs
 ```
 
@@ -20293,7 +20327,7 @@ For a service image I use ENTRYPOINT for the server binary. For a multi-purpose 
 `EXPOSE` is documentation plus a hint for `-P`; it publishes nothing and Kubernetes ignores it entirely (`containerPort` is likewise informational). Do not expect it to do anything security-relevant.
 
 ### How do you run Gunicorn/Uvicorn correctly inside a container?
-For a sync WSGI app: `gunicorn` with `--workers N` where N is derived from the CPU **limit**, not the node's core count, plus `--max-requests 1000 --max-requests-jitter 100` to bound leaks, `--timeout 60` (this is a *worker* watchdog — a blocked worker is killed and respawned), and `--graceful-timeout 30`. For async FastAPI, either `uvicorn` directly with `--workers N` or Gunicorn with `-k uvicorn.workers.UvicornWorker`; Gunicorn buys you the supervisor (worker restarts on crash, max-requests recycling), uvicorn alone buys you one less process layer.
+For a sync WSGI app: `gunicorn` with `--workers N` where N is derived from the CPU **limit**, not the node's core count, plus `--max-requests 1000 --max-requests-jitter 100` to bound leaks, `--timeout 60` (this is a *worker* watchdog — a blocked worker is killed and respawned), and `--graceful-timeout 30`. For async FastAPI, either `uvicorn` directly with `--workers N` or Gunicorn with `-k uvicorn_worker.UvicornWorker` (the `uvicorn-worker` package; the in-tree `uvicorn.workers` path is deprecated); Gunicorn buys you the supervisor (worker restarts on crash, max-requests recycling), uvicorn alone buys you one less process layer.
 
 Container-specific rules: bind `0.0.0.0` (binding `127.0.0.1` makes the port unreachable from outside the netns — a very common first-day bug), set `--forwarded-allow-ips` correctly or `X-Forwarded-For` is ignored and every client IP logs as the ingress pod's IP, and do **not** use `--reload` in prod (it starts a watcher thread and doubles memory). Access logs go to stdout; disable Uvicorn's access log if your ingress already logs, otherwise you double your log bill.
 
@@ -20352,7 +20386,7 @@ Services: **ClusterIP** is a virtual IP with kube-proxy/iptables (or IPVS, or eB
 The gRPC/HTTP2 trap belongs here: kube-proxy load balances **connections**, not requests. A gRPC client opens one long-lived HTTP/2 connection and pins to one pod, so adding replicas does nothing — traffic stays lopsided. Fix with headless service + client-side round-robin, or a proxy that speaks HTTP/2 (Envoy/Linkerd), or periodic connection recycling (`GRPC_ARG_MAX_CONNECTION_AGE_MS` on the server).
 
 ### What does an Ingress controller do that a LoadBalancer Service does not?
-An Ingress controller (ingress-nginx, Traefik, or a Gateway API implementation like Envoy Gateway / Istio) is an L7 reverse proxy running in-cluster behind **one** cloud LB, routing by host and path to many backend Services. That collapses N cloud load balancers into one, and gives you TLS termination with cert-manager, path rewriting, header manipulation, rate limiting, and per-route timeouts. `Ingress` itself is a thin spec; everything interesting is in controller-specific annotations, which is precisely why **Gateway API** (GA since 1.1) exists — it moves timeouts, retries, header matching and traffic splitting into typed, portable resources and separates the infra team's `Gateway` from the app team's `HTTPRoute`.
+An Ingress controller (ingress-nginx, Traefik, or a Gateway API implementation like Envoy Gateway / Istio) is an L7 reverse proxy running in-cluster behind **one** cloud LB, routing by host and path to many backend Services. That collapses N cloud load balancers into one, and gives you TLS termination with cert-manager, path rewriting, header manipulation, rate limiting, and per-route timeouts. `Ingress` itself is a thin spec; everything interesting is in controller-specific annotations, which is precisely why **Gateway API** (GatewayClass/Gateway/HTTPRoute GA since 1.0; GRPCRoute since 1.1) exists — it moves timeouts, retries, header matching and traffic splitting into typed, portable resources and separates the infra team's `Gateway` from the app team's `HTTPRoute`.
 
 The operational details that bite: the ingress controller's default `proxy-read-timeout` is 60s, so a long streaming or SSE endpoint gets cut off unless you raise it per-route; the ALB/NLB idle timeout (60s default on AWS) sits in front of that and must be reconciled; `proxy-body-size` defaults to 1m in ingress-nginx and silently 413s uploads; and the controller keeps its own endpoint cache, so pod termination must account for its propagation delay (see the preStop discussion). Also, ingress-nginx historically reloads its config on endpoint changes — during a big rollout you can see connection resets from reload churn unless the controller uses the Lua endpoint updater.
 
@@ -20405,6 +20439,10 @@ Two rules I hold firmly: **build once, promote the same digest** through dev →
 
 ### Show me a concrete GitHub Actions workflow with dependency caching and matrix testing.
 ```yaml
+on:
+  push: { branches: [main] }
+  pull_request:
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -20429,10 +20467,14 @@ jobs:
 
   build:
     needs: test
+    runs-on: ubuntu-latest
     permissions: { id-token: write, contents: read }   # OIDC, no static AWS keys
     steps:
+      - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
         with: { role-to-assume: arn:aws:iam::123:role/gha-push, aws-region: us-east-1 }
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr                          # defines steps.ecr.outputs.registry, used below
       - uses: docker/build-push-action@v6
         with:
           cache-from: type=gha
@@ -20485,7 +20527,7 @@ Name the crossover: Lambda wins below roughly 1–2 million invocations/month or
 ### What breaks when you run a Python API on Lambda?
 **Cold starts** first: init phase = download + unzip the package, start the runtime, import your module tree. A FastAPI + SQLAlchemy + boto3 + pydantic import graph is easily 1.5–3 seconds of imports alone; add VPC-attached ENI setup (now fast, but historically 10s) and you have p99 outliers that no amount of app optimization fixes. Mitigations: shrink the package (250 MB unzipped limit; container images go to 10 GB), factor shared deps into **layers** — which help package size and build time but count against that same 250 MB and add their own versioning problem — lazy-import heavy modules inside the handler, and use **provisioned concurrency** for a floor of warm instances (you now pay for idle, which erodes the serverless value proposition).
 
-**Connection pooling** is the deeper mismatch. Each concurrent execution is its own process with its own pool; 500 concurrent Lambdas × a pool of 5 = 2,500 connections against an RDS instance whose `max_connections` is ~1,700 on a db.r6g.2xlarge — and each idle Postgres backend costs ~5–10 MB. This is exactly why **RDS Proxy** exists: it multiplexes many client connections onto a small pool of real ones and survives failover by holding client connections while the backend moves. Use `pool_size=1` (or NullPool) in Lambda and put RDS Proxy in front, or use a data API / HTTP-based DB.
+**Connection pooling** is the deeper mismatch. Each concurrent execution is its own process with its own pool; 500 concurrent Lambdas × a pool of 5 = 2,500 connections against an RDS instance whose `max_connections` is ~1,700 on a db.r6g.large (the RDS default is `LEAST(DBInstanceClassMemory/9531392, 5000)`, so even a 2xlarge caps at 5,000) — and each idle Postgres backend costs ~5–10 MB. This is exactly why **RDS Proxy** exists: it multiplexes many client connections onto a small pool of real ones and survives failover by holding client connections while the backend moves. Use `pool_size=1` (or NullPool) in Lambda and put RDS Proxy in front, or use a data API / HTTP-based DB.
 
 Other sharp edges: the 15-minute hard timeout; API Gateway's 29-second integration timeout, which caps latency regardless of Lambda's setting; background threads and `asyncio` tasks freeze the moment you return, so fire-and-forget metrics silently never flush; `/tmp` (512 MB) and module-global state persist between invocations on the same instance — a caching opportunity and a data-leak risk. Serverless is wrong for a latency-sensitive API with a strict p99, for long-lived websockets, and wherever per-request cost at your volume exceeds a container.
 
@@ -21539,7 +21581,7 @@ The security bug to name: `has_object_permission` only runs when the view calls 
 
 ### How do you handle throttling, pagination and filtering in DRF at scale?
 
-**Throttling**: `AnonRateThrottle`/`UserRateThrottle` via `DEFAULT_THROTTLE_RATES`, or `ScopedRateThrottle` for expensive endpoints. Be honest about the limits — it is a fixed-window counter in the cache, not a distributed token bucket, so boundary bursts reach 2x the nominal rate, and with LocMem each worker keeps its own counter, making "100/hour" really `100 × workers`. Use the Redis backend, and put security-critical limits (login) at the edge in nginx or Cloudflare.
+**Throttling**: `AnonRateThrottle`/`UserRateThrottle` via `DEFAULT_THROTTLE_RATES`, or `ScopedRateThrottle` for expensive endpoints. Be honest about the limits — `SimpleRateThrottle` keeps a sliding-window *log* of timestamps in the cache (so no fixed-window boundary burst, but the whole history is read, rewritten and raced on every request, with no atomicity across workers), and with LocMem each worker keeps its own copy, making "100/hour" really `100 × workers`. Use the Redis backend, and put security-critical limits (login) at the edge in nginx or Cloudflare.
 
 **Pagination**: `PageNumberPagination` and `LimitOffsetPagination` both run `COUNT(*)` and degrade with deep offsets, since `OFFSET 100000` walks 100k rows. For large or append-heavy collections use `CursorPagination` — ordered by an indexed immutable field, paging via `WHERE created_at < ?`, O(page size), immune to items shifting between pages. You give up random page access and a total count, which is the right trade for feeds and logs.
 
@@ -21692,7 +21734,7 @@ async def fetch(client: httpx.AsyncClient, url: str) -> dict:
 
 ### psycopg2 vs psycopg3 vs asyncpg — how do you choose a Postgres driver?
 
-**psycopg2** is the incumbent: mature, sync-only, Django's default, effectively feature-frozen. **psycopg3** is my default for new sync code — server-side parameter binding (fewer round trips, better plan reuse), a real `psycopg_pool` in the box, **pipeline mode** for batching statements without waiting on each result, better `COPY`, and native asyncio. Django supports it from 4.2 and migration is mostly imports plus fixing code that relied on client-side interpolation.
+**psycopg2** is the incumbent: mature, sync-only, Django's default, effectively feature-frozen. **psycopg3** is my default for new sync code — server-side parameter binding (better plan reuse, no client-side interpolation), a real `psycopg_pool` in the box, **pipeline mode** for batching statements without waiting on each result, better `COPY`, and native asyncio. Django supports it from 4.2 and migration is mostly imports plus fixing code that relied on client-side interpolation.
 
 **asyncpg** is a from-scratch asyncio implementation of the binary protocol, often 2-3x faster than psycopg on large result sets because it skips libpq. The catch worth naming: it **caches prepared statements**, which breaks under **PgBouncer in transaction pooling mode** (`prepared statement "__asyncpg_stmt_1__" already exists`) — fix with `statement_cache_size=0`/`prepared_statement_cache_size=0`, PgBouncer 1.21+ with `max_prepared_statements`, or session pooling. Rule: sync Django/Flask → psycopg3; async FastAPI/Litestar → asyncpg, unless you sit behind transaction-mode PgBouncer, in which case psycopg3's async mode is safer.
 
@@ -21777,7 +21819,7 @@ Then state your approach *and its complexity* before coding: "brute force is O(n
 Finally, budget the clock: roughly 20% clarify + design, 50% code, 30% test and follow-ups. Running out of time with untested code reads far worse than a slightly simpler solution you dry-ran on an example.
 
 ### How do you reason about time complexity out loud, including amortized and space costs?
-Count operations by **structure, not by intuition**: nested loops multiply, sequential loops add, recursion multiplies branching factor by depth. `list.append` is **amortized O(1)** because CPython over-allocates geometrically (growth is roughly `newsize + newsize >> 3`, about 1.125x plus padding), so the total cost of n appends is O(n) even though individual appends occasionally copy. Say "amortized" explicitly — interviewers listen for it. `list.pop(0)` and `list.insert(0, x)` are O(n) because they memmove the whole array; that is the single most common accidental O(n²) in interview code, fixed with `collections.deque`.
+Count operations by **structure, not by intuition**: nested loops multiply, sequential loops add, recursion multiplies branching factor by depth. `list.append` is **amortized O(1)** because CPython over-allocates geometrically (growth is roughly `newsize + (newsize >> 3) + 6`, about 1.125x plus padding), so the total cost of n appends is O(n) even though individual appends occasionally copy. Say "amortized" explicitly — interviewers listen for it. `list.pop(0)` and `list.insert(0, x)` are O(n) because they memmove the whole array; that is the single most common accidental O(n²) in interview code, fixed with `collections.deque`.
 
 Watch the hidden costs interviewers probe: string concatenation in a loop is O(n²) (strings are immutable; CPython's in-place `+=` optimization only fires when the refcount is 1 and is not part of the language spec — use `"".join(parts)`); slicing a list or string is O(k) and allocates, so `s[1:]` inside recursion turns O(n) into O(n²); `x in list` is O(n) but `x in set` is O(1) average. For space, distinguish **auxiliary space** from output space: quicksort is O(log n) auxiliary for the recursion stack, and a "constant space" answer that returns a list of size n is still O(n) output.
 
@@ -22321,8 +22363,8 @@ def copy_random_list(head):
     # 1) weave copies: A -> A' -> B -> B' -> ...
     cur = head
     while cur:
-        cur.next = Node(cur.val, cur.next, None), cur.next  # illustrative; see below
-        cur = cur.next
+        cur.next = Node(cur.val, cur.next, None)   # splice the copy in after the original
+        cur = cur.next.next                        # skip over the copy we just inserted
     ...
 ```
 
@@ -22485,7 +22527,7 @@ from collections import Counter
 
 def top_k_frequent(nums: list[int], k: int) -> list[int]:
     counts = Counter(nums)
-    return [x for x, _ in counts.most_common(k)]   # C-implemented; uses nlargest internally
+    return [x for x, _ in counts.most_common(k)]   # pure Python; delegates to heapq.nlargest
 
 def top_k_manual(nums: list[int], k: int) -> list[int]:
     counts = Counter(nums)
@@ -22620,7 +22662,7 @@ def topo_sort(n: int, prereqs: list[tuple[int, int]]) -> list[int]:
     while q:
         u = q.popleft()
         order.append(u)
-        for v in g[u]:
+        for v in g.get(u, ()):           # .get: don't insert empty lists for sink nodes
             indeg[v] -= 1
             if indeg[v] == 0:            # all deps satisfied
                 q.append(v)
@@ -23143,7 +23185,7 @@ def top_k_stream(lines, k: int, shards: int = 256) -> list[tuple[str, int]]:
 
 The correctness argument to state: because sharding is by key hash, a key's total count lives entirely in one shard, so a global top-k element must be in *some* shard's top-k. That is why hash-partitioning is required and random splitting is wrong — a genuinely common wrong answer. Note `hash()` on `str` is **randomized per process** since Python 3.3 (PYTHONHASHSEED), so it is unusable for stable sharding across machines; use `hashlib.blake2b(key.encode()).digest()` or `zlib.crc32`.
 
-If even one shard's distinct keys don't fit, switch to approximation: a **count-min sketch** (a few MB gives counts with bounded overestimate) for heavy hitters, or Space-Saving/Lossy-Counting. For distinct *counts* rather than frequencies, **HyperLogLog** estimates cardinality in ~12 KB with ~2% error by tracking the maximum leading-zero run across 2^14 buckets and harmonic-averaging — that is Redis' `PFADD`/`PFCOUNT`, and citing it wins the question.
+If even one shard's distinct keys don't fit, switch to approximation: a **count-min sketch** (a few MB gives counts with bounded overestimate) for heavy hitters, or Space-Saving/Lossy-Counting. For distinct *counts* rather than frequencies, **HyperLogLog** estimates cardinality in ~12 KB with ~0.81% standard error (1.04/√m) by tracking the maximum leading-zero run across 2^14 buckets and harmonic-averaging — that is Redis' `PFADD`/`PFCOUNT`, and citing it wins the question.
 
 ### Use generators to process a large dataset under a memory limit.
 ```python
@@ -23213,7 +23255,7 @@ class BoundedQueue:
             return item
 ```
 
-The three things being graded: `+=` is not atomic (it compiles to LOAD/ADD/STORE and the interpreter can switch threads between them — before 3.10 every 100 bytecodes, now on a 5ms interval via `sys.setswitchinterval`), `Condition` must be waited on in a **`while` loop** not an `if`, and both conditions must **share one lock** or `put` and `get` will race. In production you use `queue.Queue(maxsize=N)`, which is exactly this, and the bounded size is what provides **backpressure** — an unbounded queue turns a slow consumer into an OOM kill. Follow-ups: add `timeout` to `put`/`get` (`Condition.wait(timeout)` returns `False` on expiry), and a `close()`/sentinel protocol so consumers can drain and exit. On free-threaded Python 3.13+ (`--disable-gil`), the "atomic because of the GIL" folklore is gone entirely and the lock is unambiguously required.
+The three things being graded: `+=` is not atomic (it compiles to LOAD/ADD/STORE and the interpreter can switch threads between them — before 3.2 every 100 bytecodes via the old `sys.setcheckinterval`, now on a 5 ms interval via `sys.setswitchinterval`), `Condition` must be waited on in a **`while` loop** not an `if`, and both conditions must **share one lock** or `put` and `get` will race. In production you use `queue.Queue(maxsize=N)`, which is exactly this, and the bounded size is what provides **backpressure** — an unbounded queue turns a slow consumer into an OOM kill. Follow-ups: add `timeout` to `put`/`get` (`Condition.wait(timeout)` returns `False` on expiry), and a `close()`/sentinel protocol so consumers can drain and exit. On free-threaded Python 3.13+ (`--disable-gil`), the "atomic because of the GIL" folklore is gone entirely and the lock is unambiguously required.
 
 ### Design a rate limiter class — token bucket and sliding window.
 ```python
@@ -23252,7 +23294,7 @@ class TTLCache:
         self._lock = threading.Lock()
 
     def set(self, key: str, value: object, ttl: float | None = None) -> None:
-        exp = time.monotonic() + ttl if ttl else None
+        exp = time.monotonic() + ttl if ttl is not None else None   # not `if ttl`: ttl=0 must expire
         with self._lock:
             self._data[key] = (value, exp)
             if exp is not None:
@@ -23334,6 +23376,7 @@ class CircuitBreaker:
         self.failures = 0
         self.opened_at = 0.0
         self.state = State.CLOSED
+        self.probing = False                     # a probe is in flight right now
         self.lock = threading.Lock()
 
     def call(self, fn, *a, **kw):
@@ -23341,17 +23384,20 @@ class CircuitBreaker:
             if self.state is State.OPEN:
                 if time.monotonic() - self.opened_at < self.reset_after:
                     raise CircuitOpen("circuit is open")
-                self.state = State.HALF_OPEN     # let exactly one probe through
+                self.state, self.probing = State.HALF_OPEN, True   # THIS caller is the probe
+            elif self.state is State.HALF_OPEN and self.probing:
+                raise CircuitOpen("probe in flight")   # without this, half-open admits everyone
         try:
             result = fn(*a, **kw)
         except Exception:
             with self.lock:
                 self.failures += 1
+                self.probing = False
                 if self.state is State.HALF_OPEN or self.failures >= self.threshold:
                     self.state, self.opened_at = State.OPEN, time.monotonic()
             raise
         with self.lock:
-            self.failures, self.state = 0, State.CLOSED
+            self.failures, self.state, self.probing = 0, State.CLOSED, False
             return result
 ```
 
@@ -23556,17 +23602,25 @@ class ConnectionPool:
             self._checkin(conn)          # only return healthy connections
 
     def _checkout(self):
+        deadline = time.monotonic() + self._timeout   # ONE deadline for the whole checkout
         with self._available:
-            deadline_ok = True
             while True:
                 if self._pool:
                     return self._pool.pop()
                 if self._created < self._size:
                     self._created += 1   # lazy creation: don't open 10 sockets at startup
-                    return self._factory()
-                if not deadline_ok:
-                    raise TimeoutError("pool exhausted")
-                deadline_ok = self._available.wait(self._timeout)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:       # re-waiting self._timeout on every lost wakeup race
+                    raise TimeoutError("pool exhausted")   # makes the bound unenforceable
+                self._available.wait(remaining)
+        try:
+            return self._factory()       # OUTSIDE the lock: a slow TCP+TLS handshake must not
+        except BaseException:            # serialize every other borrower
+            with self._available:
+                self._created -= 1       # or a failed connect permanently shrinks the pool
+                self._available.notify()
+            raise
 
     def _checkin(self, conn) -> None:
         with self._available:
@@ -23636,7 +23690,7 @@ Python-specific caveats worth stating: ints are **arbitrary precision**, so ther
 ### Handle the math problems: sieve of Eratosthenes, gcd, and modular arithmetic.
 ```python
 def sieve(n: int) -> list[int]:
-    is_prime = bytearray([1]) * (n + 1)          # bytearray: 1 byte/entry vs ~28 for a list of bools
+    is_prime = bytearray([1]) * (n + 1)          # bytearray: 1 byte/entry vs 8 (a pointer) per list slot
     is_prime[0:2] = b"\x00\x00"
     for p in range(2, int(n ** 0.5) + 1):        # stop at sqrt(n)
         if is_prime[p]:
@@ -23684,9 +23738,9 @@ Dry-run one small example by hand, narrating the state at each step — that cat
 If the environment allows execution, write assertions rather than prints — they are self-checking and read as production instinct:
 
 ```python
-assert two_sum([2, 7, 11, 15], 9) == (0, 1)
-assert two_sum([], 5) is None
-assert two_sum([3, 3], 6) == (0, 1)            # duplicates
+assert two_sum_sorted([2, 7, 11, 15], 9) == (0, 1)
+assert two_sum_sorted([], 5) is None
+assert two_sum_sorted([3, 3], 6) == (0, 1)     # duplicates
 assert max_subarray([-3, -1, -2]) == -1        # all-negative: the classic init bug
 ```
 
@@ -23758,7 +23812,8 @@ Patch the sleep and pin the randomness. Tests that really sleep 4s are why nobod
 ```python
 async def test_backoff_schedule(monkeypatch):
     slept: list[float] = []
-    monkeypatch.setattr(asyncio, "sleep", lambda d: slept.append(d) or asyncio.sleep(0))
+    _real_sleep = asyncio.sleep          # capture BEFORE patching, or the lambda recurses
+    monkeypatch.setattr(asyncio, "sleep", lambda d: slept.append(d) or _real_sleep(0))
     monkeypatch.setattr(random, "random", lambda: 1.0)   # kill jitter -> deterministic
     calls = 0
     @aretry(attempts=4, retry_on=(ConnectionError,))
@@ -23871,7 +23926,8 @@ The response contract matters as much as the algorithm: **429** with `Retry-Afte
 `OrderedDict` gives both orderings: `move_to_end` on hit for recency, `popitem(last=False)` for the victim. TTL is enforced lazily on read; a sweeper thread is unnecessary unless entries hold resources needing prompt close.
 
 ```python
-_MISS = object()
+_MISS = object()      # "key absent from the cache"
+_NEG = object()       # "key present, and the answer was None" -- see the decorator below
 
 class TTLCache:
     def __init__(self, maxsize: int = 1024, ttl: float = 60.0):
@@ -23920,7 +23976,7 @@ def cached(cache: TTLCache, *, prefix: str, ttl: float = 30.0):
     return deco
 ```
 
-Three failure modes. **Caching ORM entities is a trap**: a detached SQLAlchemy instance shared across sessions raises `DetachedInstanceError` on lazy attribute access and isn't thread-safe — cache the Pydantic DTO. **Stale-after-write**: invalidate in the same path as the commit, and prefer delete-on-write (a failed delete costs a miss; a failed update leaves poison).
+Three failure modes. **Caching ORM entities is a trap**: a detached SQLAlchemy instance shared across sessions raises `DetachedInstanceError` on lazy attribute access and isn't thread-safe — cache the Pydantic DTO. **Stale-after-write**: invalidate in the same path as the commit, and prefer delete-on-write (a failed delete costs a miss; a failed update leaves poison). **Unbounded key cardinality**: keying on every argument means a caller passing a per-request value (a timestamp, a cursor) evicts everything useful — key on the arguments that actually select the row, and assert a bounded key space in review.
 
 ### 500 requests miss the same cache key at once. Implement singleflight.
 
@@ -24027,7 +24083,11 @@ class Batcher:
                 self._timer = asyncio.get_running_loop().call_later(
                     self._max_latency, lambda: asyncio.create_task(self.flush_now()))
 
-    async def _do_flush(self) -> None:
+    async def flush_now(self) -> None:              # the timer path; takes the SAME lock as add()
+        async with self._lock:
+            await self._do_flush()
+
+    async def _do_flush(self) -> None:              # caller must already hold self._lock
         batch, self._buf = self._buf, []
         if self._timer: self._timer.cancel(); self._timer = None
         if batch: await self._flush(batch)          # a raise here loses the batch -> DLQ it
@@ -24082,9 +24142,10 @@ class Worker:
             t = asyncio.create_task(self._handle(job))
             self._inflight.add(t)                    # strong ref: bare tasks can be GC'd mid-flight
             t.add_done_callback(lambda t: (self._inflight.discard(t), self._sem.release()))
-        _done, pending = await asyncio.wait(self._inflight or {asyncio.sleep(0)},
-                                            timeout=self._drain_timeout)
-        for t in pending: t.cancel()                 # lease expiry re-queues these
+        if self._inflight:                           # asyncio.wait() rejects an empty set, and
+                                                     # since 3.11 it rejects bare coroutines too
+            _done, pending = await asyncio.wait(self._inflight, timeout=self._drain_timeout)
+            for t in pending: t.cancel()             # lease expiry re-queues these
 ```
 
 Abandoned jobs are only safe to drop because at-least-once queues redeliver on lease/visibility-timeout expiry.
@@ -24431,7 +24492,8 @@ async def initiate(req: InitiateUpload, user: CurrentUser, s3: S3Client) -> dict
     if req.content_type not in {"image/png", "image/jpeg", "application/pdf"}:
         raise HTTPException(422, "unsupported type")
     key = f"tenant/{user.tenant_id}/{uuid4()}{Path(req.filename).suffix.lower()[:8]}"  # ours
-    session.add(Upload(id=uuid4(), key=key, owner_id=user.id, state="pending"))
+    session.add(Upload(id=uuid4(), key=key, owner_id=user.id, state="pending",
+                       content_type=req.content_type))   # persisted so complete() can verify it
     await session.commit()
     return s3.generate_presigned_post(       # POST policy enforces size; a presigned PUT cannot
         BUCKET, key, ExpiresIn=900,
@@ -24460,7 +24522,8 @@ async def rows_csv(session: AsyncSession, tenant_id: UUID) -> AsyncIterator[byte
     writer.writerow(["id", "created_at", "email", "total_cents"])
     stmt = (select(Order).where(Order.tenant_id == tenant_id)
             .order_by(Order.id).execution_options(yield_per=1000))
-    result = await session.stream(stmt)                  # real server-side cursor
+    result = await session.stream_scalars(stmt)          # real server-side cursor; scalars, so
+                                                         # partitions yield Order, not Row
     async for partition in result.partitions(1000):
         for o in partition:
             writer.writerow([o.id, o.created_at.isoformat(), o.email, o.total_cents])
@@ -24708,21 +24771,25 @@ class PaymentsClient:
     async def charge(self, idem_key: str, amount_cents: int) -> Charge:
         if not self._breaker.allow(): raise DependencyUnavailable("circuit open")
         for attempt in range(1, 4):
-            allowed, wait = self._limiter.acquire()
-            if not allowed: await asyncio.sleep(wait); continue
+            while True:                                     # waiting for a token is NOT a retry:
+                allowed, wait = self._limiter.acquire()      # never let throttling burn an attempt
+                if allowed: break
+                await asyncio.sleep(wait)
+            backoff = random.uniform(0, min(8.0, 2 ** attempt))       # full jitter, capped
             try:
                 r = await self._client.post("/charges", json={"amount": amount_cents},
                                             headers={"Idempotency-Key": idem_key})  # SAME key
             except httpx.TransportError as e:
                 self._breaker.record(False)
                 if attempt == 3: raise DependencyUnavailable(str(e)) from e
+                await asyncio.sleep(backoff)                 # back off before the next attempt
             else:
                 if r.status_code < 500 and r.status_code != 429:
                     self._breaker.record(True)
                     if r.is_success: return Charge.model_validate(r.json())
                     raise PaymentRejected(r.status_code, r.json())     # 4xx: never retry
                 self._breaker.record(False)
-                await asyncio.sleep(float(r.headers.get("Retry-After", 2 ** attempt)))
+                await asyncio.sleep(float(r.headers.get("Retry-After", backoff)))
         raise DependencyUnavailable("exhausted retries")
 ```
 
@@ -24752,7 +24819,7 @@ async def bench(url: str, *, concurrency=50, duration=30.0) -> dict:
             "p50": p(.50), "p95": p(.95), "p99": p(.99), "max": lat[-1] * 1000}
 ```
 
-Methodology beats code here. **Warm up** first (cold pools, lazy imports, an unwarmed DB buffer cache), use a **realistic dataset** — an endpoint that is 2ms on 100 rows is 900ms on 10M, because the missing index only hurts at scale —. Beware **coordinated omission**: a closed-loop driver stops issuing requests while the server is slow and understates the tail, so use an open-loop tool (`wrk2`, `vegeta -rate`, k6 constant-arrival) for tail-sensitive work. Pair it with a profile of one request (`py-spy record --pid`, or `cProfile` around the handler).
+Methodology beats code here. **Warm up** first (cold pools, lazy imports, an unwarmed DB buffer cache), use a **realistic dataset** — an endpoint that is 2ms on 100 rows is 900ms on 10M, because the missing index only hurts at scale. Beware **coordinated omission**: a closed-loop driver stops issuing requests while the server is slow and understates the tail, so use an open-loop tool (`wrk2`, `vegeta -rate`, k6 constant-arrival) for tail-sensitive work. Pair it with a profile of one request (`py-spy record --pid`, or `cProfile` around the handler).
 
 ---
 
