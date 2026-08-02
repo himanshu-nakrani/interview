@@ -119,7 +119,7 @@ The practical move is to stop trying to reason about it from the outside. Ask tw
 
 They mean genuinely different things and you should care, but not in the direction people assume.
 
-At Google or Meta, staff is a *calibrated* level. There is a written expectation document, a promotion committee, a peer group, and a market rate other companies will honor. If you leave with an L6 stamp, your next recruiter starts you at senior-staff conversations. The title is portable capital.
+At Google or Meta, staff is a *calibrated* level. There is a written expectation document, a promotion committee, a peer group, and a market rate other companies will honor. If you leave with an L6 stamp, your next recruiter starts you at staff-level conversations instead of making you re-argue the level from scratch. The title is portable capital.
 
 At a 200-person AI product company — Cursor, Sierra, Harvey-scale — "staff" is frequently either (a) a title given to make an offer competitive without giving equity, or (b) a genuine description of scope because the company has twelve engineers touching AI and you would own a third of the surface. The scope version is often the better career outcome and the worse portable-title outcome: two years owning the entire retrieval-and-eval stack at a fast company teaches more than two years of L6 at a hyperscaler, but a future recruiter cannot verify the title against a public ladder.
 
@@ -249,7 +249,7 @@ Because the initial grant is a four-year asset and your career is longer than fo
 
 The mechanics vary in ways you must ask about specifically:
 
-**Annual refresh at big-tech** typically grants additional RSUs each year based on performance, vesting over a new 4-year (sometimes 2-year) schedule. Because grants overlap, steady-state vesting after ~4 years is the sum of the tails of four grants. A company granting refreshes at roughly 50–60% of the initial annual rate produces a steady state near your initial run rate; one granting 25% produces a cliff.
+**Annual refresh at big-tech** typically grants additional RSUs each year based on performance, vesting over a new 4-year (sometimes 2-year) schedule. Because grants overlap, steady-state vesting after ~4 years is the sum of the tails of four grants. The arithmetic to internalize: if the refresh grant each year is a fraction *f* of your initial annual vest rate, then once four grants overlap your steady-state vesting is *f* × that initial rate. So refreshes at 50–60% land you at 50–60% of your initial run rate, not level with it; only *f* = 100% holds you flat, and 25% produces a cliff.
 
 **Front-loaded-grant companies** (a large initial grant, small or no refresh) are common at startups. The arithmetic there is brutal at year five.
 
@@ -338,9 +338,9 @@ Headline gap: $297k/yr, or 74%.
 
 **Step 2 — apply the liquidity/outcome discount to the private paper, and state the assumption.** Case A, the lab has run employee tenders in each of the last two years at flat-or-up prices and I have confirmed I would be eligible: discount 35%. Equity becomes 450 × 0.65 = 292.5, total **$542.5k/yr**. Case B, no tender history, double-trigger units, no visible liquidity path: discount 70%. Equity becomes 450 × 0.30 = 135, total **$385k/yr** — now *below* the big-tech offer.
 
-**Step 3 — vesting shape and the tenure assumption.** Both assumed 25% annual here; if the lab's is back-loaded or double-trigger, re-run at a 2-year exit. Under a 2-year exit with double-trigger and no liquidity event, the lab equity realized is **$0** and the comparison is $250k vs (220+33+300) = $553k. That case matters more than people admit, because it is not rare.
+**Step 3 — vesting shape and the tenure assumption.** Both assumed 25% annual here; if the lab's is back-loaded or double-trigger, re-run at a 2-year exit. Under a 2-year exit with double-trigger and no liquidity event, the lab equity realized is **$0**, and the two-year cumulative comparison is 2 × 250 = **$500k** for the lab against 2 × (220+33) + 300 = **$806k** for big-tech. (Keep the units straight here: the lab's $250k is per year, so it has to be doubled before it can sit next to two years of big-tech vesting.) That case matters more than people admit, because it is not rare.
 
-**Step 4 — refresh.** Big-tech: assume a 50% refresh, so steady-state equity stays near $150k/yr indefinitely. Lab: ask. Many fast-growing private companies grant infrequently and the year-five picture is thin. If the lab refreshes at 25%, year five is base 250 + roughly 112 = $362k, while big-tech year five is 220 + 33 + ~140 = $393k. **The 74% headline gap can invert entirely by year five.**
+**Step 4 — refresh.** Big-tech: assume refreshes at 50% of the initial annual vest rate, which by the steady-state arithmetic above settles equity at 0.5 × 150 = **$75k/yr**, not the initial $150k. Lab: ask. Many fast-growing private companies grant infrequently and the year-five picture is thin. If the lab refreshes at 25% of its initial annual rate, its steady state is 0.25 × 450 ≈ $112k/yr, so year five is base 250 + 112 = **$362k nominal**, while big-tech year five is 220 + 33 + 75 = **$328k**. **The 74% headline gap has collapsed to about 10% by year five — and applying the same 35% liquidity discount to the lab's paper (250 + 112 × 0.65 ≈ $323k) inverts it outright.**
 
 **Step 5 — the non-financial terms that are actually worth money.** Concentration risk (my salary and my net worth in the same private bet), tax treatment of the specific instrument (get a CPA — PPU and private-RSU treatment differs and I am not going to pretend to give tax advice), the portability of what I learn, and the level. If the lab role is scoped smaller, I am paying for the logo.
 
@@ -588,7 +588,7 @@ The composite red flag: a team that is off the critical path, fully owned, with 
 
 ### Databricks reportedly requires two to three references from recent managers before extending an offer. How do I prepare for a reference process like that?
 
-Treat references as a stage of the loop, not a formality, because at companies that run them pre-offer they genuinely change outcomes — a lukewarm reference can downgrade a level, and a bad one can end a process that was otherwise finished.
+Treat references as a stage of the loop, not a formality, because at companies that run them pre-offer they genuinely change outcomes — a lukewarm reference can downgrade a level, and a bad one can end a process that was otherwise finished. **📅 Volatile:** take the specific "two to three recent managers, pre-offer" detail as a report about one company's process at one point in time, not a standing rule. Reference policies change, so ask your recruiter what theirs actually is rather than asserting what it is.
 
 **Preparation starts months before you interview, not when they ask.** Maintain three or four people who have managed you or worked adjacently to you, who you have talked to in the last year for reasons unrelated to needing something. This is the unglamorous part and it is the whole game.
 
@@ -630,7 +630,7 @@ Structure — one page, three phases, and it must contain something specific to 
 
 Add a fourth section titled **"What I would not do in the first 90 days"** — do not migrate the framework, do not fine-tune, do not rewrite retrieval. This section is the one that gets remarked on in the debrief, because restraint is the rarest signal in AI engineering and it directly contradicts the reflex the interviewer has seen in the last ten candidates.
 
-**💰 Put one number in it.** "If prefix caching lands on the fixed 8k-token system preamble at 200k calls/day and the provider's cached-input rate is roughly a tenth of the uncached rate, the input cost on that segment falls from 8,000 × 200,000 = 1.6B tokens/day — at $3/Mtok that is $4,800/day — to roughly $480/day, about $130k/month, minus whatever fraction of calls miss the cache." Even if your assumptions are off, the *habit* of quantifying is what scores. **📅 Volatile:** cached-input discounts and per-token prices move constantly — state your source and the date.
+**💰 Put one number in it.** "If prefix caching lands on the fixed 8k-token system preamble at 200k calls/day and the provider's cached-input rate is roughly a tenth of the uncached rate, the input cost on that segment falls from 8,000 × 200,000 = 1.6B tokens/day — at $3/Mtok that is $4,800/day — to roughly $480/day. That is about $4,300/day saved, call it $130k/month, minus whatever fraction of calls miss the cache." Even if your assumptions are off, the *habit* of quantifying is what scores. **📅 Volatile:** cached-input discounts and per-token prices move constantly — state your source and the date.
 
 **⚠ Trap:** a 90-day plan full of things you would build. It reads as arrogance and as someone who has not understood the system. The plan should be roughly 40% learning, 40% measurement, 20% shipping. The ratio itself is the argument.
 

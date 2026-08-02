@@ -115,7 +115,7 @@ J_hand = torch.diag(s) - torch.outer(s, s)
 assert torch.allclose(J_auto, J_hand.detach(), atol=1e-6)
 ```
 
-**⚠ Trap:** materializing the Jacobian in your own custom layer. For a 128k vocabulary that matrix is 128256² × 4 bytes = 65 TB. Backprop never forms a Jacobian; it forms vector-Jacobian products. If your answer to "how does backprop work" involves building J, you've described something that cannot run.
+**⚠ Trap:** materializing the Jacobian in your own custom layer. For a 128k vocabulary that matrix is 128256² × 4 bytes ≈ 65 GB — *per token position*, so a single 2,048-token sequence would need ~134 TB. Backprop never forms a Jacobian; it forms vector-Jacobian products. If your answer to "how does backprop work" involves building J, you've described something that cannot run.
 
 ### Write multi-head attention with einsum, and tell me what einsum buys you over reshape and transpose.
 
@@ -233,7 +233,7 @@ The construction. Take a head dimension d_h and split it into d_h/2 two-dimensio
 
   [x_{2i}, x_{2i+1}] ↦ [x_{2i}cos(mθ_i) − x_{2i+1}sin(mθ_i), x_{2i}sin(mθ_i) + x_{2i+1}cos(mθ_i)].
 
-Stack those 2×2 rotations into a block-diagonal orthogonal matrix R_m ∈ R^{d_h×d_h}, and apply it to **q and k only, never to v**. Each pair rotates at its own frequency: pair 0 rotates once per token (fast, encodes fine local order), the last pair rotates with period ~2π·10000 tokens (slow, encodes coarse global position). It's a positional clock with hands of many different speeds — the same idea as sinusoidal embeddings, but applied multiplicatively to the query/key vectors rather than added to the residual stream.
+Stack those 2×2 rotations into a block-diagonal orthogonal matrix R_m ∈ R^{d_h×d_h}, and apply it to **q and k only, never to v**. Each pair rotates at its own frequency: pair 0 advances by one radian per token, i.e. a full turn every ~6.3 tokens (fast, encodes fine local order), while the last pair rotates with period ~2π·10000 tokens (slow, encodes coarse global position). It's a positional clock with hands of many different speeds — the same idea as sinusoidal embeddings, but applied multiplicatively to the query/key vectors rather than added to the residual stream.
 
 ```python
 def rope(x, base=10000.0):
@@ -272,6 +272,7 @@ Now the consequences, which is where the follow-ups go.
 **Raising the base.** Many long-context models simply train with base = 500,000 or 1,000,000 instead of 10,000, which lengthens every period so the slowest dimensions still haven't wrapped at 128k. **📅 Volatile:** the specific base value per model family changes with each release — check the config, don't quote from memory.
 
 **🗣 Say this in the room:** "R_mᵀR_n = R_{n−m}, so the absolute positions cancel and the score is a function of relative offset only. That's the whole property. It also explains why extrapolation fails — the model has simply never seen those offsets — and why the fixes are all about remapping unseen offsets back into the trained angular range rather than about RoPE being wrong."
+
 ### Where does "2N FLOPs per token" come from? Derive it rather than quoting it.
 
 Mental model: **every parameter in a dense model is a multiply-accumulate that gets used exactly once per token, and a multiply-accumulate is two floating-point operations.** That's the whole derivation. Two FLOPs per parameter per token, so 2N per token forward.
@@ -361,7 +362,7 @@ An 80 GB H100 cannot hold that. This is the number to have memorized, because it
 
 Activations, term 4, with gradient checkpointing at layer granularity: you store only each layer's input, so B·T·d·L·2 bytes. For B = 4, T = 4096, d = 4096, L = 32: 4 × 4096 × 4096 × 32 × 2 = **4.3 GB**. Without checkpointing you store many intermediates per layer — the norm outputs, the qkv projections, the attention output, the MLP's intermediate at d_ff = 3.5d — and the figure is an order of magnitude higher, comfortably 40–80 GB at this shape, which is why nobody trains long-sequence models without checkpointing.
 
-**📐 Numbers you must know:** 16 bytes/param for AdamW mixed precision (2 + 2 + 4 + 8). 2 bytes/param for bf16 inference. 4 bytes/param at int32-free fp32 inference. 1 byte/param at int8, 0.5 at int4. Memorize the 16, because the follow-up question in every training round is "so how do you make it fit?"
+**📐 Numbers you must know:** 16 bytes/param for AdamW mixed precision (2 + 2 + 4 + 8). 2 bytes/param for bf16 inference. 4 bytes/param at fp32 inference. 1 byte/param at int8, 0.5 at int4. Memorize the 16, because the follow-up question in every training round is "so how do you make it fit?"
 
 **⚠ Trap:** forgetting the fp32 master weights. Candidates confidently recite "2 + 2 + 8 = 12 bytes" and get 84 GB, then conclude a 7B fine-tune fits on an 80 GB card — and it doesn't. Mixed precision keeps an fp32 master copy precisely because a bf16 weight has ~8 mantissa bits, and an update of relative size 10⁻⁴ against a weight of order 1 rounds to zero. That master copy is the difference between "fits" and "OOM," and knowing it is a strong tell that you've actually run a training job.
 
@@ -375,7 +376,7 @@ I'd work down this ladder, cheapest intervention first, and I would state the la
 
 **3. Cheaper optimizer state.** 8-bit Adam (bitsandbytes) cuts the moments from 8 bytes to 2, saving 42 GB on a 7B. Adafactor factorizes the second moment into row and column statistics, cutting it to O(d) per matrix instead of O(d²). Both cost some quality; 8-bit Adam costs very little in my experience and is underused.
 
-**4. Shard across GPUs — ZeRO / FSDP.** **📄 Paper:** Rajbhandari et al. (2020), *ZeRO: Memory Optimizations Toward Training Trillion Parameter Models* — partitions optimizer state (stage 1), then gradients (stage 2), then parameters themselves (stage 3) across data-parallel ranks instead of replicating them. On 8 GPUs, ZeRO-2 puts the 84 GB of gradient+optimizer state at 10.5 GB per card; ZeRO-3/FSDP shards the weights too, at the cost of all-gathering them per layer during forward and backward, which is bandwidth you need NVLink to afford.
+**4. Shard across GPUs — ZeRO / FSDP.** **📄 Paper:** Rajbhandari et al. (2020), *ZeRO: Memory Optimizations Toward Training Trillion Parameter Models* — partitions optimizer state (stage 1), then gradients (stage 2), then parameters themselves (stage 3) across data-parallel ranks instead of replicating them. On 8 GPUs, ZeRO-2 puts the 98 GB of gradient+optimizer state (14 grads + 28 master + 56 moments) at 12.25 GB per card; ZeRO-3/FSDP shards the weights too, at the cost of all-gathering them per layer during forward and backward, which is bandwidth you need NVLink to afford.
 
 **5. Reduce the batch, then recover it with gradient accumulation.** Activations scale linearly with micro-batch. Micro-batch 1 with 32 accumulation steps has the same effective batch and the same convergence as micro-batch 32, at a fraction of the activation memory and worse GPU utilization. This is the lever you pull last because it's the one that costs throughput most directly.
 
@@ -399,7 +400,7 @@ At 128k context (131,072 tokens): 131,072 × 327,680 = 4.295 × 10¹⁰ bytes = 
 
 Now the comparison that makes the point about GQA. Llama-2-7B is MHA: L = 32, 32 KV heads, head_dim 128 → 2 × 32 × 32 × 128 × 2 = **512 KiB per token**. Llama-3-8B is GQA-8: 2 × 32 × 8 × 128 × 2 = **128 KiB per token**. **A 7B model with MHA has a 1.6× larger KV cache per token than a 70B model with GQA.** State that in an interview and watch the room reorder its priors: KV cache size is governed by architecture, not by parameter count.
 
-**📐 Numbers you must know:** 128 KiB/token for an 8B GQA-8 model; 320 KiB/token for a 70B GQA-8 model; ×8 if the model is MHA; ÷2 if you quantize the cache to fp8. Multiply by context length, then by concurrency. This is the single most-asked arithmetic in an inference-serving round.
+**📐 Numbers you must know:** 128 KiB/token for an 8B GQA-8 model; 320 KiB/token for a 70B GQA-8 model; if the model is MHA instead, multiply by n_query_heads/n_kv_heads — ×4 for the 32-head 8B (512 KiB/token), ×8 for the 64-head 70B (2.5 MiB/token); ÷2 if you quantize the cache to fp8. Multiply by context length, then by concurrency. This is the single most-asked arithmetic in an inference-serving round.
 
 **💰 Math on why this is the capacity planner:** an 8B model on one H100 (80 GB) has 16 GB of weights, leaving ~60 GB for cache after activations and overhead. At 128 KiB/token that's 60e9/131072 ≈ **458,000 tokens of total cache**. Sixty-four concurrent users at 8k context each = 512k tokens — you're already over. At 4k each, 256k tokens, you fit with room. Your maximum concurrency is a division problem, and the number that comes out of it is what your autoscaler should be tracking instead of CPU.
 
@@ -441,8 +442,8 @@ Arithmetic intensity = FLOPs performed / bytes moved from HBM. The machine's bal
 2. **Time to move them.** H100 SXM HBM3 bandwidth is 3.35 TB/s = 3,350 GB/s. 14 / 3,350 = **4.18 ms per token**.
 3. **Theoretical ceiling.** 1 / 0.00418 = **239 tokens/second**.
 4. **Apply achieved-bandwidth efficiency.** Real kernels hit 70–85% of peak HBM bandwidth. At 78%: 239 × 0.78 ≈ **186 tok/s**.
-5. **Add the KV cache read.** At 4k context with a GQA-8 7B-class model (128 KiB/token), the cache is 4,096 × 131,072 = 0.54 GB — about 3.8% on top of the 14 GB, so ~180 tok/s. At 128k context the cache is 16.8 GB, *larger than the weights*, and per-token traffic goes from 14 GB to 30.8 GB: throughput drops to roughly 186 × (14/30.8) ≈ **85 tok/s**. Same model, same GPU, 2.2× slower purely from cache traffic.
-6. **Sanity check against reality.** Published single-stream numbers for 7–8B models on an H100 with a good engine land in the 100–180 tok/s range. The estimate is in the right place, which is what a first-principles estimate is for.
+5. **Add the KV cache read.** At 4k context with a GQA-8 7B-class model (128 KiB/token), the cache is 4,096 × 131,072 = 0.54 GB — about 3.8% on top of the 14 GB, so ~180 tok/s. At 128k context the cache is 131,072 × 131,072 = 1.72 × 10¹⁰ bytes = 17.2 GB (16 GiB), *larger than the weights*, and per-token traffic goes from 14 GB to 31.2 GB: throughput drops to roughly 186 × (14/31.2) ≈ **83 tok/s**. Same model, same GPU, 2.2× slower purely from cache traffic.
+6. **Sanity check against reality.** Published single-stream numbers for 7–8B models on an H100 with a good engine land in roughly the 100–180 tok/s range. The estimate is in the right place, which is what a first-principles estimate is for. **📅 Volatile:** that band is an engine-and-version snapshot, not a hardware constant — kernel improvements move it; re-derive from bandwidth rather than quoting a remembered number.
 
 Two follow-ups worth pre-empting. **"How would you double it?"** Quantize the weights to fp8 or int8 — 7 GB instead of 14, so ~2× on the weight-read term, which is the dominant term at short context. That is the single highest-leverage change to single-stream latency, and it is why every latency-sensitive deployment is quantized. **"And if I need 10× ?"** You can't get it from one stream on one card; you change the problem — speculative decoding (verify k drafted tokens per weight-read, 2–3× realistic), or accept that per-stream latency is bandwidth-bound and optimize throughput per dollar via batching instead.
 
@@ -488,11 +489,12 @@ The rule that makes this derivable rather than memorized, and the one I'd give a
 Two follow-ups that show up. **"Why is the W gradient summed over the batch?"** Because W is shared across all B·T token positions — every position contributed to the loss through the same weights, and the chain rule sums contributions over all paths. This is also why the weight-gradient matmul reduces over the biggest axis and is therefore the memory-traffic-heavy half of the backward. **"What if there's a bias?"** ∂L/∂b = G summed over B and T, giving `[d_out]` — same logic, same reduction.
 
 **🏋 Drill:** 6 minutes, blank page, no autocomplete. Write the forward and backward for a two-layer MLP with GELU by hand — `h = gelu(xW1 + b1); y = hW2 + b2` — and produce all six gradients with their shapes. Then verify against autograd with `torch.autograd.gradcheck` on float64 inputs of shape `[4, 8]`. Pass criterion: gradcheck returns True on your first submission. Most people get W2 and b2 right and fumble the GELU derivative chain into W1 — that's the part worth rehearsing.
+
 ### Someone says "softmax is just a Boltzmann distribution." Unpack that, and tell me what temperature physically is.
 
 Mental model: **the softmax is the maximum-entropy distribution consistent with a set of energies, and the logits are negative energies.** In statistical mechanics, a system in thermal equilibrium occupies state i with probability p_i ∝ exp(−E_i / kT). Set E_i = −z_i and absorb k, and you get p_i ∝ exp(z_i/T), which is the softmax with temperature. That is not an analogy — it is the same functional form derived from the same variational principle (maximize entropy subject to a fixed expected energy), and knowing that is why the temperature parameter behaves the way it does rather than being a magic knob.
 
-The physics gives you the intuition for free. **Temperature is inverse inverse-coldness**: write β = 1/T and p_i ∝ exp(βz_i). Large β (low temperature) means the system settles into its lowest-energy state — the argmax. Small β (high temperature) means thermal noise swamps the energy differences and every state becomes equiprobable. The entropy of the distribution is monotonically increasing in T. In sampling terms:
+The physics gives you the intuition for free. **Temperature is the reciprocal of β, the "inverse temperature" (coldness)**: write β = 1/T and p_i ∝ exp(βz_i). Large β (low temperature) means the system settles into its lowest-energy state — the argmax. Small β (high temperature) means thermal noise swamps the energy differences and every state becomes equiprobable. The entropy of the distribution is monotonically increasing in T. In sampling terms:
 
 - **T → 0⁺:** the distribution converges to a point mass on argmax(z). Greedy decoding.
 - **T = 1:** the model's calibrated distribution, i.e. the one it was trained to produce by minimizing cross-entropy.
@@ -732,6 +734,7 @@ The mitigations, and each is worth naming:
 - **Token-level rather than sequence-level ratios**, so you never multiply hundreds of ratios together.
 
 **🔍 Failure taxonomy — RL run destabilizes mid-training:** (1) Plot the distribution of importance ratios per batch; if the tail exceeds ~3–5, the policy has drifted too far — reduce epochs per batch or raise β. (2) Plot the fraction of tokens hitting the clip boundary; above ~20% you are mostly training on a clipped, biased signal. (3) Plot ESS; a collapse precedes the loss blowup by many steps and is your best early warning. (4) **Check for a sampling/training numerics mismatch** — if you generate rollouts with an inference engine and compute log-probs in a training framework, kernel and precision differences make π_old subtly wrong, so your ratios are wrong even at step 0. This is a real, common, and extremely confusing production bug in RLHF pipelines; the diagnostic is to recompute log-probs of the generated tokens in *both* stacks and compare them directly before you debug anything else.
+
 ### What does it mean for a model to be calibrated, and why should I care as an applied engineer rather than a researcher?
 
 Mental model: **calibration is the property that lets you build a control flow on top of a probabilistic component.** A model is calibrated if, among all the cases where it says 80%, it is right 80% of the time. That is not a statement about accuracy — a coin-flip predictor that always says "50%" is perfectly calibrated and useless. It is a statement about whether the *number* the model attaches to its answer means anything, and everything you want to build on top of an LLM — cascades, abstention, human escalation, selective automation — is a threshold on that number.
@@ -912,7 +915,7 @@ The cells a and d — where both agree — carry *no information about which is 
 
 When b + c < 25, skip the approximation and run the exact binomial test of b successes out of b + c trials against p = 0.5.
 
-**Worked example on the 500-item case from earlier.** Suppose A scored 76%, B scored 78%, and the table is a = 370, b = 25 (A right, B wrong), c = 35 (A wrong, B right), d = 70. The net is (35 − 25)/500 = +2 points, matching. Now:
+**Worked example on the 500-item case from earlier.** Suppose A scored 76%, B scored 78%, and the table is a = 355, b = 25 (A right, B wrong), c = 35 (A wrong, B right), d = 85 — so A is right on a + b = 380 = 76% and B on a + c = 390 = 78%, as claimed. The net is (35 − 25)/500 = +2 points, matching. Now:
 
   χ² = (|35 − 25| − 1)² / (35 + 25) = 9² / 60 = 81/60 = **1.35**, p ≈ **0.245**.
 
@@ -1040,7 +1043,7 @@ Mechanically you build a per-token label tensor that is a copy of `input_ids` wi
 3. *EOS not supervised.* Symptom: perfect-looking eval loss, but generation never stops and runs to `max_new_tokens` every time. This one gets shipped constantly.
 4. *Off-by-one at the span boundary.* Symptom: the model reliably drops or duplicates the first token of every response.
 
-**💰 Math:** the cost of getting this wrong is not compute, it is a wasted run. A 7B full-finetune on 100k examples averaging 1,200 tokens is 1.2e8 tokens; at roughly 6·N·D FLOPs that is 6 × 7e9 × 1.2e8 ≈ 5.0e18 FLOPs. On 8×H100 at a realistic 400 TFLOP/s each — 3.2e15 FLOP/s aggregate — that is 5.0e18 / 3.2e15 ≈ 1,570 s of pure math, call it ~1 hour wall clock with overheads, so ~$25–40 of GPU time. Cheap. The expensive part is the three days of eval confusion before someone decodes the label tensor.
+**💰 Math:** the cost of getting this wrong is not compute, it is a wasted run. A 7B full-finetune on 100k examples averaging 1,200 tokens is 1.2e8 tokens; at roughly 6·N·D FLOPs that is 6 × 7e9 × 1.2e8 ≈ 5.0e18 FLOPs. On 8×H100 at a realistic 400 TFLOP/s each — 3.2e15 FLOP/s aggregate — that is 5.0e18 / 3.2e15 ≈ 1,570 s of pure math, call it ~1 hour wall clock with overheads, so `8 × 1 × $2.50 ≈ $20` of GPU time (**📅 Volatile:** on-demand H100 rates move; the structure of the calculation is the durable part). Cheap. The expensive part is the three days of eval confusion before someone decodes the label tensor.
 
 **🏋 Drill:** given a tokenized multi-turn chat, write the label-masking function unaided in 10 minutes and then assert that `tokenizer.decode(input_ids[labels != -100])` equals exactly the concatenated assistant turns plus their end-of-turn tokens. Pass criterion: the assertion passes on a 3-turn example on the first run.
 
@@ -1350,7 +1353,7 @@ The diagnostic procedure: at step 0, compute the theoretical random-init loss by
 
 ### Derive Adam from SGD. I want to know what each of the two moments is buying you.
 
-Start from plain SGD: `θ ← θ − η·g`. Its defect is that a single global `η` must serve every parameter, but gradient magnitudes across a transformer differ by orders of magnitude — embedding rows for rare tokens get gradient roughly `1/frequency` of common ones, LayerNorm gains get tiny gradients, attention output projections get large ones. Any `η` that moves the small-gradient parameters will blow up the large-gradient ones.
+Start from plain SGD: `θ ← θ − η·g`. Its defect is that a single global `η` must serve every parameter, but gradient magnitudes across a transformer differ by orders of magnitude — an embedding row accumulates gradient only on the steps where its token appears, so a rare token's row gets a gradient smaller than a common one's roughly in proportion to their frequency ratio, LayerNorm gains get tiny gradients, attention output projections get large ones. Any `η` that moves the small-gradient parameters will blow up the large-gradient ones.
 
 **Momentum** fixes a different problem: gradient noise. `m ← β₁·m + (1−β₁)·g` is an exponential moving average with an effective window of `1/(1−β₁)` steps — at `β₁ = 0.9` that is a 10-step average. It attenuates the stochastic component of the minibatch gradient while preserving the consistent component, which is a low-pass filter, exactly the same device as an EWMA on a noisy metric before you alert on it.
 
@@ -1579,7 +1582,7 @@ The layouts:
 
 bf16 is literally fp32 with 16 mantissa bits chopped off — the exponent field is identical, so conversion is a truncation and the *range* is the same as fp32. That single property is why bf16 killed fp16 for training.
 
-What it buys, concretely. In fp16, gradient values below ~6e-5 flush to zero, and late-training gradients in a large transformer routinely live at 1e-6 to 1e-8. So fp16 training requires **loss scaling**: multiply the loss by a large factor `S` (e.g. 2^16) before backward so gradients land in representable range, then divide by `S` before the optimizer step. And because the right `S` changes over the run, you need a *dynamic* scaler that detects `inf`/`NaN` in the gradients, skips that step, and halves `S` — a control loop that skips real training steps and adds a synchronization point. bf16 has fp32's range, so gradients never underflow, so loss scaling is unnecessary and the whole GradScaler apparatus disappears.
+What it buys, concretely. In fp16, gradient values below ~6.1e-5 fall out of the normal range into the subnormals, where you lose mantissa bits one at a time until true flush-to-zero at ~6e-8 — and late-training gradients in a large transformer routinely live at 1e-6 to 1e-8, squarely inside that lossy band (or below it). So fp16 training requires **loss scaling**: multiply the loss by a large factor `S` (e.g. 2^16) before backward so gradients land in representable range, then divide by `S` before the optimizer step. And because the right `S` changes over the run, you need a *dynamic* scaler that detects `inf`/`NaN` in the gradients, skips that step, and halves `S` — a control loop that skips real training steps and adds a synchronization point. bf16 has fp32's range, so gradients never underflow, so loss scaling is unnecessary and the whole GradScaler apparatus disappears.
 
 The cost: 7 mantissa bits gives roughly 2–3 decimal digits of precision, so bf16 accumulation error is much larger than fp16's. This is fine because you never accumulate in bf16 — matmuls accumulate in fp32 inside the tensor core, and everything sensitive is upcast.
 
@@ -1757,7 +1760,7 @@ Summing the linear-in-`T` terms: roughly `(1+1+3+1+1+4+4)·B·T·d = 15·B·T·d
 
 That second number is the entire argument for FlashAttention in one line: it never materializes the `T×T` matrix, so the quadratic activation term drops out completely and you are left with the ~34 GB linear part. Add gradient checkpointing at block granularity and the stored-per-block term collapses to just the block inputs — `32 × 8192 × 4096 × 2 = 2.1 GB` for the whole model — at the cost of ~33% more compute.
 
-**📐 Numbers you must know:** **activations without FlashAttention and without checkpointing are dominated by `B·h·T²` per layer** — it is the term that makes long context impossible naively. **With FlashAttention, activations are ≈ `16·B·T·d·L` bytes in bf16**, which for the 8B/8k/batch-1 case is 34 GB. Both numbers are worth carrying.
+**📐 Numbers you must know:** **activations without FlashAttention and without checkpointing are dominated by `B·h·T²` per layer** — it is the term that makes long context impossible naively. **With FlashAttention, activations are ≈ `16·B·T·d·L` *elements*, i.e. `32·B·T·d·L` bytes in bf16**, which for the 8B/8k/batch-1 case is 34 GB. Both numbers are worth carrying — and carry the units with them, because the factor-of-2 between elements and bf16 bytes is exactly the slip that turns a "fits" into an OOM.
 
 **⚠ Trap:** believing FlashAttention reduces *KV-cache* memory. It does not — it reduces *attention activation* memory during training and prefill by never writing the score matrix to HBM. KV cache is a serving-time structure and is entirely unaffected. Conflating the two is a fast way to lose credibility in a serving round.
 
@@ -2073,7 +2076,7 @@ def adamw_step(p, g, m, v, t, lr, b1=0.9, b2=0.95, eps=1e-8, wd=0.1):
 
 Use these three formulas, which you should be able to write without hesitation:
 - **Persistent state (full FT, AdamW mixed precision)** = `16 bytes × params`
-- **Activations with FlashAttention, no checkpointing** ≈ `16 × B × T × d × L` bytes in bf16
+- **Activations with FlashAttention, no checkpointing** ≈ `16 × B × T × d × L` elements, i.e. `32 × B × T × d × L` bytes in bf16
 - **KV cache per token** = `2 × n_layers × n_kv_heads × d_head × bytes_per_elem`
 
 **Case 1.** Full fine-tune, 8B params, 1×H100 80 GB. → `8e9 × 16 = 128 GB` of persistent state alone. No fit, not close. Remedy: LoRA (frozen base is `8e9 × 2 = 16 GB`, adapter optimizer state is negligible) or shard across nodes. Note that gradient checkpointing does *not* help here — it touches activations, and activations are not the problem.
@@ -2145,7 +2148,11 @@ The mental model: extraction from a fixed layout is a parsing problem, and parse
 The mechanism I ship: text layer via `pdfplumber` or `pypdf` (or `pdftotext -layout` if the layout is column-sensitive), then anchored regex or positional extraction, then a validator — invoice number matches the vendor's known format, date parses and is within 400 days, total is a decimal that equals the sum of line items. Three layers, all deterministic.
 
 ```python
-import re, datetime
+import re
+from decimal import Decimal
+
+class ExtractionMiss(Exception): pass
+
 INV = re.compile(r"Invoice\s*(?:No\.?|#)\s*[:\-]?\s*([A-Z]{2,4}-\d{6,8})", re.I)
 TOT = re.compile(r"Total\s+Due\s*[:\-]?\s*\$?([\d,]+\.\d{2})", re.I)
 
@@ -2181,7 +2188,7 @@ route = QUEUES[top] if conf >= 0.62 else "escalate_to_llm"
 
 That last line is the whole design. You do not replace the LLM; you demote it to the abstention branch. Calibrate the threshold on held-out data to hit whatever routing accuracy the support org demands, and the fraction of traffic above threshold is your cost saving.
 
-**💰 Math:** 5,000 tickets/day = 150k/month. LLM path at ~900 input tokens, 15 output tokens: 900 × 3e-6 + 15 × 15e-6 = $0.0027 + $0.000225 ≈ **$0.0029/ticket** → **$437/month**, p50 ~700 ms. Classifier path: embedding at ~$0.02/Mtok is 900 × 2e-8 = $0.000018/ticket → **$2.70/month**, and the logistic regression forward pass is a 1024×12 matmul, roughly 25 μs. If 85% clears the threshold, you pay $2.70 + 0.15 × $437 = **$68/month**. The dollars are small at this volume; the interesting number is latency — routing becomes synchronous and sub-millisecond instead of a 700 ms async job, which changes the product.
+**💰 Math:** 5,000 tickets/day = 150k/month. LLM path at ~900 input tokens, 15 output tokens: 900 × 3e-6 + 15 × 15e-6 = $0.0027 + $0.000225 ≈ **$0.0029/ticket** → **$439/month**, p50 ~700 ms. Classifier path: embedding at ~$0.02/Mtok is 900 × 2e-8 = $0.000018/ticket → **$2.70/month**, and the logistic regression forward pass is a 1024×12 matmul, roughly 25 μs. If 85% clears the threshold, you pay $2.70 + 0.15 × $439 = **$69/month**. The dollars are small at this volume; the interesting number is latency — routing becomes synchronous and sub-millisecond instead of a 700 ms async job, which changes the product.
 
 **🗣 Say this in the room:** "Twelve fixed labels with three months of human-corrected routing history is a supervised problem, not a generation problem. I'd fit a linear head on embeddings, calibrate an abstention threshold, and keep the LLM strictly for the low-confidence tail. The win isn't the $370 a month — it's that routing becomes deterministic, testable, and 25 μs."
 
@@ -2241,13 +2248,13 @@ Three tiers, and I would build them in this order.
 
 **⚠ Trap:** the semantic cache returns a *semantically close, factually wrong* answer. "How do I cancel my Pro plan?" and "How do I cancel my Team plan?" sit at cosine ~0.94 with most embedding models, and they have different answers. A threshold tuned on a similarity histogram rather than on labeled pairs will absolutely serve one for the other. Three rules I enforce: (a) the threshold is chosen on a hand-labeled set of near-miss pairs, not on the score distribution; (b) anything the query distinguishes by a *named entity* — plan name, product, version, region — is excluded from semantic caching entirely, or the entity is part of the cache key; (c) personalized or account-scoped answers are never semantically cached, only exact-cached within a user scope.
 
-**💰 Math:** 1M chats/month, RAG-flavored, ~6k input tokens and 400 output tokens each. Uncached: 6,000 × 3e-6 + 400 × 15e-6 = $0.018 + $0.006 = **$0.024/chat** → **$24,000/month**. Now layer it: 35% curated (free), 8% exact-hit (free), 20% semantic-hit (embedding only, ~$0.0001) — that leaves 37% hitting the model, so 370,000 × $0.024 = **$8,880**, plus ~$100 of embedding, ≈ **$9,000/month**. A **62% reduction**, and the 43% served from tiers 1–2 comes back in ~8 ms instead of ~4 s.
+**💰 Math:** 1M chats/month, RAG-flavored, ~6k input tokens and 400 output tokens each. Uncached: 6,000 × 3e-6 + 400 × 15e-6 = $0.018 + $0.006 = **$0.024/chat** → **$24,000/month**. Now layer it: 35% curated (free), 8% exact-hit (free), 20% semantic-hit (embedding only, ~$0.0001) — that leaves 37% hitting the model, so 370,000 × $0.024 = **$8,880**, plus ~$100 of embedding, ≈ **$9,000/month**. A **62% reduction**, and the 43% served from tiers 1–2 comes back in ~8 ms instead of ~4 s. **📅 Volatile:** the $3/$15 per-Mtok figure is a placeholder frontier price — re-derive with your provider's current rate card.
 
 And note what else you get: the curated tier is your regression suite. Those 200 questions with approved answers are exactly the eval set you were going to have to build anyway.
 
 ### Give me the full comparison: a 200-line scikit-learn model versus a frontier API, at one million requests a month. Cost, latency, accuracy — all of it.
 
-Let me fix a concrete task so the numbers mean something: binary content classification — does this user-generated post violate policy — at 1M posts/month (~23 QPS average, ~70 QPS peak), with 1.2% positives and 50k human-labeled examples in hand.
+Let me fix a concrete task so the numbers mean something: binary content classification — does this user-generated post violate policy — at 1M posts/month (~0.4 QPS average, call it ~1.5 QPS at peak), with 1.2% positives and 50k human-labeled examples in hand.
 
 **Cost.** The sklearn path is a gradient-boosted tree over TF-IDF plus a few hand features, or logistic regression over embeddings. Say embeddings: 1M × 300 tokens × $0.02/Mtok = 300M tokens × 2e-8 = **$6/month** for embedding, plus inference on two `c6i.large` instances for redundancy at ~$62/month each = **$130/month all-in**. The frontier path at ~450 input tokens (post + a compact policy prompt) and 8 output tokens: 450 × 3e-6 + 8 × 15e-6 = $0.00135 + $0.00012 = **$0.00147/post** → **$1,470/month**. With prompt caching on a 2,000-token policy preamble at a 90% cached-input discount, the cached portion costs 2,000 × 3e-7 = $0.0006 instead of $0.006 — but note the preamble was not in my 450 tokens, so realistically the honest comparison is **$1,470–$2,000/month vs $130/month, roughly 11–15×**. Using a small hosted model at ~$0.15/Mtok input instead: 450 × 1.5e-7 = $0.0000675 → **$68/month**, which is genuinely competitive. **📅 Volatile:** all four prices need re-verification.
 
@@ -2279,7 +2286,7 @@ Worked example, delivered end to end:
 
 **🗣 Say this in the room:** "A model is what I reach for when the input format is unbounded or the output space is open and I don't have labels. Here neither is true — twelve fixed queues and three months of human-corrected routing history — so I'd fit a linear classifier on embeddings and calibrate an abstention threshold. I'd still use the model in two places: it labels the bootstrap set for a new queue before I have data, and it takes the low-confidence tail. That's a 25-microsecond p50 on 85% of traffic and the model spending its budget where it actually adds information."
 
-Two calibration notes. First, **read the room's incentive**. If you are interviewing at a company whose product *is* an LLM product, the gate question is usually testing whether you know the boundary, not whether you will refuse — so lead with the LLM's genuine strengths and be crisp about the carve-out. Second, **if they push back, hold the line with a number, not with conviction.** "At 70 QPS peak with a 50 ms budget, no API round trip fits — that's the constraint, not a preference" ends the argument. Restating your opinion louder does not.
+Two calibration notes. First, **read the room's incentive**. If you are interviewing at a company whose product *is* an LLM product, the gate question is usually testing whether you know the boundary, not whether you will refuse — so lead with the LLM's genuine strengths and be crisp about the carve-out. Second, **if they push back, hold the line with a number, not with conviction.** "With a 50 ms end-to-end budget and a synchronous block-before-publish path, no API round trip fits — that's the constraint, not a preference" ends the argument. Restating your opinion louder does not.
 
 ### Fine — flip it. What are the positive criteria that make an LLM genuinely the right call?
 
@@ -2859,7 +2866,7 @@ Three architectural branches came out of the transformer, and the family tree is
 
 What still matters in a 2026 stack, honestly:
 
-- **Encoder-only models are alive and important**, just not as chatbots. Every retrieval embedding model and every cross-encoder reranker you deploy is an encoder — bidirectional attention is *strictly better* for producing a single representation of a fixed text, because a causal encoder's early tokens cannot see the later ones. When someone asks why your embedding model is bidirectional but your generator is causal, that is the answer. Encoders are also still the right tool for classification and token tagging when latency matters: a small encoder classifier runs in single-digit milliseconds on CPU.
+- **Encoder-only models are alive and important**, just not as chatbots. Every retrieval embedding model and every cross-encoder reranker you deploy is an encoder — bidirectional attention is the natural fit for producing a single representation of a fixed text, because under a causal mask the early tokens cannot see the later ones and last-token pooling has to carry everything. When someone asks why your embedding model is bidirectional but your generator is causal, that is the answer. State it as an architectural default rather than a law, though: decoder-only backbones adapted for embeddings — with bidirectional fine-tuning or pooling tricks — now score at the top of public retrieval leaderboards, so the bidirectional advantage is about efficiency per parameter more than it is a hard ceiling. Encoders are also still the right tool for classification and token tagging when latency matters: a small encoder classifier runs in single-digit milliseconds on CPU.
 - **Encoder-decoder survives in narrower niches** — translation, some speech and multimodal connectors — but the decoder-only branch absorbed most of what T5 was used for, because a single causal stack with a long context does conditional generation perfectly well and is simpler to serve.
 - **BERT-as-a-fine-tuned-classifier is still, frequently, the right answer** to the classification problems in this section. A fine-tuned small encoder at 5 ms and effectively zero marginal cost, beating a frontier API on your specific labeled task, is the classical-ML punchline of Part I dressed in transformer clothing.
 
@@ -2875,7 +2882,7 @@ Two structural properties, and both are about *shape*, not quality. I want to be
 
 The cost of both is explicit and worth stating so the answer is balanced: self-attention is `O(T²·d)` in compute and `O(T²)` in attention memory per head in the naive formulation, against the RNN's `O(T·d²)` and `O(T)`. Transformers traded an asymptotically worse dependence on sequence length for a dramatically better *constant factor on real hardware* and a vastly better gradient path — and then the field spent the following years reclaiming the quadratic term with FlashAttention-style tiling, sparse and sliding-window patterns, and KV-cache engineering.
 
-**📐 Numbers you must know:** at `T = 1,024` and `d = 1,024`, `T²·d = 1.07e9` versus `T·d² = 1.07e9` — exactly equal, which is the useful crossover to remember. The quadratic term only dominates above `T ≈ d`. That is why quadratic attention was a non-issue at the original 512-token context and became the central engineering problem at 128k, where `T²·d` is `128000² × 1024 ≈ 1.7e13` per layer per head-group and `T·d²` would be `1.3e11` — a factor of 128 apart. Being able to produce this crossover on demand is a strong signal.
+**📐 Numbers you must know:** at `T = 1,024` and `d = 1,024`, `T²·d = 1.07e9` versus `T·d² = 1.07e9` — exactly equal, which is the useful crossover to remember. The quadratic term only dominates above `T ≈ d`. That is why quadratic attention was a non-issue at the original 512-token context and became the central engineering problem at 128k, where `T²·d` is `128000² × 1024 ≈ 1.7e13` per layer per head-group and `T·d²` would be `1.3e11` — a factor of 125 apart, which is just `T/d`. Being able to produce this crossover on demand is a strong signal.
 
 **🗣 Say this in the room:** "Two reasons, both structural. Attention has O(1) sequential operations across the sequence where an RNN has O(T), so training saturates the hardware instead of serializing. And the path between any two positions is one hop instead of T, so long-range gradients don't decay geometrically. The price is O(T²) attention, which was irrelevant at 512 tokens and became the whole engineering problem at 128k."
 

@@ -358,7 +358,7 @@ The failure chain if you do nothing: the upload succeeds, the request handler ho
 
 The design. **Bound at the edge:** a max upload size and a max page count, both configurable, both returning a structured 413 with the actual limits in the body. **Decouple ingestion from the request:** upload writes to object storage and enqueues a job; the API returns a job ID immediately and the client polls or subscribes. Even in a take-home where the "queue" is a background task and SQLite, the *seam* being in the right place is what's graded. **Stream the parse:** page by page, never materializing the whole document as one string; chunk and embed in batches of, say, 64 chunks so a 900-page document is a bounded number of bounded allocations. **Make it resumable:** record `pages_completed` so a crash at page 700 doesn't restart at zero. **Backpressure:** ingestion concurrency capped so a bulk upload can't starve query traffic — separate pools for ingest and serve, which is a distinction you already make between batch and interactive workloads.
 
-Then the quality problem, which is the part specific to this domain and which most candidates miss: **a 900-page document breaks retrieval, not just ingestion.** One document contributing 3,000 chunks will dominate top-k for every query in its topic, crowding out the ten other documents that were more relevant. Mitigations: per-document diversity caps in retrieval (at most 3 chunks from any one document in the top 8), and hierarchical retrieval — first find the relevant *section* by summary embedding, then retrieve chunks within it.
+Then the quality problem, which is the part specific to this domain and which most candidates miss: **a 900-page document breaks retrieval, not just ingestion.** One document contributing ~1,000 chunks (900 pages × ~500 tokens ÷ 512-token chunks, plus overlap) will dominate top-k for every query in its topic, crowding out the ten other documents that were more relevant. Mitigations: per-document diversity caps in retrieval (at most 3 chunks from any one document in the top 8), and hierarchical retrieval — first find the relevant *section* by summary embedding, then retrieve chunks within it.
 
 **💰 Math:** 900 pages × ~500 tokens = 450,000 tokens. Embedding at $0.10/Mtok = **$0.045** — trivial. But if you'd naively tried to summarize the whole document with a model at $3/Mtok input, that's 450,000 × 3/1e6 = **$1.35 for one upload**, and ten of those a day is $405/month for a feature nobody asked for. The cost asymmetry between embedding and generating over long documents is worth stating out loud; it's the reason "just put the whole document in the context window" is usually the wrong answer even when it fits.
 
@@ -451,7 +451,7 @@ Handle it as a *recoverable, in-band* error, because it is one, and the naive al
 
 I build it, and I open the README with an argument for collapsing it to two, because **the number of agents in a spec is usually a description of a human org chart rather than a technical requirement, and multiplying agents multiplies failure modes without multiplying capability.** Saying that respectfully, while still delivering what was asked, is exactly the judgment the assignment is testing — this is a spec that punishes obedience.
 
-**The technical case for collapsing.** Every agent boundary is a lossy serialization: agent A's rich internal state becomes a text blob, and agent B re-reads it with none of A's context. Five agents means four such boundaries, each a place where a nuance is dropped and a hallucination is laundered into an assertion. It also means five model calls minimum where one or two would do — five sequential calls at ~4s each is 20 seconds of latency and roughly 5× the token cost, with the full document re-sent at nearly every stage.
+**The technical case for collapsing.** Every agent boundary is a lossy serialization: agent A's rich internal state becomes a text blob, and agent B re-reads it with none of A's context. Five agents means four such boundaries, each a place where a nuance is dropped and a hallucination is laundered into an assertion. It also means five model calls minimum where one or two would do — five sequential calls at ~4s each is 20 seconds of latency and roughly 2.3× the token cost of a collapsed two-node version (the arithmetic is below), with the full document re-sent at nearly every stage.
 
 **💰 Math:** a 2,000-word article is ~2,700 tokens. Researcher: 1,500 in / 2,000 out. Writer: 3,500 in / 2,700 out. Editor: 6,200 in / 2,700 out. Fact-checker: 6,200 in / 800 out. Publisher: 3,000 in / 200 out. Totals: 20,400 in, 8,400 out. At $3/$15 per Mtok (📅 Volatile): 20,400 × 3/1e6 + 8,400 × 15/1e6 = $0.0612 + $0.126 = **$0.187 per article.** Collapse to writer + verifier: ~9,700 in, 3,500 out = $0.029 + $0.053 = **$0.082**, a 56% cut and roughly half the latency. That arithmetic is the argument, and having it ready is what makes the pushback credible rather than lazy.
 
@@ -551,7 +551,7 @@ A two-hour cap is a scoping test, and the scoping decision is the deliverable. I
 
 **The approval-gate design, which is the conceptual core.** Approval is a **state machine with durable state**, not a callback: `proposed → approved → executed` and `proposed → rejected`, with the execution step keyed on the action ID so a double-approve is a no-op. Approvals expire — a proposal older than 24 hours moves to `stale` and requires re-generation, because approving a two-day-old draft reply to a live thread is a real-world hazard. Every transition is logged with the actor. And the human sees the *reasoning and the evidence*, not just the proposed action, because an approver who can't evaluate the reasoning becomes a rubber stamp within a week — which is the failure mode that quietly destroys human-in-the-loop systems.
 
-**The asymmetry that drives the policy:** auto-archiving an urgent customer email costs a real relationship; sending an unnecessary item to the approval queue costs about 15 seconds. So the thresholds are deliberately conservative in one direction, and I say so with the arithmetic. **💰 Math:** at 200 emails/day, if 60% auto-archive and 40% queue, the human reviews 80 items × 15s = **20 minutes/day**, down from ~90 minutes of reading everything — a 78% reduction. Model cost: 200 × (1,200 in + 300 out) at $0.25/$1.25 per Mtok = 200 × ($0.0003 + $0.000375) = **$0.135/day**. Roughly **$4/month to save 23 hours/month**, which is the sentence that makes the business case in one line.
+**The asymmetry that drives the policy:** auto-archiving an urgent customer email costs a real relationship; sending an unnecessary item to the approval queue costs about 15 seconds. So the thresholds are deliberately conservative in one direction, and I say so with the arithmetic. **💰 Math:** at 200 emails/day, if 60% auto-archive and 40% queue, the human reviews 80 items × 15s = **20 minutes/day**, down from ~90 minutes of reading everything — a 78% reduction. Model cost: 200 × (1,200 in + 300 out) at $0.25/$1.25 per Mtok (📅 Volatile) = 200 × ($0.0003 + $0.000375) = **$0.135/day**. That's 70 minutes/day saved for about 13.5 cents/day — roughly **$4/month to save 35 hours/month** on a 30-day basis (about $3 and 23 hours if you count only working days) — which is the sentence that makes the business case in one line.
 
 **🗣 Say this in the room:** "Under a two-hour cap I'd cut live mail integration entirely and work from a seeded fixture, because OAuth burns the budget and proves nothing. What I'd protect is the approval state machine with durable state and idempotent execution, and twenty minutes for a labelled eval set — specifically measuring auto-archive false negatives, since that's the only expensive error."
 
@@ -664,9 +664,9 @@ Model choice is a question every defense contains and the answer that fails is "
 |---|---|---|---|---|
 | Large, generation | 0.90 | 0.83 | 4.1 s | $0.0204 |
 | Small, generation | 0.83 | 0.83 | 2.2 s | $0.0017 |
-| Small + large on low-confidence (18%) | 0.89 | 0.83 | 2.6 s | $0.0051 |
+| Small + large on low-confidence (18%) | 0.89 | 0.83 | 2.6 s | $0.0054 |
 
-Note that recall@5 doesn't move — retrieval quality is independent of the generation model, and pointing that out demonstrates you understand where each component's contribution lives. The routed row is the interesting one: **💰** blended cost is 0.82 × $0.0017 + 0.18 × $0.0204 = $0.00139 + $0.00367 = **$0.0051/query**, which is a **75% cut against always-large** for one point of faithfulness. At 10k/day that's $51/day versus $204/day — **$4,590/month saved**. That's the number that makes the routing decision obvious, and it exists only because the eval harness made the comparison cheap.
+Note that recall@5 doesn't move — retrieval quality is independent of the generation model, and pointing that out demonstrates you understand where each component's contribution lives. The routed row is the interesting one: **💰** it's a cascade, so every query pays for the small call and 18% additionally pay for the large one — $0.0017 + 0.18 × $0.0204 = $0.0017 + $0.00367 = **$0.0054/query**, which is a **74% cut against always-large** for one point of faithfulness. (Don't drop the small-model call from the escalated slice; a cascade pays twice on those, and a grader who catches that omission catches all your other arithmetic too.) At 10k/day that's $54/day versus $204/day — **$4,500/month saved**. That's the number that makes the routing decision obvious, and it exists only because the eval harness made the comparison cheap.
 
 **Two things I'd also say.** Embedding model and generation model are separate decisions with separate evidence: the embedding choice is validated by recall@5 and is expensive to change later because it means a full reindex, so I'd spend more care there than on the generation model, which is a config swap. And **the model must be pinned to an exact version string**, not a floating alias — a provider-side update to a floating alias silently invalidates every number in my results directory, and I've watched that turn into a week of confused debugging.
 
@@ -702,7 +702,7 @@ Ten minutes, six beats, recorded after one dry run and no more than two takes �
 
 **Beat 5 — Failures and limits, 1.5 minutes.** Read the top three known issues, with measured impact. Say what you'd need to see in production to know each one mattered.
 
-**Beat 6 — Next steps, 45 seconds.** A prioritized list — three items, ordered, with the reasoning for the order. "First the reranker, because recall@5 is my ceiling and it's the cheapest 5–10 points. Then per-document diversity caps, because the seed corpus has one document producing 3,000 chunks. Then multilingual, because it's a real gap but nobody in the brief asked for it."
+**Beat 6 — Next steps, 45 seconds.** A prioritized list — three items, ordered, with the reasoning for the order. "First the reranker, because recall@5 is my ceiling and it's the cheapest 5–10 points. Then per-document diversity caps, because the seed corpus has one document producing ~1,000 chunks. Then multilingual, because it's a real gap but nobody in the brief asked for it."
 
 **Practical mechanics.** Screen plus a small camera window if the tool supports it — a face reduces the "did they build this?" doubt measurably. Have the terminal, the README and the eval results open in tabs *before* recording. Don't type commands live if they take more than five seconds; have output ready. And say the numbers out loud rather than only showing them, because the grader may be listening at 1.5× while scanning your repo.
 
@@ -773,7 +773,7 @@ Directly, early, in writing, and without accusation. The framing that works is *
 
 ### 🏋 Drill: the four-hour build, unaided.
 
-**Setup.** Pick a corpus you have never indexed — 100–300 PDFs from a public source (regulatory filings, RFCs, a company's docs site). Start a timer at 4:00:00. No AI assistance if you're preparing for Anthropic, DeepMind, xAI or a similar policy; with assistance if you're preparing for a company that permits it, but you must be able to defend every line unaided at the end. Phone in another room.
+**Setup.** Pick a corpus you have never indexed — 100–300 PDFs from a public source (regulatory filings, RFCs, a company's docs site). Start a timer at 4:00:00. Match the assistance rule to whatever the actual brief says (📅 Volatile — company policies on AI assistance in take-homes differ and have been revised repeatedly; some labs that once asked applicants not to use assistants now explicitly permit or expect it, so read the current instructions rather than assuming): run it unaided if the brief forbids assistance, with assistance if it permits it — but either way you must be able to defend every line unaided at the end. Phone in another room.
 
 **The task.** Ship a repo that answers questions over the corpus with validated citations, plus an eval harness, plus a README, at the standard described throughout this section.
 
@@ -885,9 +885,9 @@ Here is the plan I actually use, and the discipline is that **the build block is
 
 **Hours 38–44 — Document and instrument the reviewer's experience (6h).** PR description as a design doc, README delta, `KNOWN_ISSUES.md`, the eval report with its numbers and its caveats, a cost estimate, and a one-command way for the reviewer to reproduce your results.
 
-**Hours 44–48 — Rehearse and buffer (4h).** Out loud, twice: the 3-minute version and the 15-minute version of the defense. Fix whatever the rehearsal exposed. Submit with 2 hours on the clock, not 2 minutes.
+**Hours 44–48 — Rehearse and buffer (4h).** Out loud, twice: the 3-minute version and the 45-minute version of the defense. Fix whatever the rehearsal exposed. Submit with 2 hours on the clock, not 2 minutes.
 
-**💰 Math on why the build block is only half:** 48 hours, minus 12 hours of sleep across two nights (6+6), minus ~2 hours of meals and walking away from the screen, leaves **34 working hours**. Of those, orient 2 + eval 4 + harden 8 + document 6 + rehearse 4 = 24 hours of non-feature work, leaving **10 hours of genuine new-feature coding**. Ten hours. That is the number you should scope against, and it is roughly one-fifth of what most candidates plan for. When someone says "I'll get three features done," they are budgeting 34 hours of pure build and no sleep, and they will deliver three broken features and no eval.
+**💰 Math on why the build block is only half:** 48 hours, minus 12–14 hours of sleep across two nights, minus ~2 hours of meals and walking away from the screen, leaves **32–34 working hours** (take 34 as the optimistic end). Of those, orient 2 + eval 4 + harden 8 + document 6 + rehearse 4 = 24 hours of non-feature work, leaving **8–10 hours of genuine new-feature coding**. Ten hours at best. That is the number you should scope against, and it is roughly a quarter of the 40 build-hours most candidates plan for. When someone says "I'll get three features done," they are budgeting 34 hours of pure build and no sleep, and they will deliver three broken features and no eval.
 
 **⚠ Trap:** the freeze line at hour 30 is the single most-violated rule in this plan, and violating it is the standard way trials fail. At hour 33 the feature *almost* works and one more capability feels within reach. What actually happens is you spend hours 33–46 debugging, submit at 47:55 with no README, no eval report, an untested error path, and a diff you have never re-read. **The freeze is not a suggestion; put it in your calendar with an alarm.**
 
@@ -901,7 +901,7 @@ My order:
 
 **2. Run the tests, and time them.** `pytest -x -q` tells you three things at once: whether the suite is green on main (if it isn't, screenshot it now — that is your alibi), how long your feedback loop is, and where the tests live. **A 4-second test suite and a 9-minute test suite imply completely different working styles for the next two days.** With a 9-minute suite you learn the `-k` filter immediately and you write a scratch script that exercises just your path.
 
-**3. Find the entry points.** Not by reading — by grepping for the framework's registration points. `APIRouter(`, `@app.`, `def main(`, `if __name__`, `console_scripts` in `pyproject.toml`, the CLI definitions, the worker task registrations, the cron entries. Ten minutes of this gives you the map of "how does control enter this system."
+**3. Find the entry points.** Not by reading — by grepping for the framework's registration points. `APIRouter(`, `@app.`, `def main(`, `if __name__`, `[project.scripts]` in `pyproject.toml` (or `console_scripts` in `setup.py`/`setup.cfg` on older repos), the CLI definitions, the worker task registrations, the cron entries. Ten minutes of this gives you the map of "how does control enter this system."
 
 **4. Trace one request end to end.** Pick the existing endpoint or job most similar to what you must build and follow it: route → validation → service → repository/model → external calls → response. Read *that* stack and nothing else. This is where you learn the house's actual layering, its error conventions, its transaction boundaries, and whether "services" are real or theatre.
 
@@ -992,7 +992,7 @@ def score(case, out):
     want = set(case["gold_doc_ids"])
     return {
         "recall": len(got & want) / max(len(want), 1),
-        "no_hallucinated_cite": float(got <= case["corpus_doc_ids"]),
+        "no_hallucinated_cite": float(got <= set(case["corpus_doc_ids"])),  # set(...) — a list here raises TypeError
         "answered": float(bool(out.text.strip())),
     }
 
@@ -1012,7 +1012,11 @@ def main(path="evals/fixtures/qa.jsonl"):
         print(sl.ljust(14), " ".join(f"{k}={statistics.mean(m[k] for m in ms):.3f}" for k in keys))
     overall = statistics.mean(r["recall"] for r in rows)
     print(f"\nOVERALL recall={overall:.3f}  n={len(rows)}")
-    return 0 if overall >= float(sys.argv[1] if len(sys.argv) > 1 else 0.0) else 1
+    thr = float(sys.argv[sys.argv.index("--min-recall") + 1]) if "--min-recall" in sys.argv else 0.0
+    return 0 if overall >= thr else 1
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
 That is under 30 lines of real logic, it exits non-zero below a threshold so CI can gate on it, and it emits per-slice numbers. Writing this from memory in 25 minutes should be a drill you have already passed.
@@ -1031,7 +1035,7 @@ There is also a second-order effect that is arguably bigger: **writing the fixtu
 
 And the grading effect: the rubric weights *evaluation methodology* as critical, and it is the most commonly skipped item. Committing a harness plus a baseline plus per-slice numbers plus an honest note about the sample size puts you above most of the field regardless of how the feature turned out.
 
-**💰 Math on the loop cost.** Say the harness costs 4 hours to build and each run costs 90 seconds of wall clock and 30 cases × ~4k tokens ≈ 120k input tokens plus ~15k output. At $3/Mtok in and $15/Mtok out that is 0.12 × $3 + 0.015 × $15 = $0.36 + $0.225 ≈ **$0.59 per full run.** Run it 40 times across the trial: ~$24 and about an hour of cumulative wall clock. Against that, the manual alternative — re-checking 8 questions by hand — costs ~6 minutes each time; 40 iterations is 4 hours of your own time and, realistically, you would only do it five times. **The harness pays for itself by iteration ten and it is the only version of the loop that catches regressions.**
+**💰 Math on the loop cost.** Say the harness costs 4 hours to build and each run costs 90 seconds of wall clock and 30 cases × ~4k tokens ≈ 120k input tokens plus ~15k output. At $3/Mtok in and $15/Mtok out that is 0.12 × $3 + 0.015 × $15 = $0.36 + $0.225 ≈ **$0.59 per full run.** Run it 40 times across the trial: ~$24 and about an hour of cumulative wall clock. Against that, the manual alternative — re-checking 8 questions by hand — costs ~6 minutes each time; 40 iterations is 4 hours of your own time and, realistically, you would only do it five times. So on raw minutes the harness roughly breaks even around iteration forty — but that comparison flatters the manual loop badly, because it only ever looks at 8 of the 30 cases, it produces no per-slice breakdown, it silently stops happening once you are tired, and **it is the only version of the loop that catches regressions.** 📅 Volatile: the $3/$15 per-Mtok figures used here and in the cost blocks below are illustrative of current frontier-model pricing — re-check the provider's price page before quoting a number in a live interview.
 
 **🗣 Say this in the room:** "I built the eval first because a nondeterministic feature without a measurement isn't a feature, it's a demo. It cost me four of my ten build hours and it bought me a 90-second feedback loop with per-slice numbers, which is what let me make prompt changes on Sunday without wondering if I was breaking Saturday's work."
 
@@ -1043,11 +1047,11 @@ This is the practical objection and it has practical answers. You will not have 
 
 **Source 2: the repo's existing data.** Their seed fixtures, their test data, their sample documents, their existing test assertions for adjacent features. If they have a `tests/data/` directory, it is your corpus. This also keeps you honest about their actual data distribution rather than one you imagined.
 
-**Source 3: property-based cases that need no gold label.** This is the trick most people miss. A large fraction of useful eval assertions do not require knowing the right answer: *the output validates against the schema; every citation ID exists in the corpus; the answer is under 300 tokens; a question with no supporting document produces a refusal rather than a confident answer; the same input twice at temperature 0 produces the same output; a prompt-injected document does not change the system's behaviour.* Those are cheap to write, deterministic to score, and they catch the failures that actually happen. Fifteen of your thirty cases can be property cases.
+**Source 3: property-based cases that need no gold label.** This is the trick most people miss. A large fraction of useful eval assertions do not require knowing the right answer: *the output validates against the schema; every citation ID exists in the corpus; the answer is under 300 tokens; a question with no supporting document produces a refusal rather than a confident answer; the same input twice at temperature 0 produces a materially equivalent answer — assert on properties or near-equality, not byte-identity, because provider inference is not bit-deterministic even at temperature 0; a prompt-injected document does not change the system's behaviour.* Those are cheap to write, deterministic to score, and they catch the failures that actually happen. Fifteen of your thirty cases can be property cases.
 
 **Source 4: adversarial cases you generate deliberately.** Empty input, 400-page input, non-English input, an input whose answer is genuinely not in the corpus, a document containing "ignore previous instructions," a malformed tool argument. Six to eight of these. They are trivially cheap to write and they are exactly the cases the reviewer will try live in the defense, so having them already in the harness with a recorded result turns the reviewer's ambush into your demo.
 
-**Using a model to bootstrap labels** is legitimate *if you say so*. Generate 40 candidate cases from the corpus with an LLM, then hand-verify all of them — verification is maybe 8 seconds per case, so 40 cases is under 6 minutes and it converts machine-generated noise into a set you can defend. What is not legitimate is generating labels with a model and never reading them, then reporting a number as if it were ground truth.
+**Using a model to bootstrap labels** is legitimate *if you say so*. Generate 40 candidate cases from the corpus with an LLM, then hand-verify all of them — verification is maybe 30 seconds per case once you have the corpus open, so 40 cases is about 20 minutes and it converts machine-generated noise into a set you can defend. What is not legitimate is generating labels with a model and never reading them, then reporting a number as if it were ground truth.
 
 **⚠ Trap:** the self-graded eval loop — you use GPT-class model X to write the answers *and* to judge them, and score 0.94. That number measures agreement between a model and itself, not correctness. If you use an LLM judge, use a different model family than the generator where you can, hand-label at least 15 cases yourself, and **report the judge's agreement with your labels** as a separate number. Reviewers at AI companies probe this specific thing, because it is the most common way candidates fool themselves.
 
@@ -1058,7 +1062,7 @@ The mental model: **an eval that only runs on your laptop is a claim; an eval th
 
 The shape I ship, in order of preference depending on what their CI already looks like:
 
-**Tier 1 — a separate, non-required job.** A new workflow file (or a new job in the existing workflow) named `evals`, gated on `if: ${{ secrets.OPENAI_API_KEY != '' }}` or an equivalent guard so it *skips cleanly* rather than failing when the secret is absent. It runs the harness, prints the per-slice table into the job summary, and uploads `evals/last_run.json` as an artifact. It exits non-zero only against a threshold you commit in the repo. Crucially: it is not added to the required-checks list, because that is not your call to make. You say in the PR description: "I've left this non-blocking; if you want it as a merge gate, flip it in branch protection."
+**Tier 1 — a separate, non-required job.** A new workflow file (or a new job in the existing workflow) named `evals`, guarded so it *skips cleanly* rather than failing when the secret is absent. Note the mechanics here, because getting them wrong is a visible mistake: the `secrets` context is **not** available in a job-level or step-level `if:`, so `if: ${{ secrets.OPENAI_API_KEY != '' }}` does not work as a job condition. The working patterns are to set `env: HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}` at the job level (where `secrets` *is* available) and guard the steps on `if: env.HAS_KEY == 'true'`, or to fire the live job only on `workflow_dispatch`, which is what the file below does. It runs the harness, prints the per-slice table into the job summary, and uploads `evals/last_run.json` as an artifact. It exits non-zero only against a threshold you commit in the repo. Crucially: it is not added to the required-checks list, because that is not your call to make. You say in the PR description: "I've left this non-blocking; if you want it as a merge gate, flip it in branch protection."
 
 **Tier 2 — a mocked eval that runs on every PR, plus a live one that runs on demand.** This is the version I actually prefer for a trial, because it works for the reviewer with zero secrets. Record the provider responses once (VCR-style cassettes, or just a JSON fixture of `{prompt_hash: response}`), commit them, and have the default CI run replay them. The replayed run tests *your* logic — chunking, parsing, citation validation, refusal branch, schema conformance — deterministically, in eight seconds, for free. The live run against the real provider is a `workflow_dispatch` job or a `make eval-live` target. **This split is a strong senior signal**: it shows you know the difference between testing your code and measuring the model.
 
@@ -1133,7 +1137,7 @@ Then I proceed into the harden and document blocks on schedule. **The reason I d
 
 You know the generic list — timeouts, retries, validation, backpressure. So let me give you only the delta, which is the part that is specific to a component that is nondeterministic, slow, expensive, and occasionally wrong.
 
-**Every model call is a network call to a flaky, rate-limited, multi-second dependency.** So: an explicit timeout (not the SDK default, which is often absurdly long), a bounded retry policy with jitter on 429/5xx *and only those*, and a hard cap on total attempts. Retrying a 400 because your schema was invalid just burns money four times. Backend instinct serves you here; the delta is that a naive retry-on-everything multiplies your token spend by the retry count, so **retries need a budget in tokens, not just in attempts**.
+**Every model call is a network call to a flaky, rate-limited, multi-second dependency.** So: an explicit timeout (not the SDK default, which is often absurdly long), a bounded retry policy with jitter on 429/5xx *and only those*, and a hard cap on total attempts. Retrying a 400 because your request schema was invalid burns four round-trips off your latency budget and can never succeed. Backend instinct serves you here; the delta is that a naive retry-on-everything multiplies your token spend by the retry count, so **retries need a budget in tokens, not just in attempts**.
 
 **The output is untrusted input.** Parse, do not trust. If you asked for JSON, validate against a Pydantic model and have a defined behaviour when validation fails — one repair attempt with the validation error fed back, then a typed failure, never a silent `except: pass` that returns an empty object. If you asked for citations, verify each cited ID exists in the corpus before rendering it; a citation to a nonexistent document is the single most damaging failure mode in a RAG demo and it is trivially preventable with a set-membership check.
 
@@ -1163,7 +1167,7 @@ The five artifacts, in the order they hit those twenty-five minutes:
 
 **5. A short recorded walkthrough** where the format allows it — three to five minutes, structured as problem → design → demo → evals → known failures. Many reviewers watch it before reading the code, and it lets you control the framing of your own weaknesses.
 
-**💰 Math for the cost line in your readout.** Instrument tokens and print the per-request cost so the reviewer never has to ask. For a typical RAG turn: 3,400 input tokens (system 700 + 8 chunks × ~320 + question) and 290 output. At $3/Mtok in and $15/Mtok out: 0.0034 × $3 = $0.0102, plus 0.00029 × $15 = $0.00435, total **≈ $0.0146 per request**. At 10,000 requests/day: $146/day ≈ **$4,380/month**. With prefix caching on the 700-token system prompt at a 90% read discount, you save 0.0007 × $3 × 0.9 = $0.0019/request ≈ $19/day — real but small, because the chunks dominate; the bigger lever is cutting top-k from 8 to 5, which removes ~960 input tokens ≈ $0.0029/request ≈ **$29/day, $870/month**, and my eval says recall only drops 0.84 → 0.82. **That last sentence — a cost lever priced against a measured quality delta — is the single most senior thing you can put in a trial README.** 📅 Volatile: verify current per-token prices before quoting them in a live interview.
+**💰 Math for the cost line in your readout.** Instrument tokens and print the per-request cost so the reviewer never has to ask. For a typical RAG turn: 3,400 input tokens (system 700 + 8 chunks × ~320 + question) and 290 output. At $3/Mtok in and $15/Mtok out: 0.0034 × $3 = $0.0102, plus 0.00029 × $15 = $0.00435, total **≈ $0.0146 per request**. At 10,000 requests/day: $146/day ≈ **$4,380/month**. With prefix caching on the 700-token system prompt at a 90% cache-read discount, you save 0.0007 × $3 × 0.9 = $0.0019/request ≈ $19/day — real but small, because the chunks dominate. (Know the caveat before you quote this: the major providers currently impose a minimum cacheable prefix of roughly 1,024 tokens, so a 700-token system prompt on its own would not qualify — you would have to cache the system prompt plus a stable block of instructions or few-shot examples together. 📅 Volatile: minimums, discounts and cache-write surcharges differ per provider and change.) The bigger lever is cutting top-k from 8 to 5, which removes ~960 input tokens ≈ $0.0029/request ≈ **$29/day, $870/month**, and my eval says recall only drops 0.84 → 0.82. **That last sentence — a cost lever priced against a measured quality delta — is the single most senior thing you can put in a trial README.** 📅 Volatile: verify current per-token prices before quoting them in a live interview.
 
 ### The trial says AI tools are permitted. How do you use them, and what happens when I ask you to explain line 340?
 
@@ -1205,7 +1209,7 @@ The countermeasures are cheap and mechanical:
 
 **⚠ Trap:** the mid-trial refactor of *their* code. At hour 20 you realize their retriever interface is wrong for what you need. The tempting move is to change it. The correct move, almost always, is to work within it and write "I'd change `Retriever.search` to return scores alongside documents; I worked around it with X because changing a shared interface mid-trial makes the diff unreviewable and I don't know who else depends on it." That sentence demonstrates *more* seniority than the refactor would have.
 
-**📐 Numbers you must know — reviewer throughput.** The widely-cited code-review research (Cisco/SmartBear's study of ~2,500 reviews) puts effective review at roughly **200–400 lines of code per hour**, with defect-detection falling sharply above ~400 LOC in a single sitting. So a 3,500-line diff is nominally a 9–17 hour review, which means **nobody will actually review it** — they will skim it and judge you on impressions. A 700-line diff is a 2–3 hour review, which is a thing a person will genuinely do. Sizing your diff to what a human will actually read is not a courtesy; it is how you get your work seen.
+**📐 Numbers you must know — reviewer throughput.** The widely-cited code-review study (SmartBear's analysis of a Cisco program: ~2,500 reviews, ~3.2M lines, 50 developers) yields two separate rules of thumb that people routinely merge into one: review **no more than 200–400 lines in a single sitting** (defect-detection falls off sharply beyond that), and keep the **inspection rate under ~300–500 LOC per hour**. Put together, a 3,500-line diff is nominally 7–12 hours of review spread across a dozen sittings, which means **nobody will actually review it** — they will skim it and judge you on impressions. A 700-line diff is a 1.5–2.5 hour review across two or three sittings, which is a thing a person will genuinely do. Sizing your diff to what a human will actually read is not a courtesy; it is how you get your work seen.
 
 ### Under a 48-hour clock, what do you test and — more interestingly — what do you deliberately not test?
 
@@ -1241,7 +1245,7 @@ The plan I actually run for a Friday-6pm-to-Sunday-6pm window:
 - **Sat 13:00–14:00** — off the screen entirely. Walk. This is where the good architectural realizations happen and it is not optional.
 - **Sat 14:00–22:00** — slices 3–4, plus quality iteration.
 - **Sat 22:00–06:00** — sleep 7h.
-- **Sun 06:00–12:00** — freeze at 08:00 → harden.
+- **Sun 06:00–12:00** — harden. Note that the hour-30 freeze line lands at midnight Saturday, i.e. inside night two, so in practice the freeze takes effect when you close the laptop at 22:00 Saturday (hour 28): **no new capability starts on Sunday**, and the two hours of build headroom you appear to have on Sunday morning are for finishing, not starting.
 - **Sun 12:00–16:00** — documentation, instrumentation, fresh-clone test.
 - **Sun 16:00–17:00** — rehearse out loud, twice.
 - **Sun 17:00** — submit, one hour early.
@@ -1358,7 +1362,7 @@ OVERALL       32    0.83       1.00
 
 **Reproduction.** One command, the pinned model string, the date, and the cost of a run.
 
-**📐 Numbers you must know — sample size to detect a delta.** For a paired comparison of two systems on the same cases, the rough requirement to detect a difference of d in pass rate at 80% power and α = 0.05 is n ≈ 16 × p(1−p) / d². At p ≈ 0.8: to detect **d = 0.10**, n ≈ 16 × 0.16 / 0.01 = **256 cases**; for **d = 0.05**, n ≈ 16 × 0.16 / 0.0025 = **1,024 cases**; for **d = 0.20**, n ≈ 64. Memorize the shape — *halving the detectable effect quadruples the set* — because it is what lets you say, in a room, "your 40-case eval cannot see the 3-point improvement you're claiming" and be right.
+**📐 Numbers you must know — sample size to detect a delta.** For comparing two systems, the standard rule of thumb to detect a difference of d in pass rate at 80% power and α = 0.05 is n ≈ 16 × p(1−p) / d² *per arm*. At p ≈ 0.8: to detect **d = 0.10**, n ≈ 16 × 0.16 / 0.01 = **256 cases**; for **d = 0.05**, n ≈ 16 × 0.16 / 0.0025 = **1,024 cases**; for **d = 0.20**, n ≈ 64. (Running both systems on the *same* cases — a paired design, scored with McNemar — needs meaningfully fewer when the two systems' errors are correlated, which they usually are; quote the unpaired number as the safe upper bound and say that you would pair.) Memorize the shape — *halving the detectable effect quadruples the set* — because it is what lets you say, in a room, "your 40-case eval cannot see the 3-point improvement you're claiming" and be right.
 
 **⚠ Trap:** reporting a single mean over a mixed set. A mean of 0.83 over 32 cases hides that multi-hop is at 0.71 and easy is at 0.94, which is the only actionable information in the whole table. Aggregate metrics are for dashboards; sliced metrics are for engineers. In review I reject eval reports that only show the mean.
 
@@ -1437,7 +1441,7 @@ My procedure, and I set an actual timer:
 
 First, I distrust it. "Done" at hour 26 almost always means "the happy path works," and the gap between that and *done* is exactly the gap this stage is grading. So the order is: verify, deepen, then extend — and extending is last.
 
-**Verify (3–4h).** Grow the eval set. Going from 32 cases to 100 takes the detectable regression from ±13 points to ±8 and it is the single highest-value use of surplus time, because it upgrades every claim you make. Add the slices you skipped — non-English, very long documents, ambiguous questions, adversarial. Run the whole thing three times and check variance; if your recall moves 0.83 → 0.79 → 0.85 across identical runs, that is a finding you need to report, and if you never ran it three times you would have reported 0.83 as if it were a constant.
+**Verify (3–4h).** Grow the eval set. Going from 32 cases to 100 takes the detectable regression from ±13 points to ±7 and it is the single highest-value use of surplus time, because it upgrades every claim you make. Add the slices you skipped — non-English, very long documents, ambiguous questions, adversarial. Run the whole thing three times and check variance; if your recall moves 0.83 → 0.79 → 0.85 across identical runs, that is a finding you need to report, and if you never ran it three times you would have reported 0.83 as if it were a constant.
 
 **Deepen (4–6h).** Load-test it — even crudely, with a concurrency-20 script — and report goodput and p95 under load rather than single-request latency, because single-request p95 is a number almost nobody bothers to contextualize and doing so is a differentiator. Run the parameter sweep properly and build the ablation table. Profile where the time actually goes; "1.9 s p95 = 90 ms retrieval + 40 ms rerank + 1.7 s generation, so the only lever that matters is output tokens" is a sentence that ends an entire line of interview questioning in your favour.
 
@@ -1445,7 +1449,7 @@ First, I distrust it. "Done" at hour 26 almost always means "the happy path work
 
 **Only then extend (remaining).** Take the second item off your ranked list — and build it to the same standard, end to end with eval coverage, or not at all. **A second feature at the same bar is a strong signal; a second feature at demo quality dilutes the first one**, because the reviewer's impression of your standards is set by your weakest artifact, not your strongest.
 
-**💰 Math on why more eval beats more feature.** Growing from 32 to 100 cases costs about 2.5 hours of writing and verification plus $1.85 per run (100 × 4k in at $3/Mtok = $1.20, plus 100 × 500 out at $15/Mtok = $0.75). What it buys: the confidence interval on an 0.83 result tightens from ±0.13 to ±0.074 — √(0.83×0.17/100) = 0.0376, ×1.96 ≈ 0.074. That means every ablation claim in your writeup goes from "unfalsifiable" to "supported." **Three hours converting your opinions into evidence beats three hours of code that nobody has time to read.**
+**💰 Math on why more eval beats more feature.** Growing from 32 to 100 cases costs about 2.5 hours of writing and verification plus $1.95 per run (100 × 4k in at $3/Mtok = $1.20, plus 100 × 500 out at $15/Mtok = $0.75). What it buys: the confidence interval on an 0.83 result tightens from ±0.13 to ±0.074 — √(0.83×0.17/100) = 0.0376, ×1.96 ≈ 0.074. That means every ablation claim in your writeup goes from "unfalsifiable" to "supported." **Three hours converting your opinions into evidence beats three hours of code that nobody has time to read.**
 
 **⚠ Trap:** using surplus time to add abstraction. "I had time so I made the provider pluggable and added a caching layer and a plugin registry" is how a clean submission becomes an over-engineered one. Surplus time goes into evidence and hardening, not into architecture you cannot justify.
 
@@ -1509,7 +1513,7 @@ You practice it whole, at least once, under real conditions — because every co
 10. All eight failure-taxonomy cases handled and demonstrable.
 11. Structured logs with request ID, tokens, latency, and stage.
 12. Net new code under 800 lines.
-13. Between 6 and 15 commits, each coherent, messages in the repo's style.
+13. Between 8 and 15 commits, each coherent, messages in the repo's style.
 14. Fresh-clone run tested in a new directory, twice.
 15. PR description containing scope, options-considered with numbers, risks, cost with arithmetic, and rollback.
 16. `KNOWN_ISSUES.md` with 6–10 priced items.
@@ -1553,7 +1557,7 @@ The shape I use is five beats: **problem → the one hard thing → the shape of
 
 Delivered, it sounds like this. "The brief was a question-answering system over a corpus of PDFs with citations. The hard part isn't generation, it's that these PDFs are 40-to-200-page policy documents where the answer to a question is usually spread across two non-adjacent sections, so naive chunk-and-retrieve gets you a plausible answer supported by the wrong page. So the system is: a parse-and-chunk stage that keeps section headers attached to every chunk, hybrid retrieval — BM25 plus dense, fused — then a cross-encoder rerank down to six chunks, then generation with span-level citations that I verify post-hoc against the retrieved text and drop if they don't match. I measured retrieval recall@10 and end-to-end answer correctness on 120 questions I wrote from the corpus, and citation faithfulness separately because that's the failure mode that actually hurts a user. Recall@10 is 0.91, answer correctness 0.83 against a 0.61 BM25-only baseline. The known failures are numeric-table questions, where I'm at roughly 0.4, and any question that requires counting across the corpus, which I don't handle at all. Where do you want to go?"
 
-That is about 210 words, sixty to ninety seconds spoken, and it has already told the interviewer that you found the real difficulty, made an architectural choice against it, measured the thing that mattered, and know your own holes. Everything after that is a conversation between peers rather than an interrogation.
+That is about 175 words, sixty to ninety seconds spoken, and it has already told the interviewer that you found the real difficulty, made an architectural choice against it, measured the thing that mattered, and know your own holes. Everything after that is a conversation between peers rather than an interrogation.
 
 **⚠ Trap:** narrating the pipeline as a tour — "so first there's an ingest script, it uses PyMuPDF, then it writes to Postgres, then there's a FastAPI service with three endpoints..." This is the single most common opening and it is a slow-motion failure. Nothing in it is a decision. Nobody can tell whether the design was hard-won or copied. **Lead with the hard thing, not the first file in the repo.**
 
@@ -1581,7 +1585,7 @@ Answer C, said crisply with the cost arithmetic, scores *far* higher than a conf
 
 Yes — and the way you have them is that you wrote them down while building, not the night before. **The single highest-leverage artifact for this round is a decisions file with one row per choice: the choice, the one-sentence rationale, the named alternative, and the reason it lost.** Committed to the repo as `DECISIONS.md` or a set of ADRs, so it is also evidence that you did this during the build.
 
-The discipline that makes it useful is that the rejection reason must be **a measurement, a constraint, or an explicit bet** — never a preference. "I didn't use a graph store because I don't like Neo4j" is not a rejection reason. "I didn't use a graph store because the questions in my eval set that would benefit are the multi-hop ones, which are 8 of 120, and building entity extraction plus a graph schema is roughly two days against a ceiling of six points of correctness — I'd rather spend two days on the table-parsing failure that costs me eleven points" is a rejection reason, and it demonstrates prioritization at the same time.
+The discipline that makes it useful is that the rejection reason must be **a measurement, a constraint, or an explicit bet** — never a preference. "I didn't use a graph store because I don't like Neo4j" is not a rejection reason. "I didn't use a graph store because the questions in my eval set that would benefit are the multi-hop ones, which are 8 of 120, and building entity extraction plus a graph schema is roughly two days against a ceiling of six points of correctness — I'd rather spend one day on the table-parsing failure, which is worth about the same six points for half the effort" is a rejection reason, and it demonstrates prioritization at the same time.
 
 A real row set from a RAG take-home looks like:
 
@@ -1609,7 +1613,7 @@ The list has to be specific enough to be useful. Grades of quality:
 
 - Useless: "it could be more robust." Says nothing, costs you.
 - Weak: "it doesn't handle tables well."
-- Strong: "numeric-table questions are my worst slice — 12 of my 120 eval items, correctness ~0.4 against 0.83 overall. Root cause is at parse time: my PDF extractor linearizes table cells row-major without preserving column headers, so a chunk says '4.2  7.9  11.3' with no idea what those columns were. The fix is a table-aware extraction path that renders each table to markdown and keeps it as an atomic chunk, which I scoped at about a day. I didn't do it because the eval gain is bounded at nine points and I had a citation-faithfulness bug that was worse."
+- Strong: "numeric-table questions are my worst slice — 12 of my 120 eval items, correctness ~0.4 against 0.83 overall. Root cause is at parse time: my PDF extractor linearizes table cells row-major without preserving column headers, so a chunk says '4.2  7.9  11.3' with no idea what those columns were. The fix is a table-aware extraction path that renders each table to markdown and keeps it as an atomic chunk, which I scoped at about a day. I didn't do it because the eval gain is bounded at six points — 12 of 120 items with 0.6 of headroom each — and I had a citation-faithfulness bug that was worse."
 
 Include in the list at minimum: your worst-performing slice with a number; one thing that is a deliberate scope cut with the reason; one thing that would break under production load that you did not build for (concurrency, rate limits, cold start); and one thing you genuinely do not know the cause of. That last category is important — "I have three cases where retrieval looks correct and the answer is still wrong, and I haven't rooted them out" is a very senior sentence.
 
@@ -1697,7 +1701,7 @@ So answer with the provenance, and be exact about which kind of number it is. Th
 
 **Measured under load.** "I ran a 5-minute load test at 120 concurrent virtual users against a local stack with a mocked LLM, and the retrieval path held 340 req/s at p95 41 ms. With the real provider I never exceeded 8 concurrent because that's my rate limit tier, so the 100 req/s figure is retrieval-only and I should have labelled it that way." That last clause — catching your own overstatement — is worth more than the number.
 
-**Derived, and labelled as derived.** "It's a capacity calculation, not a measurement. Each request holds a worker for about 6.7 seconds end to end, dominated by 350 output tokens at ~60 tok/s of streaming. To sustain 100 req/s I need 100 × 6.7 = **670 concurrent in-flight requests**. That's fine for the Python side because they're all await-bound on network I/O, but it means 670 simultaneous provider connections, which is far beyond any rate limit I have, and it means 670 × 4,600 input tokens = 3.08M tokens/s of prompt if they all arrived at once. So the honest statement is that my service isn't the bottleneck; the provider quota is, at roughly 8–10 concurrent on my tier."
+**Derived, and labelled as derived.** "It's a capacity calculation, not a measurement. Each request holds a worker for about 6.7 seconds end to end, dominated by 350 output tokens at ~60 tok/s of streaming. To sustain 100 req/s I need 100 × 6.7 = **670 concurrent in-flight requests**. That's fine for the Python side because they're all await-bound on network I/O, but it means 670 simultaneous provider connections, which is far beyond any rate limit I have, and it means 670 × 4,600 input tokens = 3.08M tokens of prompt in flight at any instant — and at 100 req/s a sustained 100 × 4,600 = 460k input tokens *per second*. So the honest statement is that my service isn't the bottleneck; the provider quota is, at roughly 8–10 concurrent on my tier."
 
 **Aspirational, i.e. wrong.** If the number came from the brief's requirements and you never checked it, say so immediately and completely: "That's the target from the brief and I did not verify it — that's a documentation bug, it should say 'target' not 'handles'."
 
@@ -1811,7 +1815,7 @@ Graph-structured retrieval buys one specific thing: **the ability to answer ques
 
 The cost is heavy and specific: an entity/relation extraction pass over the whole corpus (an LLM call per chunk, so a real ingestion bill), a schema you have to design and maintain, an extraction quality problem that is now *upstream* of everything, and a re-extraction cost every time the corpus changes.
 
-So the defense: "I looked at my 120 eval questions and classified them. 94 are single-passage lookups, 18 are two-passage comparisons that hybrid retrieval plus a top-6 window handles, and 8 are genuinely multi-hop. Building extraction and a graph is on the order of two days and caps out at those 8 questions — a bounded 6.7-point gain — while my table-parsing failure is 12 questions and 10 points for one day. So the prioritization was mechanical. If the query distribution were inverted — if a third of my questions were aggregation or multi-hop — the calculus flips and I'd build it."
+So the defense: "I looked at my 120 eval questions and classified them. 94 are single-passage lookups, 18 are two-passage comparisons that hybrid retrieval plus a top-6 window handles, and 8 are genuinely multi-hop. Building extraction and a graph is on the order of two days and caps out at those 8 questions — a bounded 6.7-point gain — while my table-parsing failure is 12 questions sitting at 0.4, so about six points for one day. So the prioritization was mechanical. If the query distribution were inverted — if a third of my questions were aggregation or multi-hop — the calculus flips and I'd build it."
 
 **💰 Math:** the ingestion cost is worth quoting, because candidates who propose graph extraction rarely price it. Extracting entities and relations at, say, one call per chunk over 1,200 chunks, with ~600 input and ~300 output tokens per call: 1,200 × 600 = 720k input and 1,200 × 300 = 360k output. At $3/$15 per million that is 0.72 × $3 + 0.36 × $15 = $2.16 + $5.40 = **$7.56 for a full re-extraction**. Trivial at 1,200 chunks — but scale the corpus to 1 million chunks and the same arithmetic gives 600M input + 300M output = $1,800 + $4,500 = **$6,300 per full rebuild**, which is now a design constraint, and the interesting engineering question becomes incremental re-extraction rather than the graph itself. **📅 Volatile:** prices.
 
@@ -1835,7 +1839,7 @@ Do not fold, and do not get defensive. This is usually a genuine critique *and* 
 
 The framing sentence I use: "The rule I applied was that every piece of machinery has to be paid for by a number on the eval set. Tell me which piece and I'll show you the number or I'll agree it shouldn't be there."
 
-Then, per component: "The reranker adds 300 ms and a model dependency, and it bought nine points of end-to-end correctness — I'd fight to keep it. The hybrid retrieval bought thirteen points, mostly on exact-identifier queries, so that stays. The query-rewrite step bought two points, which is inside my noise band on 120 items, and I kept it mostly because it made multi-turn feel better subjectively. **That one I'd cut if you asked me to simplify** — it's the weakest-justified thing in the system." Conceding a real component, by name, with the number that makes it marginal, is what proves the rest of your defenses are real.
+Then, per component: "The reranker adds 300 ms and a model dependency, and it bought nine points of end-to-end correctness — I'd fight to keep it. The hybrid retrieval bought thirteen points of recall@10 over dense-only, mostly on exact-identifier queries, so that stays. The query-rewrite step bought two points, which is inside my noise band on 120 items, and I kept it mostly because it made multi-turn feel better subjectively. **That one I'd cut if you asked me to simplify** — it's the weakest-justified thing in the system." Conceding a real component, by name, with the number that makes it marginal, is what proves the rest of your defenses are real.
 
 And there is a version of over-engineering that is genuinely a judgment failure worth admitting to: **abstraction ahead of a second use case.** A `BaseRetriever` ABC with one implementation, a plugin registry with two plugins, a config system with eleven knobs nobody turned. If your repo has these, name them before the interviewer does: "The retriever abstraction has exactly one implementation and I built it in anticipation of a second one that never arrived — that's speculative generality and I'd delete it in review."
 
@@ -1871,7 +1875,7 @@ Do it out loud, digit by digit, and structure it as **per-request unit cost → 
 
 **Where the money actually is.** 73% of the bill is input tokens, and two thirds of the input is retrieved chunks. That single observation determines every lever, and stating it is the point of the whole exercise.
 
-**Lever 1 — prefix caching.** Only the 800-token system prompt is stable, so cached at a 90% discount it saves 800 × $3/1e6 × 0.9 = $0.00216/req = $21.60/day = **$648/month, an 11% cut**. Real but not the main lever, because the cacheable prefix is a small fraction here. **The cache only pays when the stable prefix is large** — with a 12,000-token prompt it would be the dominant lever.
+**Lever 1 — prefix caching.** Only the 800-token system prompt is stable, so cached at a 90% discount it saves 800 × $3/1e6 × 0.9 = $0.00216/req = $21.60/day = **$648/month, an 11% cut**. Real but not the main lever, because the cacheable prefix is a small fraction here — and worse, major providers impose a *minimum cacheable prefix* (commonly around 1,024 tokens; **📅 Volatile:** check your provider), so an 800-token system prompt may not be cacheable at all and this lever could be worth exactly zero until the prefix grows. **The cache only pays when the stable prefix is large** — with a 12,000-token prompt it would be the dominant lever.
 
 **Lever 2 — fewer, better chunks.** Rerank harder and pass 3 chunks instead of 6: saves 1,536 × $3/1e6 = $0.0046/req = $46/day = **$1,380/month, a 24% cut**. Cost of the reranker: self-hosted cross-encoder on existing CPU is ~$0; a hosted rerank API at roughly $1 per 1,000 searches (**📅 Volatile**) is 10 × $1 = $10/day = $300/month. Net **~$1,080/month saved**, and in my measurements top-3 after reranking cost less than a point of correctness.
 
@@ -1905,7 +1909,7 @@ This is a roadmap question disguised as a wish-list question, and the failure is
 
 Mine, for the RAG system, spoken as a ranked list:
 
-**Days 1–2: table-aware extraction.** My worst slice is numeric-table questions at 0.4 correctness across 12 of 120 items — that is 10 points of headline correctness sitting in one root cause, which is that my parser linearizes table cells and loses column headers. Fix is a table-detection path that renders each table to markdown and keeps it atomic. Measured by that slice's correctness moving from 0.4 toward 0.8, and by nothing else regressing.
+**Days 1–2: table-aware extraction.** My worst slice is numeric-table questions at 0.4 correctness across 12 of 120 items — that is six points of headline correctness sitting in one root cause, which is that my parser linearizes table cells and loses column headers. Fix is a table-detection path that renders each table to markdown and keeps it atomic. Measured by that slice's correctness moving from 0.4 toward 0.8, and by nothing else regressing.
 
 **Days 3–4: expand the eval set from 120 to 400, with real questions.** Everything downstream is gated on this, because my current 95% interval is ±6 points and I cannot detect a 4-point improvement. At n = 400 the interval tightens to roughly ±3.5 points. This is the item candidates never list and it is the one I would actually fight for first — **you cannot prioritize what you cannot measure, and at n = 120 I am flying with a 12-point-wide instrument.**
 
@@ -1917,7 +1921,7 @@ Mine, for the RAG system, spoken as a ranked list:
 
 Then close with what you'd *deliberately not* do: "I would not add a knowledge graph, multi-agent decomposition, or fine-tuning in those two weeks. None of them are justified by my measured error distribution, and all three are things I could put on a slide to look sophisticated. **The two weeks go to the boring items because that's where the numbers are.**"
 
-**🗣 Say this in the room:** "Ranked by gain per day: table extraction first — it's ten points in one root cause. Then quadruple the eval set, because at 120 items my confidence interval is ±6 points and I literally cannot see a four-point improvement. Then hardening, then routing for the 64% cost cut. I'd explicitly not build a graph or fine-tune; neither is justified by my error distribution."
+**🗣 Say this in the room:** "Ranked by gain per day: table extraction first — it's six points in one root cause. Then quadruple the eval set, because at 120 items my confidence interval is ±6 points and I literally cannot see a four-point improvement. Then hardening, then routing for the 64% cost cut. I'd explicitly not build a graph or fine-tune; neither is justified by my error distribution."
 
 ### If you started over tomorrow, what would you do differently?
 
@@ -1929,7 +1933,7 @@ The three process answers that consistently land, in rough order of how well:
 
 **"I'd have looked at raw model outputs sooner."** I spent day two tuning the prompt against my intuition about what was wrong. When I finally dumped fifty full traces into a file and read them, the actual failure was that my chunks had lost their section headers so the model couldn't tell which policy version it was quoting — nothing to do with the prompt. **Reading a hundred outputs is the highest-yield hour in any LLM project and it is always the hour that gets skipped.**
 
-**"I'd have started with the dumbest baseline and made it earn every addition."** I began with hybrid retrieval plus reranking because I knew that's what good systems look like. That means I never measured what BM25 alone would have done, so for three days I had no idea which of my components was carrying the result. When I finally ran it, BM25-only was 0.61 — which reframed everything, because it told me the entire dense-retrieval investment was worth 13 points, not the 60 I had implicitly assumed.
+**"I'd have started with the dumbest baseline and made it earn every addition."** I began with hybrid retrieval plus reranking because I knew that's what good systems look like. That means I never measured what BM25 alone would have done, so for three days I had no idea which of my components was carrying the result. When I finally ran it, BM25-only was 0.61 — which reframed everything, because it told me that everything I built on top of BM25 — dense retrieval, fusion and the reranker together — was worth 22 points, not the 83 I had implicitly assumed.
 
 **⚠ Trap:** answering with a technology swap — "I'd use a different vector database." This reads as taste, not learning, and it invites a comparison you probably can't win. The interviewer is asking what you learned about *how you work*, and the only wrong answer is "nothing, I'd build it the same way."
 ### Suppose tomorrow morning your retrieval recall drops ten points. Walk me through what you do.
@@ -2020,7 +2024,7 @@ The taxonomy worth having ready, with what you did or didn't do about each:
 
 **Data exfiltration via tools or links.** If the model can emit a markdown image URL and the client renders it, an injected instruction can encode retrieved secrets in the query string. This is a real class, and the mitigation is egress-side: strip or allowlist outbound URLs in rendered output.
 
-**Oversized or malformed input.** Does a 400,000-character paste return a 413, or does it hit the provider and cost you $1.20 and a 30-second hang? Say which. A pre-flight token count with a hard cap is a five-line change and its absence is a real finding.
+**Oversized or malformed input.** Does a 400,000-character paste return a 413, or does it hit the provider — roughly 100,000 tokens, about $0.30 at $3 per million — and cost you a 30-second hang? Say which. A pre-flight token count with a hard cap is a five-line change and its absence is a real finding.
 
 **Cost/DoS.** An unauthenticated endpoint that costs you $0.019 per call is a $190 bill per 10,000 requests an attacker sends. Rate limiting per identity, not per IP.
 
@@ -2123,7 +2127,7 @@ This is a constraint injection, and the graded skill is whether you redesign aga
 
 **If the target is TTFT under 500 ms.** I have 930 ms, split 300 rerank + 600 provider TTFT + 30 everything else. Levers, ranked by cost-effectiveness: (1) run the reranker on GPU or cut candidates 40 → 20, buying 150–260 ms for a small recall cost; (2) cut input tokens, since prefill time scales with input — going from six chunks to three cuts 1,536 tokens, roughly a quarter of the prompt, and buys perhaps 100–150 ms of prefill; (3) prefix-cache the system prompt, which cuts both cost and prefill for the cached portion; (4) start the LLM call *before* the reranker completes by speculatively sending the top-3 from fusion and revising — complex, and I'd only do it if the first three didn't get me there. Realistic landing: 500–650 ms TTFT without touching quality much.
 
-**If the target is total under 3 seconds.** Now generation dominates — 350 tokens at 60 tok/s is 5.8 s and no retrieval optimization touches it. The levers are: shorter answers by contract (a 150-token cap gets you to 2.5 s, and for many products a shorter answer is a *better* answer); a faster model or a faster-decoding deployment; or restructuring the UI so the answer streams and the "complete" moment stops mattering. **If total-time is a hard requirement on a chat product, the correct pushback is that the requirement is probably wrong** — nobody reads faster than 60 tokens/second, so a stream that keeps ahead of the reader is subjectively instant.
+**If the target is total under 3 seconds.** Now generation dominates — 350 tokens at 60 tok/s is 5.8 s and no retrieval optimization touches it. The levers are: shorter answers by contract (a 150-token cap puts generation at 2.5 s, so about 3.4 s total once you add the 930 ms head — you need roughly a 120-token cap to land under 3 s — and for many products a shorter answer is a *better* answer); a faster model or a faster-decoding deployment; or restructuring the UI so the answer streams and the "complete" moment stops mattering. **If total-time is a hard requirement on a chat product, the correct pushback is that the requirement is probably wrong** — nobody reads faster than 60 tokens/second, so a stream that keeps ahead of the reader is subjectively instant.
 
 **If the target is p95, not p50.** Then the answer is a provider-tail problem and none of the above helps much. The design is a deadline-based hedge: start a second request to a fallback provider or a smaller model if the first has not produced a token by 800 ms, take whichever streams first, cancel the other. Costs roughly (hedge rate × second-call cost) — at a 5% hedge rate that is 0.05 × $0.019 = **$0.00095 per request, a 5% cost increase for a materially tighter tail**, which is usually an easy trade and is exactly the same hedged-request pattern used for tail latency in ordinary backend services.
 
@@ -2164,7 +2168,7 @@ Three practical consequences.
 
 Choose against the employer archetype, deliberately, and be ready to switch on ninety seconds' notice because the round sometimes opens with "tell me about anything." I keep three prepared narratives and pick by who is in the room.
 
-**AI product companies — Cursor, Perplexity, Notion, Figma, Sierra, Harvey, Glean, Ramp.** Lead with the project that has **users, a taste decision, and a quality/latency/cost trade you actually tuned.** These companies are hiring for product judgment as much as engineering: the interviewer wants to hear you say "I cut the answer length to 150 tokens because the p50 read time was shorter than the p50 generation time and users were abandoning" — a decision that came from watching people use the thing. Show the UI if there is one. Talk about what you *removed*. If you are interviewing at Cursor specifically, the reported hidden rubric is whether you are a fluent, opinionated user of AI coding tools, so a project where you drove agents hard and can say precisely where you stopped trusting them is on-thesis.
+**AI product companies — Cursor, Perplexity, Notion, Figma, Sierra, Harvey, Glean, Ramp.** Lead with the project that has **users, a taste decision, and a quality/latency/cost trade you actually tuned.** These companies are hiring for product judgment as much as engineering: the interviewer wants to hear you say "I cut the answer length to 150 tokens because the p50 read time was shorter than the p50 generation time and users were abandoning" — a decision that came from watching people use the thing. Show the UI if there is one. Talk about what you *removed*. If you are interviewing at Cursor specifically, the widely-reported (**📅 Volatile:** this is candidate hearsay, not a published rubric, and hiring bars move) emphasis is on whether you are a fluent, opinionated user of AI coding tools, so a project where you drove agents hard and can say precisely where you stopped trusting them is on-thesis.
 
 **Big-tech and enterprise applied AI — Meta, Google, Amazon, Microsoft, Databricks, Snowflake, Stripe.** Lead with **scale, rollout and measurement.** The narrative shape they reward is design-doc-shaped: problem, constraints, options considered, decision, risks, rollback, measured outcome. Emphasize the migration you did without downtime, the canary, the metric that told you it worked, the cross-team dependency you negotiated. Depth on one component is worth less here than end-to-end ownership including the boring parts. If your project served three users, reframe honestly around the engineering rather than the traffic, and say so — inflating scale is the fastest way to lose one of these rounds.
 
@@ -2180,7 +2184,7 @@ Reframe it in the first sentence, because if you let it be categorized as writin
 
 Then present it exactly as you'd present any RAG system, with real numbers.
 
-**Scale.** 1,633 question-answer entries, roughly 400,000 words, about 2.6 MB of markdown. At ~1.3 tokens per word that's **~540,000 tokens** — a corpus that is too big to stuff into a context window and small enough that half the received wisdom about vector infrastructure does not apply. Saying both halves of that sentence is the whole point.
+**Scale.** 1,633 question-answer entries, roughly 400,000 words, about 2.6 MB of markdown. At ~1.3 tokens per word that's **~520,000 tokens**, and counting the chunks directly (1,633 × ~330) gives **~540,000**, which is the figure I use below — a corpus that is too big to stuff into a context window and small enough that half the received wisdom about vector infrastructure does not apply. Saying both halves of that sentence is the whole point.
 
 **Ingestion, and the one real decision in it.** The chunking policy is not a token window — it is **one chunk per question-and-answer pair**, because the corpus has a natural semantic unit and I would be insane to split on 512 tokens across it. That gives 1,633 chunks averaging ~330 tokens, with the section title and question heading prepended to every chunk so that an embedding of an answer carries the topic it belongs to. The rejected alternative: fixed 512-token windows with 64-token overlap, which I rejected because it splits answers mid-argument and produces chunks whose first line is the tail of an unrelated question. **This is exactly the "why 512?" question, answered structurally, on my own artifact.**
 
@@ -2204,11 +2208,11 @@ The answer has three parts.
 
 **Move to the engineering immediately, because the engineering is the actual answer.** Generating a large corpus at consistent quality is a real applied-AI problem and you solved it: a section-level spec as the unit of work, parallel generation with a per-section context budget, chunked output to avoid silent truncation on long generations — **which is itself a failure mode worth naming, because a model asked for 12,000 words will happily produce 4,000 and stop** — a validation pass over format contracts, deduplication across sections, and an assembly step. That is a content pipeline with a quality gate, and describing its failure modes proves authorship far better than any claim.
 
-**Name the quality problem you have not fully solved.** "The honest weakness is verification. I have format validation and dedup, but I do not have automated factual verification of every claim, so the guarantee I can make is that I hand-checked the arithmetic and the paper attributions in the sections I use, not that all 3,000 answers are correct. If I were doing it again the first thing I'd build is a claim-extraction and citation-check pass — which is the same post-hoc verification idea I used in the RAG project."
+**Name the quality problem you have not fully solved.** "The honest weakness is verification. I have format validation and dedup, but I do not have automated factual verification of every claim, so the guarantee I can make is that I hand-checked the arithmetic and the paper attributions in the sections I use, not that all 1,633 answers are correct. If I were doing it again the first thing I'd build is a claim-extraction and citation-check pass — which is the same post-hoc verification idea I used in the RAG project."
 
 **⚠ Trap:** claiming you wrote every word. It is not credible at that volume, the interviewer already suspects, and being caught converts a neutral question into a disqualifying one. **The rule: never make a claim about your own artifact that a five-minute inspection could falsify.**
 
-**⚠ Trap:** the opposite — being so apologetic about model assistance that you disclaim the design too. At the companies on your list, using models heavily and well is the job. The differentiator is whether you can describe the harness, the failure modes and the quality gate. **Someone who ran a 3,000-item generation pipeline and can name its truncation and drift failures is demonstrating exactly the skill being hired for.**
+**⚠ Trap:** the opposite — being so apologetic about model assistance that you disclaim the design too. At the companies on your list, using models heavily and well is the job. The differentiator is whether you can describe the harness, the failure modes and the quality gate. **Someone who ran a 1,633-item generation pipeline and can name its truncation and drift failures is demonstrating exactly the skill being hired for.**
 
 ### What would you do differently on the guide and the site if you started them again?
 
@@ -2326,7 +2330,7 @@ The strong version evaluates every option against the *same axes you declared in
 
 > **Options considered.** Evaluated against the constraints above: p95 ≤ 800 ms end-to-end, ≤ $0.01/query at 50k queries/day, corpus freshness ≤ 15 min, no customer text to a non-BAA vendor.
 >
-> **A. Long-context stuffing — put the 40 most-recent policy docs in the prompt, no retrieval.** Simplest possible thing; zero index infrastructure; strictly best recall on the docs included. Rejected on cost and latency: the policy corpus is 180k tokens, so at $3/Mtok input that is $0.54/query uncached, 54× the budget, and prefill alone on 180k tokens is multiple seconds. Prompt caching would cut the marginal cost roughly 10× on cache hits, but the corpus changes hourly, which invalidates the cache. **Worth revisiting if the corpus stabilizes or if per-token prices drop another 5×.**
+> **A. Long-context stuffing — put the 40 most-recent policy docs in the prompt, no retrieval.** Simplest possible thing; zero index infrastructure; strictly best recall on the docs included. Rejected on cost and latency: those 40 docs alone are 180k tokens, so at $3/Mtok input that is $0.54/query uncached, 54× the budget, and prefill alone on 180k tokens is multiple seconds. Prompt caching would cut the marginal cost roughly 10× on cache hits, but the corpus changes hourly, which invalidates the cache. **Worth revisiting if the corpus stabilizes or if per-token prices drop another 5×.**
 >
 > **B. Dense-only retrieval with an off-the-shelf embedding model.** Cheapest to build; one index; good semantic recall. Rejected as *primary* on measured evidence: on our 120-query labelled set, dense-only recall@10 was 0.68 versus 0.81 for hybrid, and the misses were concentrated in exact-identifier queries ("policy SP-2214"), which are 22% of traffic and where lexical match is structurally better than embeddings.
 >
@@ -2346,7 +2350,7 @@ A constraints section is useful exactly when it *eliminates* options. If you can
 
 Concretely, for an AI feature there are six families, and I write them with units:
 
-**Latency.** Not "fast." State the budget *and its decomposition*: "p95 end-to-end ≤ 800 ms, of which retrieval ≤ 120 ms, rerank ≤ 80 ms, leaving 600 ms for generation. Since we stream, the graded number is TTFT ≤ 900 ms p95; total completion time may run to 4 s." Naming TTFT separately from total time is itself a seniority signal, because it shows you know a streamed LLM response has two different latency contracts.
+**Latency.** Not "fast." State the budget *and its decomposition*: "p95 to the first token ≤ 800 ms end-to-end, of which retrieval ≤ 120 ms, rerank ≤ 80 ms, leaving 600 ms for the generator to emit that first token. Since we stream, the graded number is TTFT ≤ 800 ms p95, not total completion time, which may run to 4 s." Naming TTFT separately from total time is itself a seniority signal, because it shows you know a streamed LLM response has two different latency contracts.
 
 **Cost.** A per-unit ceiling tied to a business unit: "≤ $0.01 per query at 50k queries/day = $500/day = $15k/month, against a support-tooling budget of $22k/month." Cost per *resolved task* beats cost per call whenever you can compute it, because it is the number the business actually feels.
 
@@ -2358,7 +2362,7 @@ Concretely, for an AI feature there are six families, and I write them with unit
 
 **Team and schedule.** "One engineer, six weeks, no dedicated labelling budget." This is a real constraint and writing it down is what makes "we rejected fine-tuning" honest rather than lazy.
 
-**💰 Math showing why constraints eliminate:** with a 180k-token corpus at $3/Mtok input, stuffing costs 180,000 ÷ 1,000,000 × $3 = **$0.54 per query**. Against a $0.01 ceiling that is 54× over; at 50k queries/day it is $27,000/day, $810k/month. The constraint did the work — I did not need an opinion about long context, I needed one division. **📅 Volatile:** input prices are moving fast; redo this division with today's rate card before you quote it.
+**💰 Math showing why constraints eliminate:** with 180k tokens of stuffed context at $3/Mtok input, stuffing costs 180,000 ÷ 1,000,000 × $3 = **$0.54 per query**. Against a $0.01 ceiling that is 54× over; at 50k queries/day it is $27,000/day, $810k/month. The constraint did the work — I did not need an opinion about long context, I needed one division. **📅 Volatile:** input prices are moving fast; redo this division with today's rate card before you quote it.
 
 **⚠ Trap:** writing constraints *after* the design, reverse-engineered so the chosen option passes. Reviewers detect this instantly, because reverse-engineered constraints are always suspiciously tight around exactly one solution and silent everywhere else. Write constraints from the product and the ops reality first, then let them cut.
 
@@ -2390,7 +2394,7 @@ Risks, written as a table with likelihood, blast radius, and mitigation. The fam
 
 **Retrieval corpus regression.** A reindex ships a bad chunker or a bad embedding model and recall collapses without a single exception being thrown. Mitigation: build to an alias, evaluate the new index offline against the golden set, swap the alias only on a pass, keep the previous index warm for the rollback window.
 
-**Cost blowout.** One prompt change adds 4k tokens of few-shot examples; nothing breaks; the bill triples. Mitigation: per-tenant token budgets, an alert on tokens-per-request p95 rather than only on dollars, and a cost line in every prompt-change PR.
+**Cost blowout.** One prompt change adds 4k tokens of few-shot examples; nothing breaks; the input side of the bill roughly triples. Mitigation: per-tenant token budgets, an alert on tokens-per-request p95 rather than only on dollars, and a cost line in every prompt-change PR.
 
 **Prompt-injection and exfiltration** wherever retrieved or tool-returned content reaches the model, which is essentially always in RAG and agent systems.
 
@@ -2619,7 +2623,7 @@ Here is the shape I write, and it is short on purpose — one page plus appendic
 > | Identifier | 44 | 0.523 | 0.841 | +31.8 | [+16, +47] |
 > | Conversational | 84 | 0.798 | 0.786 | −1.2 | [−9, +7] |
 > | Procedural | 40 | 0.725 | 0.750 | +2.5 | [−9, +14] |
-> | Other | 32 | 0.719 | 0.750 | +3.1 | [−12, +18] |
+> | Other | 32 | 0.719 | 0.719 | 0.0 | [−15, +15] |
 >
 > **How the statistics were computed.** Paired comparison on the same 200 queries: 22 queries newly succeed, 8 newly fail, 170 unchanged. McNemar χ² = (22−8)²/(22+8) = 196/30 = 6.53, p = 0.011. CI on the paired difference computed from the discordant counts. Slice CIs are wide because slice n is small; they are reported to show *where* the effect lives, not to support per-slice ship decisions.
 >
@@ -2629,9 +2633,9 @@ Here is the shape I write, and it is short on purpose — one page plus appendic
 >
 > **Reproduce.** `make eval-retrieval SET=v3 SYSTEMS=dense,hybrid` — 4 min, $0 (no LLM calls in this eval).
 
-**⚠ Trap:** the unpaired comparison. If you evaluate the two systems on the same 200 queries — which you should — then treating them as two independent samples throws away the pairing and *massively* inflates your uncertainty. Unpaired, the same data gives 7.0 ± 8.5 points, a CI of [−1.5, +15.5] that crosses zero, and you would conclude "no significant difference" from a result that is in fact significant. **📐 The arithmetic:** unpaired SE = √(0.71·0.29/200 + 0.78·0.22/200) = √0.00189 = 0.0434, ×1.96 = 8.5 points. Paired SE from the 30 discordant pairs ≈ √30/200 = 0.027, ×1.96 = 5.3 points. Pairing cut the interval roughly in half for free. This is the single most common statistical error in eval reports and it fails in both directions — it hides real wins and it manufactures fake ones.
+**⚠ Trap:** the unpaired comparison. If you evaluate the two systems on the same 200 queries — which you should — then treating them as two independent samples throws away the pairing and *massively* inflates your uncertainty. Unpaired, the same data gives 7.0 ± 8.5 points, a CI of [−1.5, +15.5] that crosses zero, and you would conclude "no significant difference" from a result that is in fact significant. **📐 The arithmetic:** unpaired SE = √(0.71·0.29/200 + 0.78·0.22/200) = √0.00189 = 0.0434, ×1.96 = 8.5 points. Paired SE from the 30 discordant pairs ≈ √30 ÷ 200 = 0.027, ×1.96 = 5.3 points. Pairing cut the interval by roughly 40% for free. This is the single most common statistical error in eval reports, and it has a mirror that fails the other way: unpaired analysis on paired data inflates your uncertainty and hides real wins, while a paired test applied to items that are not actually the same manufactures fake ones.
 
-**🗣 Say this in the room:** "I report the point estimate, the n, a confidence interval, and the test — and for two systems on the same set that test is paired, because unpaired analysis on paired data roughly doubles the interval and will make you ship or kill the wrong change. Then I report slices, because the overall number here is an average over a 32-point win on identifiers and a wash on conversational queries, and those are different products."
+**🗣 Say this in the room:** "I report the point estimate, the n, a confidence interval, and the test — and for two systems on the same set that test is paired, because unpaired analysis on paired data widens the interval by about 60% here — 5.3 points to 8.5 — and will make you kill a change that actually won. Then I report slices, because the overall number here is an average over a 32-point win on identifiers and a wash on conversational queries, and those are different products."
 
 ### What statistics does an eval report actually need? Assume I'll push on whether your 3-point improvement is real.
 
@@ -2662,7 +2666,7 @@ The standard list I write against, in order of how often it bites:
 > 2. **It does not generalize past March traffic.** The set is drawn from 2026-03-01 to 03-28. Our query mix shifts with product launches; the identifier slice was 22% in March and was 9% in January.
 > 3. **It does not cover the long tail of zero-result queries** beyond the 11 present in the set — too few to say anything about.
 > 4. **It is not a latency or cost verdict.** Both were measured on a warm staging index with no contention; production p95 under load will be worse and the number in §5 should be treated as a floor.
-> 5. **Slice results are directional only.** With n = 32 to 84 per slice, every slice CI is 12–35 points wide. I would not ship a slice-specific behaviour change on this evidence.
+> 5. **Slice results are directional only.** With n = 32 to 84 per slice, every slice CI in the table above is 16–31 points wide. I would not ship a slice-specific behaviour change on this evidence.
 > 6. **It says nothing about adversarial or prompt-injected inputs.** No such queries are in the set. Tracked as a gap.
 > 7. **Annotator agreement was 93% (14 disagreements / 200)**, so roughly 7% of the labels are contestable, which is the same order as the effect on some slices.
 
@@ -2684,7 +2688,7 @@ Three distinct problems hide in that one sentence, and a senior reviewer will na
 
 The caveat paragraph I would actually write:
 
-> **Sampling caveats.** This set is drawn from March production logs, so it reflects queries users currently believe the system can answer; failure modes severe enough to have trained users away from asking are structurally underrepresented, and the 40-query elicited slice exists to partially cover that. The set is frozen and dated; it will drift from live traffic and should be re-sampled quarterly, with the March set retained for longitudinal comparison. Prompt iteration during this cycle used the 120-query dev split only; the 200-query set reported here was untouched between 2026-03-30 and this run, so it is a clean holdout for this change but *not* for future changes unless re-frozen.
+> **Sampling caveats.** This set is drawn from March production logs, so it reflects queries users currently believe the system can answer; failure modes severe enough to have trained users away from asking are structurally underrepresented, and a separate 40-query elicited slice, held alongside these 200 rather than mixed into them, exists to partially cover that. The set is frozen and dated; it will drift from live traffic and should be re-sampled quarterly, with the March set retained for longitudinal comparison. Prompt iteration during this cycle used the 120-query dev split only; the 200-query set reported here was untouched between 2026-03-30 and this run, so it is a clean holdout for this change but *not* for future changes unless re-frozen.
 
 **⚠ Trap:** the eval set that quietly becomes a training set. You iterate against it for three months, and every prompt tweak that helped was selected *because* it helped on that set. The number does not become obviously fake, it becomes gradually optimistic — I have seen a set drift from a genuine 0.74 to a reported 0.89 while blind user-facing quality stayed flat. **The rule I enforce: any eval set you look at more than a handful of times is a dev set, and dev-set numbers never go in a ship decision.** Budget for a sealed set from day one; it is the cheapest insurance in the whole discipline.
 
@@ -2695,7 +2699,7 @@ Structure first, then the specific content, because the structure is what makes 
 > **Post-mortem — assistant quoted a superseded price to 47 customers, 2026-05-12**
 > **Status:** resolved. **Author:** H. Nakrani. **Severity:** SEV-2 (customer-facing, financial). **Blameless — this document names systems, not people.**
 >
-> **Summary (read this if you read nothing else).** Between 09:14 and 15:40 UTC on May 12, the support assistant quoted the pre-April pricing table to 47 customers, of which 6 accepted; we honoured all 6 at a one-time cost of $4,820. The superseded price page was still present in the index because our ingestion pipeline does not process deletions — only creates and updates. No component errored, no alert fired, and detection came from a support agent noticing an odd quote 6h26m after onset.
+> **Summary (read this if you read nothing else).** Between 09:14 and 15:40 UTC on May 12, the support assistant quoted the pre-April pricing table to 47 customers, of which 6 accepted; we honoured all 6 at a one-time cost of $4,820. The superseded price page was still present in the index because our ingestion pipeline does not process deletions — only creates and updates. No component errored and no alert fired: the first human signal was a support agent flagging an odd quote at 12:03 (2h49m after onset), and it took until 15:40 — 6h26m from onset — to confirm the cause.
 >
 > **Impact.** 47 affected conversations, 6 honoured discounts, $4,820 direct cost, ~9 hours of support and finance time, one escalated customer complaint. No data loss, no availability impact, no PII exposure.
 >
@@ -2730,7 +2734,7 @@ Structure first, then the specific content, because the structure is what makes 
 
 Four differences, and they all trace to the same source: the system degrades rather than fails, and the failure is not reproducible on demand.
 
-**Time-to-detect dominates time-to-repair, and often by two orders of magnitude.** In the incident above: 6h26m to detect, 12 minutes to mitigate. Your backend post-mortems are usually the reverse — the pager fires in 90 seconds and you spend three hours fixing. So the *action items shift from prevention to detection*. A post-mortem for an AI incident whose action list contains no new monitor has probably missed the point, and I will say so in review.
+**Time-to-detect dominates time-to-repair, and often by one to two orders of magnitude.** In the incident above: 6h26m from onset to confirmed detection, 12 minutes to mitigate once confirmed — a factor of 32. Your backend post-mortems are usually the reverse — the pager fires in 90 seconds and you spend three hours fixing. So the *action items shift from prevention to detection*. A post-mortem for an AI incident whose action list contains no new monitor has probably missed the point, and I will say so in review.
 
 **Reproduction is a step, not an assumption.** A backend post-mortem can say "we reproduced it on staging." Here you must first ask whether you *can*: do you have the exact rendered prompt, the model version string, the sampling parameters, the retrieved chunk IDs, the tool outputs? If any of those were not logged, the honest post-mortem says "we could not reproduce; the following is inference from partial logs," and its first action item is the logging gap. That sentence is uncomfortable to write and it is the mark of a serious author.
 
@@ -2786,7 +2790,7 @@ What I put in an internal one, on two pages:
 
 **Change log**, because a card that describes last quarter's system is worse than no card — readers trust it and are wrong.
 
-**⚠ Trap:** the card that reports one aggregate accuracy number. An 87% aggregate hides an 87% on the majority slice and 54% on the slice a specific team depends on, and that team will adopt your system on the strength of the 87% and be silently failing half the time. **The disaggregation is not an appendix to a model card; it is the model card.** If you write only one section, write the slice table.
+**⚠ Trap:** the card that reports one aggregate accuracy number. An 87% aggregate hides a 90% on the majority slice and 54% on the smaller slice a specific team depends on, and that team will adopt your system on the strength of the 87% and be silently failing half the time. **The disaggregation is not an appendix to a model card; it is the model card.** If you write only one section, write the slice table.
 
 ### How do you choose the slices, and what do you do when a slice looks bad?
 
@@ -2842,7 +2846,7 @@ Four moves in that reply, and they are reusable: give the number, explain *why* 
 
 **⚠ Trap:** explaining sampling, temperature, or token probabilities to a business stakeholder. It feels like honesty and it lands as evasion, because you have answered a question about risk with a lecture about mechanism. **The rule: for a non-technical reader, describe the behaviour and the containment, never the mechanism** — unless they ask, in which case answer in one sentence and stop. The condescension failure mode is the mirror image: "it's a large language model, it just predicts the next word, so it can't really be accurate" is both dismissive and wrong, and it tells the VP the project should be cancelled.
 
-### Same stakeholder asks why the bill went up 40% when traffic was flat. Explain it without jargon.
+### Same stakeholder asks why the bill nearly doubled when traffic was flat. Explain it without jargon.
 
 Lead with the cause in business terms, then show the arithmetic in units they own, then give them the lever. The trick with cost is that **you must convert to a per-business-unit denominator**, because "$0.026 per model call" is a number nobody can govern and "$0.59 per deflected ticket" is a number they can compare to a salary.
 
@@ -2890,7 +2894,7 @@ What I write, in this order, and I would hold it to about 1,500–2,500 words:
 
 ### How do you spend those two hours? Give me the clock.
 
-I run it as five timeboxes with hard edges, because the failure mode here is identical to the take-home failure mode — building until the clock runs out and shipping something with no summary and no conclusion.
+I run it as six timeboxes with hard edges, because the failure mode here is identical to the take-home failure mode — building until the clock runs out and shipping something with no summary and no conclusion.
 
 **0:00–0:10 — Read the prompt twice and extract the rubric.** Every noun in the prompt is a graded axis. "Customer-support agent for our product" with a line about "we have 400k help-centre articles and strict SLAs" means retrieval scale and latency are graded, and I will make sure both have their own subsection with numbers. Write the list of graded axes down; it becomes your outline.
 
@@ -3003,7 +3007,7 @@ Senior, for an AI codebase specifically:
 perf(retrieval): rerank top-50 instead of top-200
 
 Cross-encoder reranking of 200 candidates cost 410ms p95 and blew the
-800ms end-to-end budget. Cutting to top-50 costs 3 points of precision@5
+800ms end-to-end budget. Cutting to top-50 costs 2 points of precision@5
 (0.79 -> 0.77 on golden_v3, n=200) and returns 330ms.
 
 Eval: make eval-retrieval SET=v3 -- recall@10 unchanged at 0.780,
@@ -3089,7 +3093,7 @@ interval at n=84). Multi-hop questions still fail; tracked in #4471.
 
 The sections that do the heavy lifting are **Results** (a table, not a claim), **considered and rejected** (pre-empts the reviewer's alternative), **rollback** (tells them the blast radius of approving), and **what this doesn't fix** (tells them you are not overselling). A reviewer reading that has everything they need to approve or to object substantively, and neither response requires a meeting.
 
-**💰 Math on why this is worth eight minutes:** a PR that triggers a 30-minute clarification meeting with two engineers costs one hour of senior time, ~$120 fully loaded, plus a context-switch and typically a day of calendar latency. Eight minutes of writing against a ~40% chance of a meeting is roughly break-even on the first PR and strongly positive after that — and the calendar-latency saving, a day per PR on a team merging 40 PRs a month, is the part that actually compounds.
+**💰 Math on why this is worth eight minutes:** a PR that triggers a 30-minute clarification meeting with two engineers costs one hour of senior time, ~$120 fully loaded, plus a context-switch and typically a day of calendar latency. Eight minutes of the same senior time is ~$16 against a ~40% chance of a $120 meeting, so an expected ~3× return on the first PR and better after that as the template amortizes — and the calendar-latency saving, a day per PR on a team merging 40 PRs a month, is the part that actually compounds.
 
 ### Which kind of public writing actually converts into interviews, and how do you structure each one?
 
@@ -3115,11 +3119,11 @@ Five drills, in the order I would run them over two weeks. All unaided — no AI
 
 **🏋 Drill 2 — The five-line ADR (10 min, three times).** Take three decisions you made in the last month — including one you would now reverse — and write each as an ADR: context, decision, consequences with at least one honest negative, and a revisit trigger. **Pass:** each fits on one screen, each has a numeric fact in the context, and the reversal one honestly states what you got wrong without editorializing.
 
-**🏋 Drill 3 — The eval report from raw numbers (25 min).** Given a made-up but plausible before/after result on a 200-item set, write the full report: conclusion, what was measured, on what set, the slice table, the statistics *computed by hand*, and the "what I cannot conclude" section. **Pass:** you compute the paired interval unaided; you correctly state why the unpaired interval would be roughly double; the limitations section has at least five items; and the report still ends in a recommendation.
+**🏋 Drill 3 — The eval report from raw numbers (25 min).** Given a made-up but plausible before/after result on a 200-item set, write the full report: conclusion, what was measured, on what set, the slice table, the statistics *computed by hand*, and the "what I cannot conclude" section. **Pass:** you compute the paired interval unaided; you correctly state why the unpaired interval would be substantially wider; the limitations section has at least five items; and the report still ends in a recommendation.
 
 **🏋 Drill 4 — The post-mortem from a scenario (30 min).** Take a scenario cold — "the agent called the refund API twice for 3% of conversations for nine days," "recall dropped 10 points overnight after a reindex," "the assistant started refusing 30% of legitimate questions after a model version bump" — and write the full post-mortem: summary, impact with numbers, timeline, at least four contributing factors, why the tests didn't catch it, and an action table where at least one row is a committed eval case. **Pass:** no single root cause; at least one action item is a *detection* mechanism rather than a fix; and the "why tests didn't catch it" section distinguishes "case missing" from "harness couldn't express it."
 
-**🏋 Drill 5 — The full two-hour architecture doc (120 min, three times).** As specified earlier: prompt cold, clock hard, five timeboxes, summary box written last. **Pass:** all five criteria from that question, and by the third run you finish in 90 minutes.
+**🏋 Drill 5 — The full two-hour architecture doc (120 min, three times).** As specified earlier: prompt cold, clock hard, six timeboxes, summary box written last. **Pass:** all five criteria from that question, and by the third run you finish in 90 minutes.
 
 The meta-drill that ties it together: **read your own document from six months ago and mark every sentence that a reader could not act on.** That ratio — actionable sentences over total sentences — is the single number that tracks improvement in technical writing, and watching it climb from a third to two-thirds is what the whole discipline feels like from the inside.
 

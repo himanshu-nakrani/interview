@@ -111,7 +111,7 @@ def sdpa(q, k, v, mask=None):
     return attn @ v                                             # [B, H, Tq, D]
 ```
 
-Line by line on cost, for `B=1, H=32, T=2048, D=128`. The first matmul is `2·B·H·T²·D = 2·32·2048²·128 ≈ 3.4e10` FLOPs and *materializes* a `[1,32,2048,2048]` tensor: 134M elements, 268 MB in bf16. The `masked_fill` allocates another one of those unless you fuse. The softmax reads and writes it again — that's 3 more passes over 268 MB, and at ~3 TB/s of HBM bandwidth on an H100 that's `3 × 0.268 GB / 3000 GB/s ≈ 0.27 ms` of pure memory traffic for an operation whose math takes maybe 0.02 ms. That ratio — 10× more time moving the score matrix than computing it — is precisely the observation FlashAttention monetizes.
+Line by line on cost, for `B=1, H=32, T=2048, D=128`. The first matmul is `2·B·H·T²·D = 2·32·2048²·128 ≈ 3.4e10` FLOPs and *materializes* a `[1,32,2048,2048]` tensor: 134M elements, 268 MB in bf16. The `masked_fill` allocates another one of those unless you fuse. The softmax reads and writes it again — that's 3 more passes over 268 MB, and at ~3 TB/s of HBM bandwidth on an H100 that's `3 × 0.268 GB / 3000 GB/s ≈ 0.27 ms` of pure memory traffic for an operation whose math takes `3.4e10 / 989e12 ≈ 0.035 ms` at H100 peak bf16. That ratio — roughly 8× more time moving the score matrix than computing it — is precisely the observation FlashAttention monetizes.
 
 In production you do not write this. You write:
 
@@ -163,9 +163,9 @@ FLOPs per attention layer ≈ 8·T·D²  (projections)  +  4·T²·D  (the T×T 
 
 The score *memory* is also head-count invariant in total: `B·H·T²` elements is `B·H·T²`, and `H` doesn't cancel there — but at fixed `H` it's fixed; comparing `H=8` to `H=64` at the same `d_model` does change score memory by 8×, and that's the one asymmetry. That's a good detail to volunteer.
 
-**💰 Math — the crossing point, which is the real question behind this one.** Attention's quadratic term overtakes the projections when `4T²D > 8TD²`, i.e. `T > 2D`. For Llama-3-8B (`D = 4096`) that's `T > 8192`. So at 2k context the `T×T` machinery is a *minority* of the block's FLOPs — roughly `4·2048²·4096 / (8·2048·4096²) = 1/4` — and people who say "attention is quadratic so it dominates" at 2k are wrong. At 128k context, the ratio is `4·131072²·4096` vs `8·131072·4096²` = **16×** in favour of attention. That single ratio, `T / 2D`, is the entire economic argument for sliding windows, linear attention, and SSM hybrids: it only bites past `T ≈ 2·d_model`.
+**💰 Math — the crossing point, which is the real question behind this one.** Attention's quadratic term overtakes the *attention projections* when `4T²D > 8TD²`, i.e. `T > 2D`. For Llama-3-8B (`D = 4096`) that's `T > 8192`. So at 2k context the `T×T` machinery is a *minority* of the block's FLOPs — it is only `4·2048²·4096 / (8·2048·4096²) = 1/4` of the Q/K/V/O projection cost alone, and a smaller fraction still once you count the FFN — and people who say "attention is quadratic so it dominates" at 2k are wrong. At 128k context, the ratio is `4·131072²·4096` vs `8·131072·4096²` = **16×** in favour of attention. That single ratio, `T / 2D`, is the entire economic argument for sliding windows, linear attention, and SSM hybrids: it only bites past `T ≈ 2·d_model`.
 
-**📐 Numbers you must know:** attention FLOPs cross FFN+projection FLOPs at `T ≈ 2·d_model`. Llama-3-8B: 8k. Llama-3-70B (`d_model = 8192`): 16k. Derive it live from `4T²D` vs `8TD²`; do not memorize the crossing points.
+**📐 Numbers you must know:** attention FLOPs cross the *projection* FLOPs at `T ≈ 2·d_model`. Llama-3-8B: 8k. Llama-3-70B (`d_model = 8192`): 16k. Derive it live from `4T²D` vs `8TD²`; do not memorize the crossing points. And state the caveat: fold the FFN in (roughly 2.5–3× the projection FLOPs for a SwiGLU block with `d_ffn ≈ 3.5·d_model`) and the crossover against the *whole* block moves out several-fold further — so `2·d_model` is the attention-vs-projections crossover, not the point at which attention dominates the layer.
 
 ### Give me the compute and memory complexity of attention. Be precise about where the T² memory actually lives.
 
@@ -281,7 +281,7 @@ The three places it bites:
 
 **3. Accumulating the softmax denominator.** Summing `T` terms each ≤ 1 in fp16 with T = 128k: fp16 has ~3 decimal digits, so once the running sum exceeds ~2048 further additions of small terms are silently dropped. Every kernel accumulates the running sum and running max in **fp32**, regardless of the storage dtype of Q/K/V.
 
-**📐 Numbers you must know:** fp16 max = 65504 (5-bit exponent, 10-bit mantissa); bf16 max ≈ 3.39e38 with 8-bit mantissa — same exponent as fp32, ~3 decimal digits of precision vs fp16's ~3.3. Rule: bf16 for training and for anything with a dynamic range you don't control; fp16 only where you have a loss scaler or a known-bounded range. Both need fp32 accumulation in softmax, LayerNorm statistics, and loss reduction.
+**📐 Numbers you must know:** fp16 max = 65504 (5-bit exponent, 10 stored mantissa bits = 11 effective); bf16 max ≈ 3.39e38 (8-bit exponent, 7 stored mantissa bits = 8 effective) — same exponent as fp32, ~2.4 decimal digits of precision vs fp16's ~3.3. Rule: bf16 for training and for anything with a dynamic range you don't control; fp16 only where you have a loss scaler or a known-bounded range. Both need fp32 accumulation in softmax, LayerNorm statistics, and loss reduction.
 
 **⚠ Trap:** "bf16 is more accurate than fp16." It is strictly *less* precise (8 mantissa bits vs 11 effective). It's preferred because the failures of insufficient range are catastrophic and silent, while the failures of insufficient precision are gradual and mostly absorbed by SGD noise. Say it that way and you sound like you've debugged a training run.
 
@@ -314,7 +314,7 @@ How you get a fully-masked row, in the order I check:
 
 The two defenses I actually ship. First, a data-layer invariant: every sequence has at least one real token, asserted in the collator, cheap and catches (1) and (4). Second, if you genuinely cannot guarantee it, don't fix it in the softmax — fix it in the mask, by forcing `keep[..., 0] = True` for any otherwise-empty row so it attends to a single dummy position, and then zero that query's output explicitly. That produces a defined, inspectable zero rather than a NaN.
 
-**💰 Math — what this costs.** A NaN at step 4,300 of a run that checkpoints every 1,000 steps costs you 3,300 steps of recompute. On 64×H100 at ~$2.50/GPU-hour, if those 3,300 steps took 4 hours, that's `64 × 4 × $2.50 = $640` of GPU time — trivial. The real cost is the 1.5 days of a senior engineer bisecting the data loader, and the fact that you only find it after it happens twice. A three-line assertion in the collator is one of the highest-ROI things in a training stack.
+**💰 Math — what this costs.** A NaN at step 4,300 of a run that checkpoints every 1,000 steps costs you 300 steps of recompute — you restart from the step-4,000 checkpoint. On 64×H100 at ~$2.50/GPU-hour (**📅 Volatile:** GPU rental pricing moves constantly; use your own contract rate), if those 300 steps took an hour, that's `64 × 1 × $2.50 = $160` of GPU time — trivial. The real cost is the 1.5 days of a senior engineer bisecting the data loader, and the fact that you only find it after it happens twice. A three-line assertion in the collator is one of the highest-ROI things in a training stack.
 
 ### Explain the online softmax trick and why every fast attention kernel is built on it.
 
@@ -403,7 +403,7 @@ Where it *does* survive, and this is the judgment part:
 
 An induction head implements pattern completion over the context: having seen `... A B ... A`, it predicts `B`. Not because `B` is likely in general, but because *in this context* `A` was followed by `B`. That is the minimal mechanism for learning from the prompt rather than from the weights — which is the definition of in-context learning.
 
-It takes **two layers**, and the two-layer circuit is the part to be able to draw. In layer 0, a **previous-token head** attends from each position to the position immediately before it and writes the previous token's identity into the current position's residual stream. So after layer 0, position `j` holds a composite: "I am token `B`, and I was preceded by token `A`." In layer 1, the **induction head** at the final position (currently `A`) forms a query from "I am token `A`" and matches it against keys built from the *previous-token* information written in layer 0 — so it finds positions whose predecessor was `A`. That's position `j`. Its OV circuit then copies `j`'s token identity (`B`) into the output, boosting `B`'s logit. Read as circuits: it's a QK-composition (layer 1's key reads what layer 0's OV wrote) plus a copying OV circuit.
+It takes **two layers**, and the two-layer circuit is the part to be able to draw. In layer 0, a **previous-token head** attends from each position to the position immediately before it and writes the previous token's identity into the current position's residual stream. So after layer 0, position `j` holds a composite: "I am token `B`, and I was preceded by token `A`." In layer 1, the **induction head** at the final position (currently `A`) forms a query from "I am token `A`" and matches it against keys built from the *previous-token* information written in layer 0 — so it finds positions whose predecessor was `A`. That's position `j`. Its OV circuit then copies `j`'s token identity (`B`) into the output, boosting `B`'s logit. Read as circuits: it's **K-composition** in the Elhage taxonomy (layer 1's *key* reads what layer 0's OV wrote) plus a copying OV circuit.
 
 **📄 Paper:** Elhage et al. (2021) identified the two-layer prefix-matching-plus-copying circuit in attention-only toy models; Olsson et al. (2022), *In-Context Learning and Induction Heads*, showed the formation of induction heads coincides with a visible **phase change** in the training loss curve — a small bump then a sharp drop — and that the model's in-context learning ability appears at the same moment across model scales. That co-occurrence is the evidence behind "induction heads explain ICL."
 
@@ -446,7 +446,7 @@ What makes it correct is causality plus the fact that K and V depend only on the
 
 What you do **not** cache: queries (position `n`'s query is needed only at step `n`), attention weights (they change every step because the query changes), FFN activations (recomputed from the new token only), or the logits. It's exactly K and V, per layer, per head.
 
-So the decode step becomes: take the single new token, compute `q, k, v` for it (three `[1, d] × [d, d]` matvecs), append `k, v` to the cache, attend the single query against `t+1` cached keys, and run the FFN on one token. Total FLOPs per token ≈ `2N` where `N` is parameter count, plus `4 · n_layers · n_kv_heads · d_head · t` for the attention against the cache.
+So the decode step becomes: take the single new token, compute `q, k, v` for it (three `[1, d] × [d, d]` matvecs), append `k, v` to the cache, attend the single query against `t+1` cached keys, and run the FFN on one token. Total FLOPs per token ≈ `2N` where `N` is parameter count, plus `4 · n_layers · n_heads · d_head · t` for the attention against the cache — note that term uses `n_heads`, the *query* head count, not `n_kv_heads`: GQA cuts the bytes you store and read, not the FLOPs you do.
 
 **⚠ Trap:** "the KV cache stores the previous tokens." It stores the *projected* K and V per layer — the token IDs and embeddings are not what's cached, and there are `2 × n_layers` tensors per sequence, not one. Candidates who say "we cache the previous tokens" get asked "how big is it" and cannot answer.
 
@@ -551,7 +551,7 @@ Sixty-four gigabytes for **one** sequence, on a card that has 80 GB total and is
 
 **Under GQA.** The code changes in exactly one place: `wk` and `wv` project to `n_kv_heads × d_head` instead of `d_model`, so `k` and `v` come out `[B, n_kv, T, dh]` while `q` stays `[B, H, T, dh]`. Before the score matmul you must expand the KV heads to match the query heads — `k.repeat_interleave(H // n_kv, dim=1)`, or better `k[:, :, None].expand(...)` which doesn't copy, or best, pass `enable_gqa=True` to `F.scaled_dot_product_attention` and let the kernel handle it. The cache formula's `n_heads` becomes `n_kv_heads`: at `n_kv = 8` instead of 32, the 64 GB above becomes **16 GB**. FLOPs are unchanged (you still do `H` query heads' worth of work); only the bytes moved and stored change. That distinction — memory yes, FLOPs no — is the graded part.
 
-**At batch size 1.** The character of the computation changes completely. During decode with `T_q = 1`, every matmul in the model is a matrix-*vector* product: arithmetic intensity is ~2 FLOPs per parameter byte read, so you are memory-bandwidth-bound, not compute-bound. Concretely, for an 8B model in bf16 you must read 16 GB of weights per token; on an H100 at ~3.35 TB/s that's a hard floor of `16 / 3350 ≈ 4.8 ms/token ≈ 210 tokens/s`, and no amount of extra FLOPs capacity helps. Batching is how you amortize that weight read across many sequences — at batch 32 you read the same 16 GB once and produce 32 tokens, so per-token cost drops ~32× until the KV cache reads (which do *not* amortize, being per-sequence) become the new bottleneck.
+**At batch size 1.** The character of the computation changes completely. During decode with `T_q = 1`, every matmul in the model is a matrix-*vector* product: arithmetic intensity is ~1 FLOP per byte of weights read in bf16 (2 FLOPs per parameter, 2 bytes per parameter), so you are memory-bandwidth-bound, not compute-bound. Concretely, for an 8B model in bf16 you must read 16 GB of weights per token; on an H100 at ~3.35 TB/s that's a hard floor of `16 / 3350 ≈ 4.8 ms/token ≈ 210 tokens/s`, and no amount of extra FLOPs capacity helps. Batching is how you amortize that weight read across many sequences — at batch 32 you read the same 16 GB once and produce 32 tokens, so per-token cost drops ~32× until the KV cache reads (which do *not* amortize, being per-sequence) become the new bottleneck.
 
 **📐 Numbers you must know:** `KV bytes/token = 2 × n_layers × n_kv_heads × d_head × dtype_bytes`. Derive it from the code, never recite it. For a 32-layer / 8-KV-head / 128-dim / bf16 model it is 128 KB/token, which is the single most useful constant in LLM serving.
 
@@ -613,7 +613,7 @@ They are the same mathematical operation and two completely different computatio
 | Score shape | `[B, H, T_p, T_p]` | `[B, H, 1, T_kv]` |
 | Core op | matmul (GEMM) | matrix-vector (GEMV) |
 | Bound by | compute (FLOPs) | memory bandwidth |
-| Arithmetic intensity | ~`T_p` FLOPs/byte | ~2 FLOPs/byte |
+| Arithmetic intensity | ~`T_p` FLOPs/byte | ~1 FLOP/byte (bf16 weights) |
 | Metric it drives | TTFT | ITL / TPOT |
 | Parallelism | across `T_p` positions | across batch only |
 
@@ -769,13 +769,13 @@ That asymmetry is the defining operational fact of LLM systems, and I'd unpack f
 
 **Training scales with hardware; decode scales with clock.** Training throughput is `tokens/sec` and you buy more of it with more GPUs. Decode latency for one sequence is `n_output × time_per_step`, and `time_per_step` has a hard floor set by how fast you can stream the weights out of HBM. Adding a second GPU via tensor parallelism cuts the per-step time somewhat (each card reads half the weights) but adds an all-reduce per layer, so the scaling is sublinear and saturates quickly. **You cannot buy your way to low per-sequence latency the way you can buy throughput.**
 
-**This is what makes decode memory-bandwidth-bound.** At batch 1, the model does ~2 FLOPs per parameter *byte* read, versus an H100's ratio of roughly `989e12 FLOP/s ÷ 3.35e12 byte/s ≈ 295` FLOPs per byte before you saturate compute. You're off by two orders of magnitude, running the tensor cores at ~1% utilization, and the only lever is reading fewer bytes: quantize the weights, batch more sequences, or produce more than one token per weight read.
+**This is what makes decode memory-bandwidth-bound.** At batch 1, the model does ~1 FLOP per *byte* of weights read in bf16 — 2 FLOPs per parameter, 2 bytes per parameter — versus an H100's ratio of roughly `989e12 FLOP/s ÷ 3.35e12 byte/s ≈ 295` FLOPs per byte before you saturate compute. You're off by more than two orders of magnitude, running the tensor cores at well under 1% utilization, and the only lever is reading fewer bytes: quantize the weights, batch more sequences, or produce more than one token per weight read.
 
 **Which is exactly the design space of every decode optimization.** Speculative decoding produces `k` candidate tokens per weight read using a cheap draft model and verifies them in one pass — it converts serial steps into parallel verification. Medusa-style multi-head prediction does the same with extra heads instead of a draft model. Quantization to fp8 or int4 halves or quarters the bytes read per step. Continuous batching amortizes the weight read across concurrent users. Every one of these is attacking the same denominator.
 
 **💰 Math:** an 8B model in bf16 is 16 GB. At 3.35 TB/s: `16/3350 = 4.78 ms` per decode step, floor, ignoring KV reads and all overhead — so **209 tokens/s** maximum for one sequence. Quantize to fp8 (8 GB): 2.39 ms, 418 tok/s. Add speculative decoding at an accepted-length of 2.5: ~1000 tok/s effective. Those three numbers are the honest ceiling of what you can promise a product team for single-stream latency, and they're derived from one division, not from a benchmark.
 
-**🗣 Say this in the room:** "Training parallelizes over positions because the sequence is known; decode can't, because token `t+1` depends on token `t`. That serial dependency at batch 1 gives you ~2 FLOPs per byte of weights read, versus an H100's ~295 FLOP-per-byte balance point, so you're bandwidth-bound at about 1% tensor-core utilization. Every decode optimization is either reading fewer bytes or producing more tokens per read."
+**🗣 Say this in the room:** "Training parallelizes over positions because the sequence is known; decode can't, because token `t+1` depends on token `t`. That serial dependency at batch 1 gives you ~1 FLOP per byte of weights read in bf16 — two FLOPs per parameter, two bytes per parameter — versus an H100's ~295 FLOP-per-byte balance point, so you're bandwidth-bound at well under 1% tensor-core utilization. Every decode optimization is either reading fewer bytes or producing more tokens per read."
 
 ### Someone proposes replacing softmax with a cheaper nonlinearity in your production model. Evaluate the proposal.
 
@@ -793,7 +793,7 @@ My review position, stated as a rule: **the burden of proof is on the replacemen
 
 Let me put numbers on the pressure first, because the design follows from the arithmetic.
 
-**Prefill cost.** 128k tokens through an 8B model: `2 × 8e9 × 131072 = 2.1e15` FLOPs for the dense part. Plus the attention term, which is `4 · T² · d_model` per layer, so across 32 layers: `4 × 131072² × 4096 × 32 = 9.0e15` FLOPs. Attention is **four times** the dense cost at this length, which is the `T/2D = 131072/8192 = 16×` ratio from earlier applied per-layer. Total ≈ `1.1e16` FLOPs. At 400 TFLOP/s achieved: `1.1e16 / 4e14 = 27 seconds` of TTFT for one request. That is the headline problem, and no one will accept it.
+**Prefill cost.** 128k tokens through an 8B model: `2 × 8e9 × 131072 = 2.1e15` FLOPs for the dense part. Plus the attention term, which is `4 · T² · d_model` per layer, so across 32 layers: `4 × 131072² × 4096 × 32 = 9.0e15` FLOPs. Attention is **four times** the total dense cost at this length — and 16× the Q/K/V/O projections alone, which is the `T/2D = 131072/8192 = 16` ratio from earlier. Total ≈ `1.1e16` FLOPs. At 400 TFLOP/s achieved: `1.1e16 / 4e14 = 27 seconds` of TTFT for one request. That is the headline problem, and no one will accept it.
 
 **KV memory.** At 128 KB/token (32 layers, 8 KV heads, 128 dims, bf16), 128k tokens is **16 GB per concurrent request**. On an 80 GB card holding 16 GB of weights, you fit `(80 − 16 − 8 overhead) / 16 ≈ 3.5` concurrent 128k requests. Three and a half. That's your entire concurrency budget on a $30k GPU.
 
@@ -804,7 +804,7 @@ Now the design, in the order I'd apply it — and the first three moves are all 
 3. **Chunked prefill** so a 128k prefill doesn't monopolize the GPU and stall every other user's decode. Slice into ~2k-token chunks, interleave decode steps between them. This trades a little TTFT on the long request for a lot of ITL stability across the fleet, and it's the difference between a p99 that tracks the mean and one that's 30 s.
 4. **Then, and only then, the model-level levers:** GQA or MLA to cut KV bytes; fp8 KV quantization for a further 2×; sliding-window or interleaved local:global layers if you control the architecture. These are §11 and §12 territory and they multiply with everything above.
 
-**💰 The full economics.** Say 50k document-QA requests/day. Naive 128k stuffing: 27 s of GPU-exclusive prefill each = `50,000 × 27 = 1.35e6` GPU-seconds/day = 375 GPU-hours/day, which needs ~16 H100s running flat out; at $2.50/hr that's `375 × 2.50 = $938/day ≈ $28k/month`. With retrieval to 8k plus 90% prefix-cache hit: `50,000 × 0.41 × 0.1 (miss rate) + 50,000 × 0.04 (cached path) = 2,050 + 2,000 = ~4,050` GPU-seconds/day ≈ 1.1 GPU-hours/day ≈ **$85/month**. A 300× cost reduction that costs you a retrieval pipeline and a chunking strategy. This is the arithmetic I want a candidate to produce unprompted when someone says "we'll just use the long context window."
+**💰 The full economics.** (**📅 Volatile:** every dollar figure below assumes $2.50/H100-hour and ~$30k list price for the card — rental rates and hardware prices move fast; re-derive with your own numbers, the *structure* of the argument is what's stable.) Say 50k document-QA requests/day. Naive 128k stuffing: 27 s of GPU-exclusive prefill each = `50,000 × 27 = 1.35e6` GPU-seconds/day = 375 GPU-hours/day, which needs ~16 H100s running flat out; at $2.50/hr that's `375 × 2.50 = $938/day ≈ $28k/month`. With retrieval to 8k plus 90% prefix-cache hit: `50,000 × 0.41 × 0.1 (miss rate) + 50,000 × 0.04 (cached path) = 2,050 + 2,000 = ~4,050` GPU-seconds/day ≈ 1.1 GPU-hours/day ≈ **$85/month**. A 300× cost reduction that costs you a retrieval pipeline and a chunking strategy. This is the arithmetic I want a candidate to produce unprompted when someone says "we'll just use the long context window."
 
 **⚠ Trap:** treating the advertised context limit as a capability rather than a limit. Quality degrades measurably well before the advertised maximum — the lost-in-the-middle effect and general context rot are real and reproducible. Long context is a *fallback* for when retrieval fails, not a replacement for retrieval.
 
@@ -935,7 +935,7 @@ If you can pass 1–3 you can implement decode. If you can pass 4–5 you can im
 You'll need `output_attentions=True` or an equivalent hook, and you must run the *eager* attention path since fused kernels don't return weights — say that out loud, because knowing it is part of the exercise. **📅 Volatile:** the exact flag name and which backends support returning weights change across library versions.
 
 **Pass criteria:**
-- The numbers are produced without a `for` loop over positions (vectorized reductions only), and memory stays bounded — you must not hold all layers' `[B,H,T,T]` tensors simultaneously. At `B=16, H=32, T=512, 32 layers` in fp32 that would be `16 × 32 × 512² × 4 × 32 = 1.7e11` bytes = 172 GB. Reduce per layer and free.
+- The numbers are produced without a `for` loop over positions (vectorized reductions only), and memory stays bounded — you must not hold all layers' `[B,H,T,T]` tensors simultaneously. At `B=16, H=32, T=512, 32 layers` in fp32 that would be `16 × 32 × 512² × 4 × 32 = 1.7e10` bytes ≈ 17 GB. Reduce per layer and free.
 - You can state, from your own numbers, which layers are the sink-heaviest and which heads are the most local versus most global.
 - You correctly observe that sink mass is *low* in the first layer or two and high thereafter, and can explain why (early layers haven't yet built the representations that make token 0 a strong key, and their heads are doing local positional work).
 
@@ -959,7 +959,7 @@ You have a sequence of `T` vectors, one per token, each of width `d`. You want e
 
 So each token computes three projections of itself: a **query** (what am I looking for), a **key** (what do I advertise), and a **value** (what I'll hand over if selected). Score every query against every key with a dot product — that's one matmul producing a `T × T` matrix. Divide by `√d_head`, because dot products of `d`-dimensional random vectors have standard deviation `√d` and softmax saturates if you don't. Mask out the future by setting those scores to `−inf` *before* the softmax, not by zeroing weights after, because the softmax denominator sums over everything it's given. Softmax each row into a distribution over source positions. Multiply by the values: each position's output is a weighted average of every visible position's value. Do that `n_heads` times in parallel on disjoint slices of the width, concatenate, and project once more. Add the result back into the residual stream.
 
-Three facts that follow and that drive everything downstream. It's `O(T² d)` compute, which only exceeds the rest of the block past `T ≈ 2 · d_model` — so quadratic cost is a long-context problem, not a 2k-context problem. During generation, the keys and values of past tokens never change, so you cache them; that cache is `2 · n_layers · n_kv_heads · d_head · bytes` per token — around 128 KB/token for a typical 7B-class model — and it, not the weights, is what limits how many users you can serve at once. And because generating token `n+1` requires token `n`, decode is serial and memory-bandwidth-bound at roughly 2 FLOPs per byte read, against hardware built for ~300, which is why every serving optimization in the field is about reading fewer bytes or emitting more tokens per read.
+Three facts that follow and that drive everything downstream. It's `O(T² d)` compute, whose quadratic term only exceeds the block's Q/K/V/O projection cost past `T ≈ 2 · d_model` — so quadratic cost is a long-context problem, not a 2k-context problem. During generation, the keys and values of past tokens never change, so you cache them; that cache is `2 · n_layers · n_kv_heads · d_head · bytes` per token — around 128 KB/token for a typical 7B-class model — and it, not the weights, is what limits how many users you can serve at once. And because generating token `n+1` requires token `n`, decode is serial and memory-bandwidth-bound at roughly 1 FLOP per byte of bf16 weights read, against hardware built for ~300, which is why every serving optimization in the field is about reading fewer bytes or emitting more tokens per read.
 
 **🗣 Say this in the room** (the thirty-second compression, if they cut you off): "Attention is content-addressed lookup: every token emits a query, every token advertises a key, dot products give you a soft distribution over sources, and you return the weighted average of their values. It's the only sequence operation with an O(1) path between any two positions, it costs `O(T²)`, and in production the thing that hurts isn't the FLOPs — it's the KV cache, at roughly 128 KB per token per sequence."
 
@@ -1083,7 +1083,7 @@ The reported symptoms, in the GQA paper and in practice: MQA shows measurable de
 
 ### Explain GQA precisely. What is a "group," and how do the shapes work inside the kernel?
 
-GQA partitions the `N` query heads into `G` groups of `N/G` heads each, and gives each *group* one shared K head and one shared V head. G = N is MHA; G = 1 is MQA; everything in between is GQA. Llama-3 uses N = 64 (70B) or 32 (8B) query heads with G = 8 in both cases, so 8 and 4 query heads per group respectively. Mistral-7B and Qwen2-7B likewise use 8 KV heads.
+GQA partitions the `N` query heads into `G` groups of `N/G` heads each, and gives each *group* one shared K head and one shared V head. G = N is MHA; G = 1 is MQA; everything in between is GQA. Llama-3 uses N = 64 (70B) or 32 (8B) query heads with G = 8 in both cases, so 8 and 4 query heads per group respectively. Mistral-7B likewise uses 8 KV heads against 32 query heads, as does Qwen2-72B against 64; Qwen2-7B is a counterexample worth knowing — it uses 28 query heads and only **4** KV heads. (**📅 Volatile:** head counts move between model generations; read `num_key_value_heads` in the `config.json` rather than assuming 8.)
 
 Shapes, which is what the interviewer actually wants:
 
@@ -1107,7 +1107,7 @@ def repeat_kv(x, n_rep):                 # x: [B, G, T, D]
 
 Note that `expand` is a stride-0 view — free — and the cost is entirely in the `reshape`, which forces a materializing copy. `torch.nn.functional.scaled_dot_product_attention` gained an `enable_gqa=True` flag precisely so you can pass the unexpanded K and V and let the backend broadcast internally; use it when available rather than expanding by hand.
 
-**⚠ Trap:** assuming the number of *groups* equals the number of query heads per group. A "GQA-8" model has 8 KV heads (8 groups); with 64 query heads that is 8 queries per group. People flip this constantly and then compute the cache 64× wrong in the wrong direction.
+**⚠ Trap:** assuming the number of *groups* equals the number of query heads per group. A "GQA-8" model has 8 KV heads (8 groups); with 64 query heads that is 8 queries per group. People flip this constantly and then compute the cache off by the group ratio, in the wrong direction.
 
 ### Does GQA reduce parameters or FLOPs, or only memory? Be precise.
 
@@ -1139,7 +1139,7 @@ def meanpool_kv(W_k, N, G, d_head):
 
 **Step 3 — re-do post-training.** This is the step people skip and then get burned by. Your instruction tuning, DPO/RLHF and safety alignment were fit to the *old* attention. After uptraining, the base model has drifted. You must re-run the post-training stack on the uptrained base, and you must re-run your safety evals, because refusal behavior is notoriously brittle to base-model changes.
 
-**💰 Math:** α = 5% is the whole selling point. If the original 70B pretrain was 15T tokens at C = 6ND = 6 × 70e9 × 15e12 = 6.3e24 FLOP, then 5% is 3.15e23 FLOP. At 400 TFLOP/s effective per H100 (≈40% MFU), that is 3.15e23 / 4e14 = 7.9e8 GPU-seconds = 219,000 GPU-hours ≈ **1,140 H100-days**, or about 6 days on a 200-GPU cluster. Compare the full pretrain at 4.4M GPU-hours. **You buy an 8× serving-memory reduction for ~5% of the training bill** — that is an obviously correct trade and it is why every open-weights family converted.
+**💰 Math:** α = 5% is the whole selling point. If the original 70B pretrain was 15T tokens at C = 6ND = 6 × 70e9 × 15e12 = 6.3e24 FLOP, then 5% is 3.15e23 FLOP. At 400 TFLOP/s effective per H100 (≈40% MFU), that is 3.15e23 / 4e14 = 7.9e8 GPU-seconds = 219,000 GPU-hours ≈ **9,100 H100-days**, or about 46 days on a 200-GPU cluster (and about 4.6 days on a 2,000-GPU cluster, which is the scale a lab doing this actually has). Compare the full Llama-3-70B pretrain, which Meta's model card puts at 6.4M H100-hours. **You buy an 8× serving-memory reduction for ~5% of the training bill** — that is an obviously correct trade and it is why every open-weights family converted.
 
 **⚠ Trap:** shipping the mean-pooled checkpoint *without* uptraining because "the eval looked okay." Mean-pooling alone typically costs a visible amount of quality; it is an initialization, not a conversion. And the eval that looks okay will be a short-context benchmark, per the earlier trap.
 
@@ -1159,13 +1159,13 @@ A worthwhile nuance for a senior answer: mean-pooling is the *published* recipe,
 
 Because GQA is the point on the curve where the quality loss becomes indistinguishable from noise while the memory win is still overwhelming — and because of a serving detail that has nothing to do with quality at all.
 
-The quality argument: going from 64 KV heads to 8 removes 87.5% of the cache. Going from 8 to 1 removes another 10.9% of the *original* cache. So the marginal memory benefit of MQA over GQA-8 is small — 8× versus 9.1× total reduction relative to MHA — while the marginal quality cost is disproportionately large, because you have gone from "eight independent key subspaces the heads can specialize over" to "one." Diminishing returns on the memory axis, accelerating cost on the quality axis. GQA-8 sits right at the knee.
+The quality argument: going from 64 KV heads to 8 removes 87.5% of the cache. Going from 8 to 1 removes another 10.9% of the *original* cache. So the marginal memory benefit of MQA over GQA-8 is small *in absolute bytes* — the ratio headline looks dramatic (8× versus 64× total reduction relative to MHA) but the second step only removes another 10.9 points of the original cache, and you were already down to 12.5% — while the marginal quality cost is disproportionately large, because you have gone from "eight independent key subspaces the heads can specialize over" to "one." Diminishing returns on the memory axis, accelerating cost on the quality axis. GQA-8 sits right at the knee.
 
 The serving argument, which is the one people forget: **tensor parallelism**. With TP = 8 and 8 KV heads, each rank owns exactly one KV head and the attention block shards perfectly — no replication, no extra communication. With MQA and TP = 8, the single KV head must be *replicated* on all 8 ranks, so you store 8 copies of the cache across the node and your aggregate KV memory is 8× the theoretical minimum. MQA's memory advantage partially evaporates the moment you shard. GQA with `n_kv_heads` chosen equal to your intended TP degree is the configuration that composes cleanly with the rest of the stack. That is not a coincidence — 8 KV heads showing up in Llama-3, Mistral, Qwen2 and others is a deliberate alignment with 8-GPU nodes.
 
 **📐 Numbers you must know:** relative to MHA at 64 heads, GQA-8 stores 12.5% of the cache; MQA stores 1.6%. Relative to *GQA-8*, MQA saves a further 87.5% of what remains — which sounds huge until you notice that on a 2.5 GiB cache it takes you from 2.5 GiB to 0.31 GiB while the weights are still 140 GB. The absolute win has stopped mattering.
 
-**🗣 Say this in the room:** "GQA-8 gets you 87.5% of the cache reduction MQA offers, at a fraction of the quality cost, and it shards cleanly at TP=8 where MQA has to replicate. That's why 8 KV heads is the number you see across Llama-3, Mistral and Qwen — it's co-designed with an 8-GPU node."
+**🗣 Say this in the room:** "GQA-8 removes 87.5% of the cache where MQA removes 98.4% — nearly all of the win, at a fraction of the quality cost, and it shards cleanly at TP=8 where MQA has to replicate. That's why 8 KV heads is the number you see across Llama-3, Mistral and Qwen — it's co-designed with an 8-GPU node."
 
 ### Someone proposes a model with 64 query heads and 3 KV heads because 3 divides the cache nicely. What do you say in review?
 
@@ -1188,6 +1188,7 @@ Third: powers of two are not superstition here. Head dimensions and head counts 
 **🗣 Say this in the room:** "Pick `n_kv_heads` from {1, 2, 4, 8, 16} such that it's a divisor of `n_query_heads` and a multiple of, or equal to, the tensor-parallel degrees you intend to support. Three fails both conditions and gets you replication at TP=8 — you'd end up using more KV memory than GQA-8, not less."
 
 **⚠ Trap:** treating `n_kv_heads` as a purely architectural choice made by the research team. It is a *joint* architecture-and-deployment decision. If the serving team is not in the room when that number is picked, you will ship a model whose headline efficiency claim doesn't survive contact with an 8-GPU node.
+
 ### Explain multi-head latent attention from first principles. And tell me why it isn't just "LoRA on the KV projection."
 
 Mental model: MQA and GQA shrink the cache by **removing heads**. MLA shrinks the cache by **changing the basis you cache in**. The observation is that across the `n_heads · d_head`-dimensional concatenation of all key and value vectors at a position, the information is highly redundant — the true rank is far below the ambient dimension. So instead of caching K and V, cache a single low-rank *latent* vector per token per layer, and reconstruct per-head K and V from it on demand. Every head keeps its own full-rank key and value subspace; you just don't store them.
@@ -1230,7 +1231,7 @@ So the cached state per token per layer is `512 (latent) + 64 (rope key) = 576 e
 
 Absorption is the algebraic identity I sketched above, promoted to an implementation strategy: because `W_UQ[i]ᵀ W_UK[i]` is a product of two fixed matrices, fold them into one at load time and attend in latent space. Likewise on the output side: `out = W_O · concat_i(attn_i · W_UV[i] c_kv)`, and since `W_UV[i]` and the relevant slice of `W_O` are both fixed, precompute `W_O[i] W_UV[i]` and apply attention weights directly to the *latent* values, then project once. Net effect at decode: you never build a `[T, n_heads, 128]` key tensor or value tensor at all. You read `[T, 576]` from cache and do two small matmuls.
 
-Why only at decode: the two regimes have opposite arithmetic. At **prefill**, T is large (say 4096) and you are compute-bound. Absorbed form requires a `[T, 512] × [512, 512]`-ish contraction per head — the absorbed matrix is `d_c × d_c`-shaped per head, so you do 128 heads × 512 × 512 work per query token, which is *more* FLOPs than decompressing once into `[T, 128, 128]` keys and running a standard FlashAttention over them. Decompression amortizes across all T queries. So at prefill you materialize; the extra memory is transient activation memory, not cache, and FlashAttention handles it.
+Why only at decode: the two regimes have opposite arithmetic. At **prefill**, T is large (say 4096) and you are compute-bound. In absorbed form the per-head fold is `W_UK[i]` itself, a `d_head × d_c` = `128 × 512` matrix that lifts each query head into the latent space; you then score that lifted query against every cached latent in **512** dimensions rather than the 192 dimensions of a materialized key, and the value side likewise contracts in 512 dimensions. So the `T²` terms — the ones that dominate at long T — get roughly 3× more expensive, while the decompression you avoided is a one-off `O(T)` cost that amortizes across all T queries. So at prefill you materialize; the extra memory is transient activation memory, not cache, and FlashAttention handles it.
 
 At **decode**, T_query = 1. There is nothing to amortize the decompression over — you would decompress `T_kv` cached tokens to serve a single query. Absorbed form reads 576 elements per cached token instead of reconstructing 128 heads × 192 dims = 24,576 elements. That is a 42× reduction in the bytes flowing through the attention kernel. Since decode is bandwidth-bound, that ratio translates almost directly into throughput.
 
@@ -1321,7 +1322,7 @@ So a 5.8× cache reduction at 128k, on top of whatever GQA gives you per token. 
 
 **💰 Math:** suppose a 27B-class model with 46 layers, 16 KV heads, `d_head` 128, bf16. All-global cache per token = 2 × 46 × 16 × 128 × 2 = 376,832 B = 368 KiB. At 128k that is 46 GiB per sequence — unservable. With 1:5 interleaving the effective figure is 46 GiB / 5.77 = **7.97 GiB**, which fits eight concurrent users into 64 GiB. That is the difference between "we support 128k" being true and being marketing.
 
-**⚠ Trap:** assuming the global layers are cheap because they are few. At 128k, the global layers hold `(1/6) × 131,072 = 21,845` tokens' worth of cache, which is 96% of the total cache in the interleaved model. **Your entire memory profile is set by the minority of layers.** If someone proposes going from 1:5 to 1:3 for quality, that is a 1.6× cache increase, not a small tweak.
+**⚠ Trap:** assuming the global layers are cheap because they are few. At 128k, the global layers hold `(1/6) × 131,072 = 21,845` tokens' worth of cache, which is 96% of the total cache in the interleaved model. **Your entire memory profile is set by the minority of layers.** If someone proposes going from 1:5 to 1:3 for quality, the global fraction goes from 1/6 to 1/4 and `tokens_eff` at 128k goes from 22,699 to 33,536 — a 1.5× cache increase, not a small tweak.
 
 ### Explain cross-layer KV sharing. Where would you place the shared layers, and what does it compose with?
 
@@ -1377,7 +1378,7 @@ The technique detail that matters regardless of variant: **keys and values want 
 
 ### Same byte budget: GQA-8 at bf16, or MHA-64 at int4. Which do you ship?
 
-Set up the comparison honestly. On a 80-layer, 128-`d_head` model: GQA-8 at bf16 is 2 × 80 × 8 × 128 × 2 = 327,680 B/token. MHA-64 at int4 (0.5 bytes) is 2 × 80 × 64 × 128 × 0.5 = 1,310,720 B/token — that is 4× *more*, so the premise doesn't hold at those settings. To equalize you would need MHA at int2, or GQA-16 at int4 versus GQA-8 at bf16 (2 × 80 × 16 × 128 × 0.5 = 163,840, actually 2× *less*). Let me take the honest equal-bytes pair: **GQA-8 at bf16 (327,680 B) versus GQA-16 at fp8 (2 × 80 × 16 × 128 × 1 = 327,680 B)**. Identical bytes, and now it is a real question.
+Set up the comparison honestly. On a 80-layer, 128-`d_head` model: GQA-8 at bf16 is 2 × 80 × 8 × 128 × 2 = 327,680 B/token. MHA-64 at int4 (0.5 bytes) is 2 × 80 × 64 × 128 × 0.5 = 655,360 B/token — that is 2× *more*, so the premise doesn't hold at those settings. To equalize you would need MHA at int2, or GQA-16 at int4 versus GQA-8 at bf16 (2 × 80 × 16 × 128 × 0.5 = 163,840, actually 2× *less*). Let me take the honest equal-bytes pair: **GQA-8 at bf16 (327,680 B) versus GQA-16 at fp8 (2 × 80 × 16 × 128 × 1 = 327,680 B)**. Identical bytes, and now it is a real question.
 
 I ship the **bf16 GQA-8**, and here is the reasoning.
 
@@ -1390,6 +1391,7 @@ Third: **they compose.** If I have GQA-8 at bf16 and I need more room, fp8 on to
 **🗣 Say this in the room:** "At equal bytes I take the trained compression over the post-hoc one — the optimizer got to compensate for GQA and did not get to compensate for quantization noise. And it leaves me the quantization lever in reserve for when traffic doubles."
 
 **⚠ Trap:** comparing KV configurations without stating the dtype. "We use GQA-8" is an incomplete specification of your cache footprint. The only complete statement is bytes per token at a stated precision — 320 KiB/token bf16, 160 KiB/token fp8 — and I would push back on any capacity plan written without it.
+
 ### Estimate the maximum concurrency for Llama-3-70B on a single 80 GB H100 at 8k context. Talk me through every term.
 
 The first honest answer is: **at bf16 it does not fit at all.** Weights are 70e9 × 2 = 140 GB against 80 GB of HBM. So the question is really "what do you have to give up to make it fit," and I would say that out loud rather than producing a number.
@@ -1424,7 +1426,7 @@ With **fp8 KV**: 5.37 GB/sequence → **77 concurrent**. With fp8 KV *and* fp8 w
 
 Two refinements that matter in a real answer. First, 32k is the *maximum*, not the average. If your traffic's mean context is 6k with a P99 of 32k, you should size the pool on the mean and let the scheduler preempt the tail — vLLM's continuous batching allocates blocks on demand, so you get roughly `416 GB / (320 KiB × 6,144) = 208` concurrent at the mean, with preemption handling the tail. Sizing on the max is the single most common way teams under-provision concurrency by 5×.
 
-Second, **prefix caching changes this materially** if your traffic shares prefixes. A 12k shared system prompt costs 3.84 GB of KV; without prefix caching each of 38 sequences stores its own copy = 146 GB, 35% of your pool, spent on 38 identical byte sequences. With prefix caching it is stored once. That is a bigger win than fp8.
+Second, **prefix caching changes this materially** if your traffic shares prefixes. A 12k shared system prompt costs 12,000 × 327,680 = 3.93 GB of KV; without prefix caching each of 38 sequences stores its own copy = 149 GB, 36% of your pool, spent on 38 identical byte sequences. With prefix caching it is stored once. That is a bigger win than fp8.
 
 **💰 Math:** cost per session-hour at 38 concurrent on a node at ~$2.50/GPU-hr → $20/hr / 38 = **$0.53 per session-hour**. At 77 (fp8 KV) it is $0.26. At 208 (mean-context sizing plus prefix caching) it is $0.096. **The same hardware and the same model span a 5.5× range in unit economics purely from KV management decisions.** That is the argument for putting a senior engineer on serving configuration rather than treating it as a deployment detail.
 
@@ -1511,7 +1513,7 @@ Now what it does **not** solve, which is the half of the answer that shows judgm
 
 Mental model: the KV pool is a **fixed-capacity resource pool with variable-duration, growing leases**. Every admitted request holds blocks for its whole lifetime and *acquires more blocks every decode step*. That is unlike a connection pool, where a lease is constant-size. It means admission control cannot be a simple semaphore — a request that was safe to admit at step 0 can starve the pool at step 500.
 
-The scheduler loop, concretely: at each step, the engine has a running batch and a waiting queue. It tries to admit new requests from the queue if the pool has room for their prompt blocks plus a watermark for growth. It runs one forward pass over the running batch. If a running sequence needs a new block and none is free, the engine **preempts** — it evicts a victim sequence, freeing its blocks, and either (a) **recomputes** its KV from scratch when rescheduled, or (b) **swaps** its blocks out to CPU RAM and back later. Recompute costs prefill FLOPs proportional to the victim's length; swap costs PCIe bandwidth (~64 GB/s on Gen5 x16, versus 3.35 TB/s of HBM — a 52× step down). Recompute usually wins for short sequences, swap for very long ones.
+The scheduler loop, concretely: at each step, the engine has a running batch and a waiting queue. It tries to admit new requests from the queue if the pool has room for their prompt blocks plus a watermark for growth. It runs one forward pass over the running batch. If a running sequence needs a new block and none is free, the engine **preempts** — it evicts a victim sequence, freeing its blocks, and either (a) **recomputes** its KV from scratch when rescheduled, or (b) **swaps** its blocks out to CPU RAM and back later. Recompute costs prefill FLOPs proportional to the victim's length; swap costs PCIe bandwidth (~64 GB/s on Gen5 x16, versus 3.35 TB/s of HBM — a 52× step down). Both costs are linear in the victim's length, so which one wins is set by the model's FLOPs per token against its KV bytes per token and your link bandwidth — not by how long the sequence is. I do that arithmetic in a later question; recompute is vLLM's default for operational reasons as much as arithmetic ones.
 
 Now the operational question. **The signal you autoscale on is KV cache utilization and preemption rate — not QPS, not GPU utilization, not CPU.** The backend analogue is Kafka consumer lag: request rate tells you about arrivals, but the thing that predicts SLO violation is the depth of the resource you are actually running out of. GPU "utilization" as reported by `nvidia-smi` is nearly useless here — a bandwidth-bound decode kernel shows ~100% utilization while doing almost no useful work.
 
@@ -1554,7 +1556,7 @@ Monthly                                                      = $17,200
 
 And the **latency** consequence, which the product cares about more than the money: TTFT drops from ~525 ms of pure prefill (plus queueing) to ~10 ms. That is the difference between a chat UI that feels sluggish and one that feels instant.
 
-**The third saving, which most people miss: HBM.** Without prefix sharing, each concurrent sequence stores its own copy of the 12k prefix: 12,000 × 320 KiB = **3.84 GB per sequence**. At 38 concurrent sequences that is 146 GB of identical bytes — 35% of a 416 GB KV pool. With sharing, one copy. **Prefix caching is a capacity multiplier, not just a latency and cost optimization**, and on a system-prompt-heavy workload it is often the single largest concurrency win available.
+**The third saving, which most people miss: HBM.** Without prefix sharing, each concurrent sequence stores its own copy of the 12k prefix: 12,000 × 327,680 B = **3.93 GB per sequence**. At 38 concurrent sequences that is 149 GB of identical bytes — 36% of a 416 GB KV pool. With sharing, one copy. **Prefix caching is a capacity multiplier, not just a latency and cost optimization**, and on a system-prompt-heavy workload it is often the single largest concurrency win available.
 
 **⚠ Trap:** measuring prefix-cache value only in dollars-per-token and missing the concurrency effect. I have seen teams enable prefix caching, see a modest TTFT improvement, and not notice they could now raise `max_num_seqs` by 50%.
 
@@ -1564,7 +1566,7 @@ Let me start with the number that determines the whole architecture. On a 70B GQ
 
 Cold prefill is equally damning: `2 × 70e9 × 100,000 = 1.4e16 FLOP = 14 PFLOP`, at 3.2 PFLOP/s per node = **4.4 seconds**. Against a 200 ms TTFT target, cold prefill is 22× over budget. So the design is forced: **essentially every request must hit a warm prefix, and the KV cache must be tiered.**
 
-**1. Model choice is a KV decision.** I would not use a 70B dense GQA-8 model for the inline-completion path. Either an MLA model (68.6 KiB/token → 6.9 GB at 100k, a 4.8× improvement) or a smaller model with sliding-window/interleaved attention for the local layers. For the "explain this codebase" chat path, a bigger model is fine because the concurrency is 100× lower. **Two models, two paths, routed by task** — this is the standard and correct answer.
+**1. Model choice is a KV decision.** I would not use a 70B dense GQA-8 model for the inline-completion path. Either an MLA model (68.6 KiB/token → 70,272 × 100,000 = 7.0 GB at 100k, a 4.7× improvement) or a smaller model with sliding-window/interleaved attention for the local layers. For the "explain this codebase" chat path, a bigger model is fine because the concurrency is 100× lower. **Two models, two paths, routed by task** — this is the standard and correct answer.
 
 **2. Context ordering is a caching decision.** Structure the prompt so the prefix is stable in decreasing order of stability: system instructions → language/framework conventions → repo-level context (rarely changes) → open files (changes per session) → current file (changes per minute) → cursor region and recent edits (changes per keystroke). Every dynamic token you put early costs you the entire suffix's cache. This ordering discipline is worth more than any kernel optimization in the stack.
 
@@ -1604,7 +1606,7 @@ The gotchas, in order of how often they bite:
 
 **Cache rollback.** The target writes K and V for all k speculated positions during verification. If only j < k are accepted, positions `j..k−1` must be logically discarded. With paged allocation this means truncating the sequence's block table and possibly freeing a partially-written block. If your cache manager cannot do a cheap logical truncate — or if it truncates the block table but leaves the block's `num_filled` counter wrong — you get **stale KV entries that are attended to on the next step**. The symptom is subtle: generation that is fluent but occasionally repeats or references content that was never emitted. This is the classic speculative-decoding correctness bug and it is invisible in unit tests that check only token-level output equivalence at k=1.
 
-**Draft cache memory.** The drafter has its own KV cache, and it is per-sequence too. A 1B drafter with 16 layers, 8 KV heads, `d_head` 128 costs 2 × 16 × 8 × 128 × 2 = 65,536 B = 64 KiB/token — 20% of the 70B target's 320 KiB/token. At 38 concurrent 32k sequences that is 38 × 64 KiB × 32,768 = **79.7 GB**, which you must subtract from the target's pool. Speculation is not free in memory, and teams routinely forget to budget for it and then wonder why concurrency dropped.
+**Draft cache memory.** The drafter has its own KV cache, and it is per-sequence too. A 1B drafter with 16 layers, 8 KV heads, `d_head` 128 costs 2 × 16 × 8 × 128 × 2 = 65,536 B = 64 KiB/token — 20% of the 70B target's 320 KiB/token. At 38 concurrent 32k sequences that is 38 × 65,536 B × 32,768 = **81.6 GB**, which you must subtract from the target's pool. Speculation is not free in memory, and teams routinely forget to budget for it and then wonder why concurrency dropped.
 
 **Batching interaction.** Speculation helps most at low batch (where you are most bandwidth-bound) and helps least at high batch (where you are already compute-bound and the extra k−1 verification tokens per sequence cost real FLOPs). At very high batch, speculation can be net *negative*. The correct implementation makes speculation depth adaptive on current batch size — deep speculation when the batch is shallow, off when it is deep.
 
@@ -1615,7 +1617,7 @@ The gotchas, in order of how often they bite:
 I would rank strictly by **expected saving divided by quality risk**, and I would insist on doing the zero-risk items first — I have seen too many teams reach for int4 while leaving prefix caching off.
 
 **Tier 1 — lossless, do these before anything else.**
-1. **Prefix caching**, if not already on and if prompts share structure. On a system-prompt-heavy workload this alone can be 30–50% of prefill cost plus a large concurrency gain (see the 146 GB of duplicated prefix earlier). Zero quality risk.
+1. **Prefix caching**, if not already on and if prompts share structure. On a system-prompt-heavy workload this alone can be 30–50% of prefill cost plus a large concurrency gain (see the 149 GB of duplicated prefix earlier). Zero quality risk.
 2. **Prompt reordering** to maximize hit rate — dynamic content to the tail. Costs an afternoon.
 3. **Prefix-affine routing.** Turning round-robin into consistent hashing on the prefix hash can take hit rate from 1/n to 0.9. Zero quality risk.
 4. **Chunked prefill + tuned `max_num_batched_tokens`.** Raises GPU efficiency by filling batches with prefill work instead of idling during decode. Typically 10–25% throughput.
@@ -1635,6 +1637,7 @@ I would rank strictly by **expected saving divided by quality risk**, and I woul
 12. int4 KV, KV eviction (H2O/StreamingLLM-style), aggressive sliding window at serve time. These fail on specific inputs rather than degrading uniformly, which makes them the hardest to detect and the easiest to regret.
 
 **🗣 Say this in the room:** "I'd get the 40% from prefix caching plus prefix-affine routing plus fp8 KV, in that order, and I'd expect to overshoot. All three are measurable, two are lossless, and the one that isn't gets gated on a long-context retrieval eval at our P95 context length. I would not touch KV eviction for a 40% target — that's an emergency lever."
+
 ### Your generation quality degrades, but only under high concurrency. Nothing changed in the model or the prompts. Debug it.
 
 The shape of this bug is important: quality that depends on *load* means quality that depends on a **scheduler decision**, because the scheduler is the only thing that knows about load. Model weights, prompts and sampling parameters are all load-independent. So I go straight to the four places where a scheduler under memory pressure changes what the model actually sees.
@@ -1694,17 +1697,19 @@ Preemption is the KV pool's eviction, and like any eviction you choose between t
 
 **Recompute (the vLLM default for most cases).** The victim's physical blocks are returned to the free pool immediately — refcount drops, blocks are reusable this step. The sequence goes back to the waiting queue with its full token history (prompt + tokens generated so far) as its new "prompt." When rescheduled, the engine prefills that entire history from scratch. Cost = a full prefill of `len(prompt) + len(generated)` tokens: `2 · N · T` FLOPs. For a 70B model and a victim at 20k tokens: `2 × 70e9 × 20,000 = 2.8e15 = 2.8 PFLOP` → 0.875 s of 8-GPU node time. That work is pure waste, and it also occupies the batch, delaying everyone.
 
-**Swap.** The victim's blocks are copied to pinned host memory, the physical blocks are freed, and the block table records the CPU location. On reschedule, blocks are copied back. Cost = `2 × bytes / PCIe bandwidth`. For that same 20k-token sequence on Llama-3-70B: 320 KiB × 20,000 = 6.4 GB, out and back = 12.8 GB at ~64 GB/s (PCIe Gen5 x16) = **200 ms**, versus 875 ms of recompute. Swap also consumes host RAM you must have provisioned, and the copies contend with any other PCIe traffic.
+**Swap.** The victim's blocks are copied to pinned host memory, the physical blocks are freed, and the block table records the CPU location. On reschedule, blocks are copied back. Cost = `2 × bytes / PCIe bandwidth`. For that same 20k-token sequence on Llama-3-70B: 327,680 B × 20,000 = 6.55 GB, out and back = 13.1 GB at ~64 GB/s (PCIe Gen5 x16) = **~205 ms**, versus 875 ms of recompute. Swap also consumes host RAM you must have provisioned, and the copies contend with any other PCIe traffic.
 
 **The decision rule** falls straight out of the arithmetic. Recompute cost scales as `T · 2N / node_FLOPS`; swap cost scales as `T · kv_bytes_per_token · 2 / PCIe_BW`. Setting them equal:
 
 ```
 2N / FLOPS  vs  2 · kv_bytes_per_token / PCIe_BW
-2 × 70e9 / 3.2e15 = 43.75 ns/token      (recompute)
+2 × 70e9 / 3.2e15 = 43.75 µs/token      (recompute)
 2 × 327,680 / 64e9 = 10.24 µs/token     (swap)
 ```
 
-Recompute is **234× cheaper per token** on this hardware. That is decisive, and it is why recompute is the default: modern GPUs have absurd FLOPs relative to PCIe bandwidth. Swap only wins when you are FLOPs-starved (small batch headroom, a model so large that prefill is genuinely slow) or when you want to preserve *exact* KV state rather than recompute it — which matters if any part of your pipeline is nondeterministic.
+On raw time, **swap is about 4× cheaper per token on this hardware** — which is exactly the worked example above, ~205 ms of swap against 875 ms of recompute for the same 20k victim. Note that the ratio is independent of the victim's length: both terms are linear in T, so the winner is set by model size, KV bytes per token, node FLOP/s and link bandwidth. A big model with a small cache (70B GQA-8) favours swap; a small model with a fat cache favours recompute.
+
+So why is recompute nonetheless the default in vLLM? Because that arithmetic is not the whole cost. Recompute returns the blocks to the free pool immediately and needs no pre-provisioned pinned host RAM; its work is ordinary prefill that the scheduler can chunk and interleave with the running batch, and it can reuse any prefix-cache blocks still resident, which can make the effective cost far below the formula. Swap has per-block copy overhead that hurts short victims, needs host memory you sized in advance, and leaves the GPU idle during the transfer while contending with any other PCIe traffic. Swap also preserves *exact* KV state rather than recomputing it — which matters if any part of your pipeline is nondeterministic. Re-derive both terms on your own hardware rather than assuming; the crossover is not where intuition puts it.
 
 The operational consequences that actually reach users: a preempted request's TTFT is measured from the original arrival, so a preemption injects hundreds of milliseconds to seconds into a tail latency you already promised. And preemption is **not fair** by default — the engine typically preempts the most recently admitted or the largest sequence, which means long-context requests get starved under load. If your product has a long-context premium tier, you need explicit priority in the scheduler or you will systematically punish your highest-value users.
 
@@ -1790,7 +1795,7 @@ Four KV heads, headroom for traffic growth, and a real long-range path through t
 
 **How I defend the choice in the room:** state the budget arithmetic first, name the naive answer (MQA at bf16), reject it on quality-and-sharding grounds, then present the equal-bytes alternative with more head diversity, then present the pattern-level option with the headroom. **Show that you considered three axes — head count, precision, attention pattern — and picked a point on each rather than maximizing one.**
 
-**🏋 Drill:** 10 minutes, whiteboard only, no calculator. Given `(pool_GB, concurrency, context, n_layers, d_head)`, produce a defensible `(n_kv_heads, kv_dtype, attention_pattern)` triple with the arithmetic written out. **Pass criterion: your bytes-per-token figure is within 5% of the exact value and you name at least one alternative you rejected and why.** Run it on three random parameter sets: (40 GB, 64, 32k, 32, 128); (200 GB, 256, 8k, 48, 128); (416 GB, 40, 128k, 80, 128). The third one has no bf16 solution at any head count — noticing that is the point.
+**🏋 Drill:** 10 minutes, whiteboard only, no calculator. Given `(pool_GB, concurrency, context, n_layers, d_head)`, produce a defensible `(n_kv_heads, kv_dtype, attention_pattern)` triple with the arithmetic written out. **Pass criterion: your bytes-per-token figure is within 5% of the exact value and you name at least one alternative you rejected and why.** Run it on three random parameter sets: (40 GB, 64, 32k, 32, 128); (200 GB, 256, 8k, 48, 128); (416 GB, 40, 128k, 80, 128). The third one has no bf16 solution above a single KV head: the per-token budget is 416e9/40/131,072 = 79,346 bytes, and GQA-2 at bf16 is 2 × 80 × 2 × 128 × 2 = 81,920 — it misses by 3%. So bf16 forces you onto MQA, and getting any head diversity at all requires fp8 KV or an interleaved local/global pattern. Noticing that squeeze is the point.
 
 **⚠ Trap:** solving this by cutting `max_model_len` to 8k and declaring victory. That changes the product requirement rather than meeting it. If you genuinely believe 32k is over-specified, say so explicitly and bring evidence from the traffic distribution — but do not silently redefine the problem.
 
@@ -1889,7 +1894,7 @@ Vaswani's 2017 attention gives every head its own query, key and value projectio
 
 **Ainslie 2023 (GQA)** interpolated: G groups of query heads, one KV head per group. Eight groups recovers nearly all of MHA's quality at one-eighth the cache, and — the part that made it stick — eight KV heads shard perfectly onto an eight-GPU node. Crucially they showed you can convert an existing MHA checkpoint by mean-pooling KV heads within groups and uptraining for about 5% of the original pretraining compute. That made GQA nearly free to adopt, and it became the industry default: Llama-3, Mistral, Qwen.
 
-**DeepSeek 2024 (MLA)** changed the axis. Instead of deleting heads, compress the *rank*: cache a 512-dimensional latent per token per layer and reconstruct per-head K and V from it with per-head up-projections, so heads keep independent subspaces. RoPE blocks the matrix absorption that makes decode cheap, so they split off a small 64-dim shared rotary key. Net: 576 elements per token per layer — about 3.6× smaller than GQA-8 and 57× smaller than MHA, at better quality. It needs bespoke kernels, which is why it hasn't spread beyond DeepSeek's own family yet.
+**DeepSeek 2024 (MLA)** changed the axis. Instead of deleting heads, compress the *rank*: cache a 512-dimensional latent per token per layer and reconstruct per-head K and V from it with per-head up-projections, so heads keep independent subspaces. RoPE blocks the matrix absorption that makes decode cheap, so they split off a small 64-dim shared rotary key. Net: 576 elements per token per layer — about 3.6× smaller than GQA-8 and 57× smaller than MHA, at comparable or better reported quality. It needs bespoke kernels, which is why it hasn't spread beyond DeepSeek's own family yet.
 
 Running alongside all of that, three orthogonal levers that multiply with the head-count story: **sliding window** (bound the number of cached tokens), **interleaved local/global layers** (pay full cache on only a fraction of layers), and **cross-layer KV sharing** (share one layer's cache with its neighbors). Stack three of them at 3–4× each and you get the order-of-magnitude reductions production systems actually run.
 
@@ -2019,7 +2024,7 @@ The base sets the *wavelength spectrum* of the rotation wheels, and the waveleng
 
 Run the numbers for `d_head = 128`. At base 10,000, the slowest wavelength is `2π · 10000^(63/64) = 2π · e^(0.984 · 9.2103) = 2π · 8,630 ≈ 54,200 tokens`. At base 500,000 it is `2π · 500000^(63/64) = 2π · e^(0.984 · 13.1224) = 2π · 405,600 ≈ 2,549,000 tokens`. So Llama-3's base change stretched the longest wavelength by ~47×, from about 54k tokens to about 2.5M.
 
-Why that matters: a dimension whose wavelength is shorter than your context length *wraps* — position 100 and position 100 + λ are rotationally indistinguishable in that subspace, so the model cannot use it to disambiguate long-range order. At base 10,000 and 8k context, no dimension wraps (54,200 > 8,192), so the encoding is fine — but only about the last few dimensions have wavelengths comfortably longer than the context, meaning very few "coarse" wheels are available to represent document-scale position. Raising the base rebalances the spectrum toward long wavelengths, giving the model far more headroom for coarse positional structure at 128k, at the cost of slightly coarser fine-grained resolution in the mid-band.
+Why that matters: a dimension whose wavelength is shorter than your context length *wraps* — position 100 and position 100 + λ are rotationally indistinguishable in that subspace, so the model cannot use it to disambiguate long-range order. At base 10,000 and 8k context, the *slowest* dimension does not wrap (54,200 > 8,192), so the coarse end of the encoding is fine — but only about the last few dimensions have wavelengths comfortably longer than the context, meaning very few "coarse" wheels are available to represent document-scale position. (The fast wheels wrap constantly by design — a 6-token wavelength has wrapped over a thousand times by position 8k — and that is fine, because their job is local order, not document-scale order.) Raising the base rebalances the spectrum toward long wavelengths, giving the model far more headroom for coarse positional structure at 128k, at the cost of slightly coarser fine-grained resolution in the mid-band.
 
 **📐 Numbers you must know:** longest RoPE wavelength ≈ `2π · base`. Base 10,000 → ~63k tokens; base 500,000 → ~3.1M tokens (the `2π·base^(63/64)` correction pulls these to ~54k and ~2.5M for `d_head=128`). The memorizable rule: **you want your context length to sit well inside the longest wavelength, ideally by a factor of 10 or more**, or the low-frequency dimensions start aliasing.
 
@@ -2150,9 +2155,9 @@ Then, per frequency dimension `i` with wavelength `λ_i = 2π/θ_i`:
 - `λ_i > 8192` → **fully interpolated**, `θ_i → θ_i/8`. This dimension never completed even one rotation in 8k.
 - `2048 ≤ λ_i ≤ 8192` → **linear ramp** between the two, with smoothing factor `(8192/λ_i − 1.0)/(4.0 − 1.0)`.
 
-Now compute where the boundaries actually land, because that is the answer an interviewer is fishing for. With `d_head = 128` there are 64 frequency pairs and `λ_i = 2π · 500000^(i/64)`. Setting `λ = 2048`: `500000^(i/64) = 2048/2π = 325.9`, so `i/64 = ln(325.9)/ln(500000) = 5.787/13.122 = 0.441`, giving **i ≈ 28**. Setting `λ = 8192`: `8192/2π = 1303.8`, `i/64 = 7.173/13.122 = 0.547`, giving **i ≈ 35**.
+Now compute where the boundaries actually land, because that is the answer an interviewer is fishing for. With `d_head = 128` there are 64 frequency pairs and `λ_i = 2π · 500000^(i/64)`. Setting `λ = 2048`: `500000^(i/64) = 2048/2π = 325.9`, so `i/64 = ln(325.9)/ln(500000) = 5.787/13.122 = 0.441`, giving **i ≈ 28**. Setting `λ = 8192`: `8192/2π = 1303.8`, `i/64 = 7.173/13.122 = 0.5466`, giving **i ≈ 34.98** — the boundary lands a hair *below* 35, so pair 35 (whose wavelength is 8,219, just over 8,192) already falls in the fully-interpolated zone.
 
-So concretely: **frequency pairs 0–28 are untouched, pairs 29–35 ramp, pairs 36–63 are divided by 8.** Roughly 45% of the spectrum is left alone, ~11% transitions, ~44% is fully interpolated. That is the whole config in one sentence, and being able to produce those indices from the JSON is the difference between "I've read the docs" and "I've debugged this."
+So concretely: **frequency pairs 0–28 are untouched, pairs 29–34 ramp, pairs 35–63 are divided by 8.** Roughly 45% of the spectrum is left alone, ~9% transitions, ~45% is fully interpolated. That is the whole config in one sentence, and being able to produce those indices from the JSON is the difference between "I've read the docs" and "I've debugged this."
 
 ```python
 import math, torch
@@ -2169,7 +2174,7 @@ def llama3_inv_freq(d_head=128, base=500000.0, factor=8.0,
     return torch.where((wavelen >= high_wl) & (wavelen <= low_wl), inv_smooth, out)
 ```
 
-**⚠ Trap:** loading this checkpoint in a runtime that does not implement `rope_type: "llama3"` and silently falling back to plain RoPE with base 500,000. Older inference stacks did exactly this. You get no warning, short context is perfect, and long context is bad in the specific "knee at 8k" way. **The check I run on any new serving stack: generate the `inv_freq` tensor from the framework and diff it against the reference computation above.** If the last 28 entries are not 8× smaller, the scaling is not being applied.
+**⚠ Trap:** loading this checkpoint in a runtime that does not implement `rope_type: "llama3"` and silently falling back to plain RoPE with base 500,000. Older inference stacks did exactly this. You get no warning, short context is perfect, and long context is bad in the specific "knee at 8k" way. **The check I run on any new serving stack: generate the `inv_freq` tensor from the framework and diff it against the reference computation above.** If the last 29 entries are not 8× smaller, the scaling is not being applied.
 
 ### Someone bumped `rope_theta` in a deployed model config and now our prefix cache hit rate is unchanged but quality dropped. Walk me through the debug.
 
@@ -2220,7 +2225,7 @@ Run it for Llama-3-8B: `n_layers = 32`, `d_model = 4096`, `N = 8e9`.
 - Attention term at `T = 8,192`: `6 × 32 × 4096 × 8192 = 6.44e9` FLOP/token. That is 13% of the parameter term — a rounding error, which is why nobody thinks about it at short context.
 - Attention term at `T = 131,072`: `6 × 32 × 4096 × 131072 = 1.03e11` FLOP/token. That is **2.15× the parameter term**.
 
-Total per token: 5.44e10 at 8k versus 1.51e11 at 128k. **Long-context tokens cost 2.8× as much as short-context tokens for this model.** For a 70B (80 layers, `d_model` 8192) the parameter term grows to 4.2e11 and the attention term at 128k to 5.15e11 — a ratio of ~2.2×, so the effect is comparable but slightly milder for larger models, which is a genuinely useful thing to know: long context is relatively cheaper on bigger models.
+Total per token: 5.44e10 at 8k versus 1.51e11 at 128k. **Long-context tokens cost 2.8× as much as short-context tokens for this model.** For a 70B (80 layers, `d_model` 8192) the parameter term grows to 4.2e11 and the attention term at 128k to 5.15e11, while the attention term at 8k is only 3.2e10 — so a 128k token costs `(4.2e11 + 5.15e11)/(4.2e11 + 3.2e10)` ≈ **2.1×** an 8k token, comparable to but slightly milder than the 8B's 2.8×. That is a genuinely useful thing to know: long context is relatively cheaper on bigger models.
 
 **💰 Math — dollars.** Say 100B tokens of extension training at 128k on the 8B. Total FLOPs = 1.51e11 × 1e11 = **1.51e22**. An H100 does ~990 TFLOP/s dense bf16; assume 40% MFU (long-context runs have lower MFU because of sequence-parallel communication), so 3.96e14 effective FLOP/s. Time = 1.51e22 / 3.96e14 = 3.81e7 GPU-seconds = **10,600 GPU-hours**. At $2.50/GPU-hour (**📅 Volatile — see §5**) that is **~$26,500**, or about 55 hours of wall clock on a 192-GPU cluster. Doing the same 100B tokens at 8k would have cost 5.44e10 × 1e11 / 3.96e14 = 1.37e7 s = 3,800 GPU-hours ≈ $9,500.
 
@@ -2377,13 +2382,13 @@ def linear_attn(q, k, v, phi=lambda x: torch.nn.functional.elu(x) + 1):
     return torch.stack(out)
 ```
 
-What you lose is **selectivity**, and the argument is a counting argument that I want you to be able to give crisply. Softmax attention's "state" at position `T` is the full KV cache: `T × d` numbers, growing without bound. Linear attention's state is `d_φ × d_v` numbers, *fixed*. With `d = 64`, that is 4,096 numbers no matter whether `T` is 1,000 or 1,000,000. At `T = 100,000` the softmax model is carrying 6.4M numbers per head and the linear model 4,096 — a **1,560× compression**. Information-theoretically, you cannot losslessly recall an arbitrary one of 100,000 distinct items from 4,096 numbers, so exact recall must degrade. And the failure is not graceful noise: because every new token adds a rank-1 outer product to `S`, old information is *overwritten by interference*, not forgotten cleanly.
+What you lose is **selectivity**, and the argument is a counting argument that I want you to be able to give crisply. Softmax attention's "state" at position `T` is the full KV cache: `2 × T × d` numbers — keys *and* values — growing without bound. Linear attention's state is `d_φ × d_v` numbers, *fixed*. With `d = 64`, that is 4,096 numbers no matter whether `T` is 1,000 or 1,000,000. At `T = 100,000` the softmax model is carrying 12.8M numbers per head and the linear model 4,096 — a **3,125× compression**. Information-theoretically, you cannot losslessly recall an arbitrary one of 100,000 distinct items from 4,096 numbers, so exact recall must degrade. And the failure is not graceful noise: because every new token adds a rank-1 outer product to `S`, old information is *overwritten by interference*, not forgotten cleanly.
 
 Softmax's exponential is what makes it *selective* — it can put nearly all mass on one key, which is what a lookup requires. A bounded-rank linear map fundamentally averages.
 
 **📄 Paper:** Katharopoulos et al. (2020), *Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention* — established the associativity trick and the RNN equivalence with `φ(x) = elu(x)+1`. Choromanski et al. (2021), *Rethinking Attention with Performers*, gave the FAVOR+ random-feature map that *approximates* the softmax kernel unbiasedly rather than replacing it, which is the more principled variant — but the approximation variance grows with sequence length and the fixed-state recall ceiling is the same.
 
-**🗣 Say this in the room:** "Linear attention is the associativity trick: drop `exp`, and `(QK^T)V` becomes `Q(K^TV)`, which is linear in `T` and, under causal masking, is exactly an RNN with a `d×d` matrix state. What you buy is `O(1)` decode with no KV cache. What you pay is that your entire history is compressed into a fixed-size state — at 100k tokens that's a 1,500× compression versus a KV cache, so exact single-fact recall has to degrade. It's a great trade for gist and a terrible one for lookup."
+**🗣 Say this in the room:** "Linear attention is the associativity trick: drop `exp`, and `(QK^T)V` becomes `Q(K^TV)`, which is linear in `T` and, under causal masking, is exactly an RNN with a `d×d` matrix state. What you buy is `O(1)` decode with no KV cache. What you pay is that your entire history is compressed into a fixed-size state — at 100k tokens that's roughly a 3,000× compression versus a KV cache, so exact single-fact recall has to degrade. It's a great trade for gist and a terrible one for lookup."
 
 ### Teach me state space models from scratch. Start with S4 and the recurrence-convolution duality.
 
@@ -2710,7 +2715,7 @@ Set it up concretely: a 100,000-token document, 10 conversational turns, each us
 
 **Task C (7 min).** Write two tests and make them pass:
 1. **Shift invariance.** For random `q, k` and any integer shift `c`, `⟨rope(q, m), rope(k, n)⟩ == ⟨rope(q, m+c), rope(k, n+c)⟩` to 1e-4 in fp32.
-2. **Scaling boundaries.** For `d_head=128, base=500000, factor=8, low=1, high=4, orig=8192`, assert that the number of untouched frequency indices is 29 (indices 0–28), the number fully divided by 8 is 28 (indices 36–63), and the remaining 7 are strictly between.
+2. **Scaling boundaries.** For `d_head=128, base=500000, factor=8, low=1, high=4, orig=8192`, assert that the number of untouched frequency indices is 29 (indices 0–28), the number fully divided by 8 is 29 (indices 35–63), and the remaining 6 (indices 29–34) are strictly between.
 
 **Pass criteria:** both tests green inside 25 minutes with no reference material. Then answer these three out loud, in under 60 seconds each, without notes:
 - *What changes if you cache K before rotation instead of after?* (You must re-rotate the whole cache every step: `O(T)` work per decode token instead of `O(1)`, and prefix-cache blocks stop being position-bound — a real trade some designs make deliberately.)
@@ -2798,7 +2803,7 @@ FFN share of the block is `176.2 / 218.1 = 80.8%`. Sanity-check the whole model:
 
 ### Why is `d_ff` four times `d_model`? Is there anything principled about the 4, or is it folklore?
 
-It is mostly folklore that got empirically confirmed and then frozen. Vaswani et al. (2017) used `d_model = 512, d_ff = 2048` for the base model with no ablation defending the 4 specifically, and the field inherited it. The honest answer is: the ratio is a width-vs-depth allocation knob, the loss surface is quite flat in it over roughly 2×–8×, and 4 sits comfortably in the flat region while being a power of two that tiles nicely onto tensor cores.
+It is mostly folklore that got empirically confirmed and then frozen. Vaswani et al. (2017) used `d_model = 512, d_ff = 2048` for the base model; their ablation table sweeps `d_ff` only coarsely (they report a 1024 and a 4096 variant, and the 4096 one was, if anything, marginally better on perplexity) and offers no principled defense of the 4 — the field inherited it anyway. The honest answer is: the ratio is a width-vs-depth allocation knob, the loss surface is quite flat in it over roughly 2×–8×, and 4 sits comfortably in the flat region while being a power of two that tiles nicely onto tensor cores.
 
 There are two real forces behind it. First, expressivity: the FFN needs an intermediate space wide enough to hold many more "memories" than the residual stream has dimensions, so features can live in superposition — `d_ff > d_model` is the point, and a 4× overcomplete basis is a lot of room. Second, hardware: a `[B·T, d] × [d, 4d]` GEMM is large enough to saturate tensor cores, whereas a very narrow FFN would leave the machine memory-bound on small matmuls.
 
@@ -2985,7 +2990,7 @@ Start with `x: [B, T, d_model]`, say `[4, 512, 4096]`. First thing every impleme
 
 Note what did *not* happen: no token exchanged information with any other token. The router made 2048 independent decisions. The layer is still perfectly parallel across positions — which is exactly why it survives causal masking untouched.
 
-**⚠ Trap:** thinking the permute/unpermute is bookkeeping you can ignore. At decode with a small batch, permutation, the ragged GEMM's poor tile utilization, and (under expert parallelism) two all-to-all collectives per layer can *dominate* the actual expert math. In a 61-layer model that is 122 collectives per token. The expert FLOPs are the cheap part; the data movement is the product.
+**⚠ Trap:** thinking the permute/unpermute is bookkeeping you can ignore. At decode with a small batch, permutation, the ragged GEMM's poor tile utilization, and (under expert parallelism) two all-to-all collectives per layer can *dominate* the actual expert math. In a 61-layer model with 58 MoE layers that is 116 collectives per token. The expert FLOPs are the cheap part; the data movement is the product.
 
 ### Implement top-k token-choice routing from scratch. Assume I want to see the dispatch and combine, not just the argmax.
 
@@ -3085,12 +3090,12 @@ So why is nearly every deployed model token-choice? **Because expert-choice is n
 The Switch/GShard formulation, per MoE layer, over a batch of `N` tokens and `E` experts:
 
 ```
-f_i = (1/N) · Σ_t  1[ expert i is in top-k(token t) ]     # dispatch fraction, non-differentiable
+f_i = (1/(N·k)) · Σ_t  1[ expert i in top-k(token t) ]    # dispatch fraction (Σ_i f_i = 1), non-differentiable
 P_i = (1/N) · Σ_t  softmax(router_logits(t))_i            # mean routing probability, differentiable
 L_aux = α · E · Σ_{i=1}^{E} f_i · P_i
 ```
 
-The construction is cleverer than it looks. `f_i` is a hard count and carries no gradient, so the loss reaches the router *only through* `P_i`. What it says is: "if expert `i` is currently overloaded (`f_i` large), push down the probability mass you assign to it." It is a differentiable surrogate for `Σ f_i²`, which is what you actually want minimized. At perfect balance `f_i = P_i = 1/E`, so `Σ f_i·P_i = E · (1/E²) = 1/E` and `L_aux = α`. That constant floor is a useful sanity check — if your logged aux loss is sitting at `α`, routing is uniform; if it is meaningfully above `α`, it is collapsing. Switch used `α = 0.01`.
+The construction is cleverer than it looks. `f_i` is a hard count and carries no gradient, so the loss reaches the router *only through* `P_i`. What it says is: "if expert `i` is currently overloaded (`f_i` large), push down the probability mass you assign to it." It is a differentiable surrogate for `Σ f_i²`, which is what you actually want minimized. At perfect balance `f_i = P_i = 1/E`, so `Σ f_i·P_i = E · (1/E²) = 1/E` and `L_aux = α`. That constant floor is a useful sanity check — if your logged aux loss is sitting at `α`, routing is uniform; if it is meaningfully above `α`, it is collapsing. (The floor depends on how `f_i` is normalized: Switch is top-1, so the `1/N` and `1/(N·k)` conventions coincide there, but some top-k implementations — HuggingFace's `load_balancing_loss_func` among them — normalize so the uniform-routing floor is `α·k` rather than `α`. Check your trainer's convention before you read anything into the absolute value.) Switch used `α = 0.01`.
 
 The trade-off it makes, and this is the part interviewers push on: **the auxiliary loss is a gradient that does not care about your task.** It actively fights specialization. If the true optimal routing for your data is skewed — and it usually is, because token frequencies are Zipfian — the balancing loss drags routing toward a uniformity the data does not support, and you pay for it in loss. Set `α` too high and you get well-balanced, undifferentiated experts and worse perplexity. Set it too low and you get expert collapse, dropped tokens, and stragglers. There is no principled way to pick `α`; you tune it, and the tuning is annoying because the symptom of a bad value appears thousands of steps later.
 
@@ -3110,7 +3115,7 @@ typically with a coefficient around `1e-3`. The motivation is bluntly numerical 
 
 What I actually put on a dashboard for a training run with MoE layers, and what each signal means when it moves:
 
-**Per-expert dispatch fraction `f_i`, as a distribution, per layer.** The single most informative plot. Healthy: a spread within roughly 2× of uniform after warmup. Sick: a few experts at 5–10× uniform and a tail at near-zero. Track `max(f)/min(f)` as a scalar and `Σ f_i²·E` (the coefficient of variation squared, 1.0 at uniform) as the alert metric.
+**Per-expert dispatch fraction `f_i`, as a distribution, per layer.** The single most informative plot. Healthy: a spread within roughly 2× of uniform after warmup. Sick: a few experts at 5–10× uniform and a tail at near-zero. Track `max(f)/min(f)` as a scalar and the load-imbalance index `E · Σ f_i²` as the alert metric — with `Σ f_i = 1` it equals `1 + CV²`, so it reads exactly 1.0 at uniform and rises with imbalance.
 
 **Routing entropy, and be careful to track two of them.** *Per-token* entropy `H = -Σ_i p_i log p_i` should *fall* over training — that is the router becoming decisive, which is what you want; it starts near `log E` (2.08 nats for E=8, 5.55 for E=256) and settles well below. *Batch-marginal* entropy, computed on the averaged distribution `P̄`, should stay *high*, near `log E` — that is load balance. Confusing these two is common and gives you exactly the wrong alarm. Collapse looks like both falling together.
 
@@ -3147,7 +3152,7 @@ And the activated count, which is what an inference FLOP estimate uses: attentio
 
 So: **46.7 B total, 12.9 B active.** Ratio 3.6×.
 
-**💰 Math — and this is the whole thesis of the section in one comparison.** Mixtral's active count (12.9 B) is close to Llama-3-8B's total (8.0 B), so a naive reading says "similar serving cost." Now put both on H100s in bf16. Llama-3-8B needs 16 GB of weights and fits on one 80 GB card with 64 GB left for KV; at 128 KiB/token of GQA cache that is ~500k tokens of KV, or 15 concurrent users at 32k context on **one GPU**. Mixtral needs 93.4 GB of weights and **does not fit on one H100 at all**. On two H100s (160 GB) you have 66 GB left for KV → ~503k tokens → about the same 15 users at 32k context, on **two GPUs**. Same FLOPs per token, same effective concurrency, exactly double the hardware bill. At an on-demand rate of roughly $2.50/GPU-hour (**📅 Volatile:** GPU spot and on-demand pricing moves constantly — verify before your loop), that is $3,600/month versus $1,800/month for the same served capacity.
+**💰 Math — and this is the whole thesis of the section in one comparison.** Mixtral's active count (12.9 B) is close to Llama-3-8B's total (8.0 B), so a naive reading says "similar serving cost." Now put both on H100s in bf16. Llama-3-8B needs 16 GB of weights and fits on one 80 GB card with 64 GB left for KV; at 128 KiB/token of GQA cache that is ~500k tokens of KV, or 15 concurrent users at 32k context on **one GPU**. Mixtral needs 93.4 GB of weights and **does not fit on one H100 at all**. On two H100s (160 GB) you have 66 GB left for KV → ~503k tokens → about the same 15 users at 32k context, on **two GPUs**. Comparable FLOPs per token (12.9 B active vs 8.0 B — within a factor of 1.6), same effective concurrency, exactly double the hardware bill. At an on-demand rate of roughly $2.50/GPU-hour (**📅 Volatile:** GPU spot and on-demand pricing moves constantly — verify before your loop), that is $3,600/month versus $1,800/month for the same served capacity.
 
 **🗣 Say this in the room:** "8×7B is 46.7 B parameters, not 56 B, because only the FFN is replicated — attention and embeddings are shared. And 12.9 B active does not mean it serves like a 13 B model: you still have to hold all 46.7 B in HBM. Active parameters predict FLOPs; total parameters predict your GPU count. The GPU count is what shows up on the invoice."
 
@@ -3254,7 +3259,7 @@ The arithmetic on why this hurts even with a *perfect* router is the part that s
 The router already computes everything you need; the work is getting it out cheaply and joining it to something meaningful. My instrumentation contract, in three tiers.
 
 **Tier 1 — always on, near-zero cost.** In the routing kernel, accumulate a `[n_layers, n_experts]` int32 counter of dispatch counts on-device. Reduce and export it once every `N` steps (I use N such that export is under 1% of step time — typically every 100–1000 decode steps), not per step. Export as a histogram, not a mean. The derived scalars I alert on:
-- `cv2 = E · Σ_i (f_i)²` — the squared coefficient of variation of load, equal to 1.0 at perfect balance. Alert above ~1.5.
+- `imbalance = E · Σ_i (f_i)²` — the load-imbalance index; with `Σ f_i = 1` it equals `1 + CV²`, so it is exactly 1.0 at perfect balance. Alert above ~1.5.
 - `max_i f_i / (1/E)` — the hot-expert ratio. Alert above ~3.
 - Per-GPU aggregate load, since that is what actually determines step time.
 
@@ -3295,7 +3300,7 @@ B_eff = B · k / E
 
 Now put numbers on it. Suppose you want the arithmetic intensity of a dense model at batch 256 — comfortably past the H100 ridge point, where you are finally using the tensor cores. For Mixtral you need `B = 1024` concurrent decode tokens. For DeepSeek-V3 you need `B = 8192`. **Eight thousand concurrent sequences in the decode batch.** That is the number that decides whether an MoE makes sense for your deployment, and it is a *product* question — do you have that much simultaneous traffic? — dressed as an architecture question.
 
-And here is the cruelty that makes this self-defeating on fixed hardware: the batch size you can reach is capped by KV-cache memory, and the MoE's weights already ate that memory. Take Mixtral 8x22B (141 B total, 39 B active) on 4× H100 in fp8: 141 GB of weights leaves 179 GB for KV. At 224 KiB/token of GQA cache that is 800k tokens — about **25 concurrent sequences at 32k context**. But you needed `B ≈ 1024` tokens in flight to reach good expert utilization, and 25 sequences gives you 25. You are running at `B_eff = 25 · 2/8 = 6.25`. The model is being read at an effective batch of six.
+And here is the cruelty that makes this self-defeating on fixed hardware: the batch size you can reach is capped by KV-cache memory, and the MoE's weights already ate that memory. Take Mixtral 8x22B (141 B total, 39 B active) on 4× H100 with fp8 weights: 141 GB of weights leaves 179 GB for KV. At 224 KiB/token of GQA cache (56 layers × 8 KV heads × 128 × 2 tensors, bf16 KV) that is 800k tokens — about **25 concurrent sequences at 32k context**. But you needed `B ≈ 1024` tokens in flight to reach good expert utilization, and 25 sequences gives you 25. You are running at `B_eff = 25 · 2/8 = 6.25`. The model is being read at an effective batch of six.
 
 **⚠ Trap:** benchmarking an MoE with a synthetic load of thousands of short concurrent prompts, seeing excellent throughput, and shipping it for a long-context product where KV capacity caps concurrency at a few dozen. Your benchmark measured the regime where MoE wins; production runs in the regime where it loses. **The rule I enforce: benchmark MoE serving at your actual context length, not at your actual request count.** Context length is what determines the batch you can reach, and the batch is what determines whether the architecture pays.
 
@@ -3308,10 +3313,10 @@ Let me do this fully, because the arithmetic *is* the answer. Compare **Llama-3-
 - Mixtral 8x22B at any batch large enough to touch all 8 experts (which is any batch above ~15 tokens): 141 GB → 35.3 GB per GPU → `35.3e9 / 3.35e12 = 10.5 ms`.
 
 **FLOPs per decode step (linear in batch):**
-- Dense: `2 · 70e9 · B` FLOP over `4 · 990e12` FLOP/s → `35.4 ns · B`.
-- MoE: `2 · 39e9 · B` over the same → `19.7 ns · B`.
+- Dense: `2 · 70e9 · B` FLOP over `4 · 990e12` FLOP/s → `35.4 µs · B`.
+- MoE: `2 · 39e9 · B` over the same → `19.7 µs · B`.
 
-**Where each becomes compute-bound:** dense at `B = 5.2e-3 / 35.4e-9 ≈ 147`; MoE at `B = 10.5e-3 / 19.7e-9 ≈ 533`.
+**Where each becomes compute-bound:** dense at `B = 5.2e-3 / 35.4e-6 ≈ 147`; MoE at `B = 10.5e-3 / 19.7e-6 ≈ 533`.
 
 **Throughput:**
 | batch B | dense step | dense tok/s | MoE step | MoE tok/s | winner |
@@ -3325,7 +3330,7 @@ Let me do this fully, because the arithmetic *is* the answer. Compare **Llama-3-
 
 **The crossover is around 300 concurrent decode tokens.** Below it, the dense 70B is up to **2× faster** despite having 1.8× the active parameters, because decode is bandwidth-bound and the MoE reads twice as many bytes. Above it, the MoE is up to 1.8× faster because it does half the FLOPs.
 
-Now the capacity check, which is the part people skip. Can you *reach* batch 300 on this hardware? KV budget for Mixtral 8x22B is `320 − 141 = 179 GB` at 224 KiB/token = 800k tokens. At 32k average context: 25 sequences. At 8k: 100 sequences. At 2k: 400 sequences. **So the MoE only wins if your workload is short-context and high-concurrency.** For a long-context enterprise assistant, you sit permanently on the wrong side of the crossover.
+Now the capacity check, which is the part people skip. Can you *reach* batch 300 on this hardware? KV budget for Mixtral 8x22B is `320 − 141 = 179 GB` at 224 KiB/token (bf16 KV) = 800k tokens. At 32k average context: 25 sequences. At 8k: 100 sequences. At 2k: 400 sequences. **So the MoE only wins if your workload is short-context and high-concurrency.** For a long-context enterprise assistant, you sit permanently on the wrong side of the crossover.
 
 **🗣 Say this in the room:** "For that pair on 4 H100s, the crossover is around 300 concurrent decode tokens. Below it the dense model wins by up to 2× because decode is bandwidth-bound and the MoE reads 141 GB per step against the dense model's 70. Above it the MoE wins by ~1.8× because it does half the FLOPs. Then I'd check whether the KV budget even permits batch 300 at our context length — for 32k contexts it caps out around 25 sequences, so we'd never get there."
 
@@ -3339,7 +3344,7 @@ As requests arrive and sequences grow, KV cache grows linearly in total tokens r
 282e9 bytes / 229,376 bytes-per-token ≈ 1.23 M tokens resident
 ```
 
-which is 38 sequences at 32k context, or 9.6 sequences at 128k. On an 8×H100 node you have `640 − 282 = 358 GB` for KV = 1.56 M tokens, so **you cross over just before you run out** — you spend the last third of your capacity in a regime where KV dominates and the weights are the smaller half. That shape is important: it means both levers matter, and neither alone saves you.
+which is 38 sequences at 32k context, or 9.6 sequences at 128k. On an 8×H100 node you have `640 − 282 = 358 GB` for KV = 1.56 M tokens, so **you cross over just before you run out** — you spend only the last ~20% of your capacity in a regime where KV dominates and the weights are the smaller half. That shape is important: it means both levers matter, and neither alone saves you.
 
 Now do the same for **DeepSeek-V3 with MLA**, and watch the profile invert. MLA stores a compressed latent plus a decoupled RoPE component — 512 + 64 = 576 elements per token per layer — so across 61 layers at fp8 that is `576 · 61 · 1 B ≈ 35 KB per token` (≈70 KB at bf16). Weights at fp8 are 671 GB. Crossover:
 
@@ -3499,8 +3504,8 @@ I will start with the measurements that determine the answer, because the archit
 
 *Memory, both candidates at fp8 weights and fp8 KV.*
 
-- **Llama-3-70B dense:** weights 70 GB. KV = `2 · 80 layers · 8 kv_heads · 128 · 1 byte = 163,840 B = 160 KiB/token`. At 67 × 30k = 2.0 M resident tokens → `2.0e6 × 163840 = 328 GB`. Total 398 GB → **6 GPUs**, round up to 8 for TP divisibility and headroom.
-- **Mixtral 8x22B MoE:** weights 141 GB. KV = `2 · 56 · 8 · 128 · 1 = 114,688 B = 112 KiB/token` → `2.0e6 × 114688 = 229 GB`. Total 370 GB → also **8 GPUs**.
+- **Llama-3-70B dense:** weights 70 GB. KV = `2 · 80 layers · 8 kv_heads · 128 · 1 byte = 163,840 B = 160 KiB/token`. At 67 × 30k = 2.0 M resident tokens → `2.0e6 × 163840 = 328 GB`. Total 398 GB → **5 GPUs** by raw capacity, round up to 8 for TP divisibility, activations and headroom.
+- **Mixtral 8x22B MoE:** weights 141 GB. KV = `2 · 56 · 8 · 128 · 1 = 114,688 B = 112 KiB/token` → `2.0e6 × 114688 = 229 GB`. Total 370 GB → 5 GPUs by raw capacity, so also **8 GPUs**.
 
 Note the MoE's *KV* is smaller (fewer layers), which partly offsets its larger weights. Same GPU count. So memory does not decide it.
 
@@ -3515,7 +3520,7 @@ Both clear the 30 ms ITL budget with room, but the dense model is **2× faster p
 
 **My call: dense 70B-class for Product B.** Same GPU count, 2× better ITL, 2× more headroom, dramatically simpler operations — no expert telemetry, no straggler management, no placement table. The MoE's only win is first-turn TTFT, which prefix caching largely erases. **I would revisit if concurrency grew past ~300 decode tokens** (roughly 12 req/s, a 4× traffic increase) — at that point the crossover flips and the MoE's FLOP advantage starts to matter.
 
-**💰 Build-versus-buy, because this is what actually gets asked next.** 8× H100 on-demand at ~$2.50/GPU-hour (**📅 Volatile**) = $20/hour = **$14.6k/month** for Product B. Against a frontier API at, say, $3/Mtok input and $15/Mtok output: input is `80,000 × 30,000 = 2.4 B tokens/day`; with prefix caching hitting 80% of it at a 90% discount, that is `0.8 × 2400 Mtok × $0.30 + 0.2 × 2400 Mtok × $3.00 = $576 + $1,440 = $2,016/day`. Output: `80,000 × 800 = 64 Mtok × $15 = $960/day`. Total ≈ **$3.0k/day ≈ $89k/month**. Self-hosting is ~6× cheaper *if* you sustain utilization — which at 67 concurrent sequences on 8 GPUs, you do. That 6× is the entire business case, and it is also why the answer changes completely at 200 engineers instead of 2,000: at one-tenth the traffic the API bill is $8.9k and the GPUs still cost $14.6k, and you should buy.
+**💰 Build-versus-buy, because this is what actually gets asked next.** 8× H100 on-demand at ~$2.50/GPU-hour (**📅 Volatile:** GPU rates *and* the API list prices below both move every few months — quote the ratio, not the absolute numbers, and re-derive from current price pages before your loop) = $20/hour = **$14.6k/month** for Product B. Against a frontier API at, say, $3/Mtok input and $15/Mtok output: input is `80,000 × 30,000 = 2.4 B tokens/day`; with prefix caching hitting 80% of it at a 90% discount, that is `0.8 × 2400 Mtok × $0.30 + 0.2 × 2400 Mtok × $3.00 = $576 + $1,440 = $2,016/day`. Output: `80,000 × 800 = 64 Mtok × $15 = $960/day`. Total ≈ **$3.0k/day ≈ $89k/month**. Self-hosting is ~6× cheaper *if* you sustain utilization — which at 67 concurrent sequences on 8 GPUs, you do. That 6× is the entire business case, and it is also why the answer changes completely at 200 engineers instead of 2,000: at one-tenth the traffic the API bill is $8.9k and the GPUs still cost $14.6k, and you should buy.
 
 **How I would know it works:** acceptance rate for Product A, edit-survival rate (does the model's code still exist 24 hours later) for Product B, TTFT and ITL percentiles per product, and cost per accepted suggestion. Not perplexity.
 
@@ -3597,13 +3602,13 @@ moe_intermediate_size = 1536     first_k_dense_layers = 2
 
 ### Start me at the beginning — why do language models tokenize at all? Why not just feed them raw bytes or raw characters?
 
-Tokenization is a compression codec sitting between your string and the model's embedding table, and it exists because the transformer's cost is quadratic in sequence length and linear in vocabulary size — so you are trading one axis against the other. Every token costs you `O(T²)` attention work and `O(T·d)` of KV cache; every vocabulary entry costs you one row in the embedding matrix and one row in the unembedding matrix, plus a slice of softmax time. Tokenization picks the operating point on that curve.
+Tokenization is a compression codec sitting between your string and the model's embedding table, and it exists because the transformer's cost is quadratic in sequence length and linear in vocabulary size — so you are trading one axis against the other. A sequence of `T` tokens costs you `O(T²)` attention work and `O(T·d)` of KV cache — so each extra token costs `O(T)` attention work and `O(d)` of cache on top of what is already there; every vocabulary entry costs you one row in the embedding matrix and one row in the unembedding matrix, plus a slice of softmax time. Tokenization picks the operating point on that curve.
 
 Concretely: English text is roughly 4 characters per token under a modern 100k–200k BPE vocabulary. If you fed raw UTF-8 bytes instead, the same document would be ~4× longer. At 4× the sequence length you pay 16× the attention-score FLOPs, 4× the KV cache bytes, and 4× the wall-clock decode steps to emit the same text. That is not a rounding error — it is the difference between a 32k-token document fitting in context and a 128k-token document not fitting.
 
 The other direction fails too. A word-level vocabulary needs hundreds of thousands of entries and still hits out-of-vocabulary words constantly — every typo, every proper noun, every new product name becomes `<UNK>` and the model literally cannot represent it. Subword tokenization is the compromise: frequent words get one token, rare words decompose into pieces, and nothing is unrepresentable.
 
-**🗣 Say this in the room:** "Tokenization is lossy-free compression that buys you sequence length at the cost of vocabulary size. Attention is quadratic in tokens and the embedding table is linear in vocab, so you're picking a point on that trade curve. Bytes are maximally general and maximally expensive; words are compact and can't handle the tail. Subword BPE is the settled compromise."
+**🗣 Say this in the room:** "Tokenization is lossless compression that buys you sequence length at the cost of vocabulary size. Attention is quadratic in tokens and the embedding table is linear in vocab, so you're picking a point on that trade curve. Bytes are maximally general and maximally expensive; words are compact and can't handle the tail. Subword BPE is the settled compromise."
 
 The backend analogue that actually helps: the tokenizer is a *dictionary-coder*, like the LZ78 family. It builds a table of frequently-recurring byte sequences during training and then encodes new input against that fixed table. The important consequence — and the source of half this section's failure modes — is that **the table is frozen at training time and the model's entire world is expressed in it.** If your production text distribution drifts away from the tokenizer's training distribution, you do not get an error; you get silently worse compression, more tokens, higher bills, and degraded quality on the tokens that fall apart.
 
@@ -3943,18 +3948,18 @@ def fertility(tok, docs):           # tokens per character
 English on a modern 100k+ vocab sits near 0.25 tokens/char (the "4 characters per token" rule of thumb). If your Hindi corpus measures 0.8 tokens/char, that is a 3.2× fertility ratio and you now have a number you can multiply by.
 
 **📐 Numbers you must know**, with their derivations rather than as bare figures:
-- **English prose ≈ 4 characters/token ≈ 0.75 tokens/word** on a 100k+ BPE vocab. Derivation: mean English word length is ~4.7 characters plus a space ≈ 5.7 characters, and most common words are a single leading-space token, so ~5.7 chars ÷ 0.75 tokens ≈ 4 chars/token. This is the anchor every other estimate hangs off.
-- **UTF-8 byte width is the floor on byte-fallback cost**: Latin 1, Cyrillic/Greek/Hebrew/Arabic 2, Devanagari/Thai/CJK 3, most emoji 4. A script with zero learned merges costs *that many tokens per character*, so a 3-byte script degrades to 12× English's chars-per-token in the pathological case.
-- **Code and JSON run 2.5–3.5 characters/token** — worse than prose, because punctuation, indentation, and identifiers fragment. Budget structured payloads at roughly 1.3–1.6× the token count you'd estimate from prose of the same length.
+- **English prose ≈ 4 characters/token ≈ 0.75 *words* per token** (equivalently ~1.33 tokens per word — the "100 tokens ≈ 75 words" rule) on a 100k+ BPE vocab. Derivation: mean English word length is ~4.7 characters plus a space ≈ 5.7 characters per word, so 5.7 chars/word × 0.75 words/token ≈ 4.3 chars/token. Note the direction of the ratio — "0.75 tokens per word" is the inverted, wrong form and people say it constantly. This is the anchor every other estimate hangs off.
+- **UTF-8 byte width is the floor on byte-fallback cost**: Latin 1, Cyrillic/Greek/Hebrew/Arabic 2, Devanagari/Thai/CJK 3, most emoji 4. A script with zero learned merges costs *that many tokens per character*, so a 3-byte script lands at 3 tokens/char against English's 0.25 tokens/char — 12× the tokens per character in the pathological case.
+- **Code and JSON run 2.5–3.5 characters/token** — worse than prose, because punctuation, indentation, and identifiers fragment. Budget structured payloads at roughly 1.15–1.6× the token count you'd estimate from prose of the same length.
 
 All three are starting estimates for a back-of-envelope in the room. The number you put in a design doc is the one you measured on your corpus.
 
-**💰 Math — the actual bill.** Support assistant, 2,000-token cached system prompt, 600-character user message, ~200-token English reply. Prices at $3/Mtok in, $15/Mtok out.
+**💰 Math — the actual bill.** Support assistant, 2,000-token system prompt (uncached, for this comparison), 600-character user message, ~200-token English reply. Prices assumed at $3/Mtok in, $15/Mtok out.
 
 *English:* input `2000 + 150 = 2150` tokens → `2150 × 3e-6 = $0.00645`. Output 200 tokens → `200 × 15e-6 = $0.0030`. Total **$0.00945**.
 *Hindi at 3.3× fertility:* input `2000 + 495 = 2495` → `$0.00749`. Output `660` tokens → `660 × 15e-6 = $0.0099`. Total **$0.01739**.
 
-That is **1.84× per message**, and notice where it came from: the input barely moved because the system prompt dominates and doesn't inflate, while the *output* nearly tripled at 5× the per-token price. At 500k Hindi messages/month you pay $8,695 instead of $4,725 — **+$3,970/month**, for identical product behaviour.
+That is **1.84× per message**, and notice where it came from: the input barely moved because the system prompt dominates and doesn't inflate, while the *output* more than tripled at 5× the per-token price. At 500k Hindi messages/month you pay $8,695 instead of $4,725 — **+$3,970/month**, for identical product behaviour.
 
 The second-order damage is worse than the money. Your 128k context window holds ~3.3× less Hindi content, so your RAG retrieval budget silently shrinks, your conversation history truncates sooner, and your "max 40 chunks" retrieval config is now effectively "max 12 chunks" for those users. **The quality regression from context starvation is usually bigger than the cost regression.**
 
@@ -3972,7 +3977,7 @@ Four levers, in the order I would reach for them.
 
 **⚠ Trap:** "we'll just translate to English, call the model, and translate back." You have now added two model calls, two failure modes, translation loss on domain terminology, and latency — and you still pay for the non-English tokens on the translation calls. It occasionally wins on very long documents with a cheap translation model. It usually loses. Measure before you propose it in a design review, because an interviewer who has done this will push back.
 
-**📅 Volatile:** fertility ratios move with every tokenizer generation, and the newer 150k–250k vocabularies are substantially better on non-Latin scripts than the 32k–50k generation. Never quote a ratio from memory in an interview; describe the measurement and give the range. Verify before your loop.
+**📅 Volatile:** fertility ratios move with every tokenizer generation, and the newer 150k–250k vocabularies are substantially better on non-Latin scripts than the 32k–50k generation. The per-token list prices used in the arithmetic above ($3/Mtok in, $15/Mtok out) and the cached-input discount are illustrative placeholders — provider pricing changes. Never quote a ratio or a price from memory in an interview; describe the measurement and give the range. Verify before your loop.
 
 ### What are glitch tokens? Give me the mechanism, not the folklore.
 
@@ -4114,13 +4119,15 @@ Before anything else: adding vocabulary is only possible if you own the weights.
 The mechanism is that you are appending `N` rows to the embedding matrix and (if untied) `N` rows to the unembedding matrix, and those rows arrive untrained. **A newly-added token is, by construction, a glitch token until you train it.** Every failure mode in this procedure follows from that one fact.
 
 ```python
-# 1. Extend the tokenizer.
+# 1. Capture the OLD sub-token decomposition FIRST — before the tokenizer knows
+#    the new terms — so we can initialize each new row from the pieces it
+#    replaces. This is the good init, and it only works if it runs before
+#    add_tokens(); afterwards `tok` returns the new single ID instead.
+pieces = {t: tok(t, add_special_tokens=False).input_ids for t in new_terms}
+
+# 2. Extend the tokenizer.
 n_added = tok.add_tokens(new_terms)            # returns how many were actually new
 old_v   = model.get_input_embeddings().weight.shape[0]
-
-# 2. Capture the OLD sub-token decomposition BEFORE resizing, so we can
-#    initialize each new row from the pieces it replaces. This is the good init.
-pieces = {t: old_tok(t, add_special_tokens=False).input_ids for t in new_terms}
 
 # 3. Resize. This grows both matrices (or the shared one, if tied).
 model.resize_token_embeddings(len(tok))
@@ -4531,7 +4538,7 @@ I would offer a fourth if pressed, because it is the most operationally expensiv
 
 ### I'm going to give you 45 minutes and a blank editor. Write me BPE — training and encoding — and then I'll ask you four things about it.
 
-**🏋 Drill — Time: 45 minutes. No autocomplete, no reference material, no LLM assistance.** This is the exact format of an Anthropic or DeepMind live coding round on this topic.
+**🏋 Drill — Time: 45 minutes. No autocomplete, no reference material, no LLM assistance.** This mirrors the shape of a frontier-lab live coding round on this topic; the exact format varies by company and by year.
 
 **Part A (20 min) — training.** Implement `train_bpe(word_freqs: dict[str, int], num_merges: int) -> list[tuple[bytes, bytes]]` from scratch. Byte-level alphabet. Deterministic tie-breaking. Return the ordered merge list.
 
@@ -4752,7 +4759,7 @@ There are four defects and they are of escalating severity.
 
 **Bug 4 — the real one: zeroing probabilities is not the same as masking logits, once anything else is in the pipeline.** Setting probabilities to zero and renormalizing is mathematically equivalent to setting logits to `-inf` and re-softmaxing *for this operation alone*. But the moment a second filter, a logit bias, or a constrained-decoding grammar mask runs after this, the pipeline expects logits, and it has been handed a probability vector. Everything downstream that adds a bias in log-space now adds it in probability-space. The convention every engine enforces is: **every stage of the sampler consumes logits and emits logits; softmax happens exactly once, at the end.** This PR breaks that invariant and the resulting bug is invisible until someone enables JSON mode.
 
-**🗣 Say this in the room:** "Three functional bugs — temperature applied to the token id instead of the logits, a `cum > p` boundary that can empty the nucleus and NaN on a confident distribution, and an in-place write into a sort view. The architectural one is that it returns probabilities where the sampler pipeline contract is logits-in, logits-out."
+**🗣 Say this in the room:** "Two functional bugs — temperature applied to the token id instead of the logits, and a `cum > p` boundary that can empty the nucleus and NaN on a confident distribution — plus an in-place write into the sort output that I'd flag on robustness grounds rather than correctness. The architectural one is that it returns probabilities where the sampler pipeline contract is logits-in, logits-out."
 
 ### What is min-p sampling and what's it fixing that top-p doesn't?
 
@@ -4861,7 +4868,7 @@ Three points carry the answer. **Sum log-probs, never multiply probabilities** �
 
 The decision rule is about the shape of the output space, not about the model. **Use search when the task has a small number of correct outputs and you are trying to find one of them. Use sampling when the task has many acceptable outputs and you are trying to produce a natural one.**
 
-Beam search is right for machine translation, grammatical error correction, constrained code completion where a single-token mistake invalidates everything, and any task whose evaluation metric is a similarity score against a reference (BLEU, chrF, exact match). In all of these, the reference is close to the mode, so maximizing sequence likelihood is aligned with the metric. Translation is the canonical case, and it is where beam search was developed — the correct German rendering of an English sentence is nearly unique, so a slightly better-scoring path really is a better translation.
+Beam search is right for machine translation, grammatical error correction, constrained code completion where a single-token mistake invalidates everything, and any task whose evaluation metric is a similarity score against a reference (BLEU, chrF, exact match). In all of these, the reference is close to the mode, so maximizing sequence likelihood is aligned with the metric. Translation is the canonical case — beam search itself comes out of 1970s speech recognition, but machine translation is where it became the default for neural sequence generation — because the correct German rendering of an English sentence is nearly unique, so a slightly better-scoring path really is a better translation.
 
 It is wrong for open-ended chat, story generation, brainstorming, and long-form assistant responses, and the reason is the finding from Holtzman et al. (2020) I mentioned earlier: **the mode of an open-ended language model's sequence distribution is degenerate.** Push the beam width up and quality gets *worse*, not better — output converges on short, bland, hedge-laden text and eventually on literal loops. The intuition is that a repetition is high-probability by construction (the model conditions on itself), so any maximization procedure is drawn toward repetition as an attractor. Beam search finds it faster than greedy does.
 
@@ -4971,7 +4978,7 @@ Z = sum(exp.values())
 probs = {k: v / Z for k, v in exp.items()}              # {'positive': 0.91, ...}
 ```
 
-**💰 Math:** the win is output tokens. A generative classification call that emits `"The sentiment here is positive."` costs ~8 output tokens; this costs 1. At $15/Mtok output that is `8 × 15e-6 = $1.2e-4` vs `1.5e-5` per call — 8× on the output line. But the bigger win is latency: output tokens are serial, so 8 tokens at ~25 ms/token inter-token latency is 200 ms of decode versus 25 ms. At 5 M classifications/month you save `5e6 × 175 ms = 243 GPU-hours` of decode occupancy and roughly `5e6 × 1.05e-4 = $525/month` on output alone. And you get a *probability*, which means you can set a confidence threshold and route the uncertain 8% to a bigger model or a human — which is worth more than the cost saving.
+**💰 Math:** the win is output tokens. A generative classification call that emits `"The sentiment here is positive."` costs ~8 output tokens; this costs 1. At $15/Mtok output (📅 **Volatile** — per-token prices move; re-derive with the current ones) that is `8 × 15e-6 = $1.2e-4` vs `1.5e-5` per call — 8× on the output line. But the bigger win is latency: output tokens are serial, so 8 tokens at ~25 ms/token inter-token latency is 200 ms of decode versus 25 ms. At 5 M classifications/month you save `5e6 × 175 ms = 243 GPU-hours` of decode occupancy and roughly `5e6 × 1.05e-4 = $525/month` on output alone. And you get a *probability*, which means you can set a confidence threshold and route the uncertain 8% to a bigger model or a human — which is worth more than the cost saving.
 
 **⚠ Trap:** treating those probabilities as calibrated. They are not, in the strict sense — instruction-tuned models are systematically overconfident, and RLHF makes it worse. They are *monotone-useful*: a 0.95 is genuinely more reliable than a 0.6, so thresholding works. But do not report them as "the model is 95% confident" to a user or a regulator. If you need calibration, fit a temperature-scaling parameter on a held-out labeled set — one scalar, fit in seconds, and it usually cuts expected calibration error substantially.
 
@@ -4993,7 +5000,7 @@ Order A — temperature first: logits become `[5, 4, 3, 2.5]`. Exponentials `148
 
 Order B — top-p first, at T=1: softmax of `[10,8,6,5]` → `e^10=22026, e^8=2981, e^6=403, e^5=148`, sum `25558`, probs `[0.862, 0.117, 0.0158, 0.0058]`. Cumulative: `0.862, 0.979`. Nucleus at p=0.9 is the first **two** tokens. Then apply T=2 to those two.
 
-**Same parameters, different candidate sets — three tokens versus two.** Order A samples token 3 about 8% of the time; order B never samples it. That is not a rounding difference, it is a different model behavior, and it is invisible in any test that only checks "the output is valid JSON."
+**Same parameters, different candidate sets — three tokens versus two.** Order A samples token 3 about 9% of the time (`0.085 / 0.948` after renormalizing over the nucleus); order B never samples it. That is not a rounding difference, it is a different model behavior, and it is invisible in any test that only checks "the output is valid JSON."
 
 The general rule: **rank-based filters (top-k) commute with temperature; mass-based filters (top-p, min-p, typical, epsilon) do not.** The near-universal convention is temperature first, then truncation — HuggingFace, vLLM and the hosted APIs all effectively do this — which is order A. Min-p is the noted exception where several practitioners argue for the reverse.
 
@@ -5150,7 +5157,7 @@ I want to establish *which* kind of "different" before touching anything, becaus
 
 Self-consistency is the observation that **for tasks with a checkable, canonical final answer, the marginal distribution over answers is more accurate than any single sampled trajectory.** Sample `k` reasoning chains at nonzero temperature, extract the final answer from each, and take the plurality vote. You are marginalizing over reasoning paths instead of committing to one — the model can reach 42 by three different valid routes and by one arithmetic slip, and the vote drowns the slip.
 
-**📄 Paper:** Wang et al. (2023), "Self-Consistency Improves Chain of Thought Reasoning in Language Models" (ICLR) — replaced greedy CoT decoding with sample-and-vote and reported large double-digit absolute accuracy gains on arithmetic and commonsense reasoning benchmarks with the frontier models of that era.
+**📄 Paper:** Wang et al. (2023), "Self-Consistency Improves Chain of Thought Reasoning in Language Models" (ICLR) — replaced greedy CoT decoding with sample-and-vote and reported large double-digit absolute accuracy gains on arithmetic reasoning benchmarks (on the order of +18 points on GSM8K), with smaller single-digit gains on commonsense benchmarks, using the frontier models of that era.
 
 Two design constraints are non-negotiable. **Temperature must be > 0** — usually 0.6–0.8 — because at temperature 0 all `k` samples are the same trajectory and you have paid `k×` for nothing. And **the final answer must be extractable and comparable**, which is why it works for math, multiple choice, structured extraction and classification, and does not work for "write me a summary" — you cannot majority-vote over prose.
 
@@ -5194,7 +5201,7 @@ The decision rule I actually use:
 - Is the output **free-form** with no verifier? Best-of-n with a reward model or an LLM judge, and now you own an evaluation problem: the scorer needs its own eval, and `k` large enough will find and exploit the scorer's blind spots. Reward over-optimization is real; the gain from best-of-n is typically non-monotone in `k`, rising and then falling as you select harder against a flawed proxy. I would not run `k > 8` against a learned reward model without measuring the turn-over point.
 - Neither? Then you are not choosing between these, you are choosing to spend the compute on a better model or better context instead — which is usually the right answer at the same price.
 
-**💰 Math:** best-of-8 on a code task with a test-suite verifier: 8 × the generation cost plus 8 test runs. If generation is $0.02 and a sandboxed test run is $0.001 of compute, that is `8 × 0.021 = $0.168` versus `$0.021`. If pass@1 is 55% and pass@8-with-verifier-selection is 82%, you paid 8× to convert 27% of failures into successes. Whether that is a good trade is entirely a question of what a failed patch costs downstream — for an autonomous agent that opens a PR a human must review, one avoided bad PR is worth many dollars of inference.
+**💰 Math:** best-of-8 on a code task with a test-suite verifier: 8 × the generation cost plus 8 test runs. If generation is $0.02 and a sandboxed test run is $0.001 of compute, that is `8 × 0.021 = $0.168` versus `$0.021`. If pass@1 is 55% and pass@8-with-verifier-selection is 82%, you paid 8× to buy 27 points of absolute pass rate — that is 60% of the previously-failing cases converted into successes. Whether that is a good trade is entirely a question of what a failed patch costs downstream — for an autonomous agent that opens a PR a human must review, one avoided bad PR is worth many dollars of inference.
 
 ### How do sampling parameters interact with prefix caching?
 
@@ -5353,7 +5360,7 @@ The engine cannot run a per-request Python branch — that would serialize the b
 
 The expensive one is any mass-based truncation, because the textbook implementation sorts. A `[256, 128256]` sort is 32.8 M float32 elements plus 32.8 M index elements. GPU radix sort throughput is in the low tens of billions of elements per second, so this lands in the low-single-digit milliseconds. Compare that to the decode step itself: a 70B model at batch 256 might take 20–30 ms per step. A 2–3 ms sampler is a **10% throughput tax on the entire deployment**, paid because some requests set `top_p`. That is a number worth having, and the shape of the argument matters more than the exact digits — measure yours.
 
-The mitigations are real and worth naming, because they show you have read an engine. **Sort-free top-p/top-k** via a rejection-sampling scheme: draw a candidate from the full distribution, check whether it satisfies the top-p condition using only order statistics you can compute without a full sort, and retry on failure. FlashInfer implements this family, and it removes the `O(V log V)` term. **Partial sorts** — you only need the top-`m` for some `m` bounded by the practical nucleus size, so `topk` with a modest `m` plus a fallback path handles the common case at a fraction of the cost. And **fusing** temperature, penalties and masking into a single kernel pass over the logit matrix instead of five separate `[B, V]` reads, which matters because at `[256, 128256]` fp32 each pass is 131 MB of HBM traffic — five passes is 655 MB, or about 0.3 ms at 2 TB/s just in memory movement.
+The mitigations are real and worth naming, because they show you have read an engine. **Sort-free top-p/top-k** via a rejection-sampling scheme: draw a candidate from the full distribution, check whether it satisfies the top-p condition using only order statistics you can compute without a full sort, and retry on failure. FlashInfer implements this family, and it removes the `O(V log V)` term. **Partial sorts** — you only need the top-`m` for some `m` bounded by the practical nucleus size, so `topk` with a modest `m` plus a fallback path handles the common case at a fraction of the cost. And **fusing** temperature, penalties and masking into a single kernel pass over the logit matrix instead of five separate `[B, V]` reads, which matters because at `[256, 128256]` fp32 the tensor is 131 MB, so each pass costs 131 MB read plus 131 MB written — five passes is about 1.3 GB of HBM traffic, or roughly 0.65 ms at 2 TB/s just in memory movement.
 
 **⚠ Trap:** assuming the sampler is free because "it's just a softmax." At large vocabulary and large batch it is a non-trivial fraction of the decode step, and it is a fraction that grows as you add features. When you propose adding min-p support to a gateway, the honest cost accounting includes the batch-wide kernel cost, not just the per-request one.
 
@@ -5412,7 +5419,7 @@ Why an engine cares. **No softmax and no cumulative sum are needed** — you nev
 
 There is a third property that is genuinely useful and rarely mentioned: **shared Gumbel noise couples your samples.** Fix the Gumbel draws and sweep temperature, and you get a coupled family of samples where the differences are attributable to temperature alone, not to independent randomness. That is a much better experiment design for a temperature sweep than independent sampling, and it is a nice thing to volunteer.
 
-**⚠ Trap:** implementing `-log(-log(u))` without clamping `u` away from 0 and 1. At `u = 0` you get `-log(inf) = -inf`... actually `log(0) = -inf`, so `-log(-log(0))` is `-log(inf) = -inf`, and at `u = 1`, `log(1) = 0` and `-log(0) = +inf`, giving `-inf`. Either way you poison the argmax. `torch.rand` returns values in `[0, 1)`, so `u = 0` is reachable. Clamp. This is the entire content of a class of "one in ten million requests returns token 0" bugs.
+**⚠ Trap:** implementing `-log(-log(u))` without clamping `u` away from 0 and 1. At `u → 0`: `log(0) = -inf`, so `-log(u) = +inf` and `g = -log(+inf) = -inf` — that entry can never be drawn. At `u → 1`: `log(1) = 0`, so `-log(u) = 0` and `g = -log(0) = +inf` — that entry *always* wins the argmax regardless of its logit, which is the dangerous direction. Either way you poison the argmax. `torch.rand` returns values in `[0, 1)`, so `u = 0` is directly reachable, and in reduced precision a `u` close enough to 1 makes `-log(u)` underflow to exactly 0 and produces the `+inf` case too. Clamp both ends. This is the entire content of a class of "one request in ten million returns a bizarre token" bugs.
 
 ### Product asks for a "regenerate" button. Design its sampling behavior.
 
@@ -5430,7 +5437,7 @@ If your surface runs at `temperature=0`, hitting regenerate re-runs the identica
 
 *Better still: pre-generate and select.* If the surface has budget, generate `n=2` or `n=3` on the first call (paying `n×` on output but `1×` on the shared prefill), return the best by whatever selector you have, and hold the others. Regenerate then returns the second candidate at **zero latency and zero marginal cost** — it is already computed. This is a genuinely superior experience: regenerate becomes instant. The trade is that you pay the extra generation on 100% of requests to serve the ~10–20% who regenerate.
 
-**💰 Math on that trade:** 1 M requests/month, 600 output tokens, $15/Mtok, and a 15% regenerate rate. *Reactive:* `1e6 × 600 × 15e-6 = $9,000` plus `0.15 × 1e6 × 600 × 15e-6 = $1,350` = **$10,350/month**, with a full generation's latency on regenerate. *Pre-generate n=2:* `1e6 × 2 × 600 × 15e-6 = $18,000` = **$18,000/month**, with instant regenerate. You are paying $7,650/month to make 150,000 regenerates instant — about **$0.051 per instant regenerate**. Now it is a product decision with a number attached, which is the whole point of doing the arithmetic. Below roughly a 50% regenerate rate, reactive wins on cost; pre-generation wins only if latency on that path is a strategic priority.
+**💰 Math on that trade:** 1 M requests/month, 600 output tokens, $15/Mtok, and a 15% regenerate rate. *Reactive:* `1e6 × 600 × 15e-6 = $9,000` plus `0.15 × 1e6 × 600 × 15e-6 = $1,350` = **$10,350/month**, with a full generation's latency on regenerate. *Pre-generate n=2:* `1e6 × 2 × 600 × 15e-6 = $18,000` = **$18,000/month**, with instant regenerate. You are paying $7,650/month to make 150,000 regenerates instant — about **$0.051 per instant regenerate**. Now it is a product decision with a number attached, which is the whole point of doing the arithmetic. Break-even is at a *100%* regenerate rate — `9,000 × (1 + r) = 18,000` solves at `r = 1.0` — so at any realistic rate reactive wins on cost; pre-generation wins only if latency on that path is a strategic priority.
 
 **⚠ Trap:** implementing regenerate as "same request, new seed" on a surface where a prefix cache is in play and then being surprised that the outputs are *sometimes* identical anyway. If the engine's RNG is derived from batch position rather than a per-request seed, and the request lands identically, you can get the same trajectory. Verify empirically — generate 20 regenerates on a fixed prompt and count distinct outputs — rather than trusting that a new seed was honored.
 
@@ -5522,7 +5529,7 @@ Because matching brackets requires counting, and finite-state machines cannot co
 
 The consequence in practice is a clean dividing line. **Non-recursive schema with fixed nesting depth → regular → DFA works, index precompiles, per-token cost is a lookup.** **Recursive schema (a `$ref` cycle) or a general grammar like "any valid JSON" → context-free → you need a pushdown automaton with an explicit stack.** The stack version cannot be fully precomputed, because the set of legal next tokens depends on the stack contents, not just a state id.
 
-This is precisely why the modern engines converged on a hybrid. XGrammar keeps a byte-level pushdown automaton with a *persistent execution stack* — a stack you can push, pop, and cheaply fork or roll back, because speculative decoding and backtracking require replaying — and then it splits the vocabulary in two. **Context-independent tokens** are those whose legality depends only on the automaton's current node, not the stack contents; their masks are precomputed once and cached. **Context-dependent tokens** — the ones that could close a bracket or terminate a string, whose legality genuinely depends on stack depth — are the small minority checked at runtime. The reported split is that the overwhelming majority of the vocabulary is context-independent, which is why the runtime check is over a few hundred tokens rather than 128k.
+This is precisely why the modern engines converged on a hybrid. XGrammar keeps a byte-level pushdown automaton with a *persistent execution stack* — a stack you can push, pop, and cheaply fork or roll back, because speculative decoding and backtracking require replaying — and then it splits the vocabulary in two. **Context-independent tokens** are those whose legality depends only on the automaton's current node, not the stack contents; their masks are precomputed once and cached. **Context-dependent tokens** — the ones that could close a bracket or terminate a string, whose legality genuinely depends on stack depth — are the small minority checked at runtime. The reported split is that the overwhelming majority of the vocabulary is context-independent — the paper reports well over 99% for typical grammars — which is why the runtime check is over a small fraction of the vocabulary (order of hundreds to ~1k tokens on a 128k vocab) rather than all 128k.
 
 **📄 Paper:** Dong et al. (2024), *XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models* — the adaptive token-mask cache plus persistent stack that made general context-free grammars, including recursion, cheap enough to leave on by default. It replaced the "compile the whole schema to one giant DFA" approach for anything recursive.
 
@@ -5662,6 +5669,8 @@ This is the question, and it should be memorized as a table because it is the fr
 
 **Rung 5 — a real grammar/FSM you own.** Compile cost measured in seconds, then hard 100% compliance with zero per-request retry. This is the rung for output languages that are not JSON — SQL, a DSL, a diff format, a chess move — and for latency-critical paths where a retry is unaffordable.
 
+**📅 Volatile:** the failure rates and added-latency figures on rungs 1–3 are order-of-magnitude anchors, not constants. They depend on model generation, schema complexity, prompt quality and provider implementation, and frontier models have been steadily pushing rung-1 failure rates down. Quote them as "on the order of," and cite your own measured numbers if you have them.
+
 **💰 Math:** take 2M calls/month, 800 input tokens, 300 output tokens, $3/Mtok in and $15/Mtok out. Base cost per call: `800 × 3/1e6 = $0.0024` plus `300 × 15/1e6 = $0.0045`, total `$0.0069`; monthly `$13,800`. A retry that resends prompt + bad output + error (≈1,200 in, 300 out) costs `1200 × 3/1e6 + 300 × 15/1e6 = $0.0036 + $0.0045 = $0.0081`. At rung 1's 8% failure rate: `13,800 + 0.08 × 2e6 × 0.0081 = 13,800 + 1,296 = $15,096/month`. At rung 3's 0.1%: `13,800 + 0.001 × 2e6 × 0.0081 = $13,816`. So schema constraints save about **$1,280/month** here — genuinely not the headline. The headline is latency: at an 8% failure rate, roughly one in twelve requests takes double the time, which puts your p95 at the two-call latency. Structured outputs are a *tail-latency* intervention that happens to also save money.
 
 **🗣 Say this in the room:** "The ladder is prompt-only at 5–10% failure and zero cost, JSON mode at 2–5% and about 50 ms, schema-constrained at under 0.1% and about 100 ms, retry-with-feedback at roughly zero and 200–500 ms on the failing tail only, and an owned grammar at 100% after a seconds-long compile. I default to rung 3 plus rung 4 — constrain the shape, validate the semantics — because rung 3 can't express business rules and rung 4 alone leaves an ugly p95."
@@ -5670,11 +5679,11 @@ This is the question, and it should be memorized as a table because it is the fr
 
 They differ in what is being constrained, and confusing them produces a specific, embarrassing class of production bug. JSON mode constrains the *syntax*: the output will parse as JSON. Structured outputs constrain the *language defined by your schema*: the output will parse as JSON **and** validate against the schema you supplied.
 
-Under the hood JSON mode is a fixed grammar — one compiled automaton for "any valid JSON value" — shared across all requests, hence no per-schema compile and negligible added latency. Structured outputs compile *your* schema, which is why there is a first-call cost and a schema cache.
+Under the hood JSON mode is a fixed grammar — one compiled automaton for "any valid JSON value" — shared across all requests, hence **no per-schema compile cost at all**; the only overhead is the per-token masking itself plus whatever extra structural tokens the JSON envelope adds, which is where the ~50 ms in the ladder above comes from. Structured outputs compile *your* schema, which is why there is a first-call cost and a schema cache on top of that.
 
 The bug this distinction causes: you enable JSON mode, you write a beautiful Pydantic model, you call `Model.model_validate_json(response)`, and it works in testing because the model is strong and the schema is simple. Then a tenant sends a document with an ambiguous field and the model returns `{"invoice_total": {"amount": 1200, "currency": "USD"}}` where your schema said `invoice_total: float`. Valid JSON. Invalid against your model. Your service throws a 500 at 3 a.m. on 0.4% of traffic. With JSON mode you *must* still validate; with structured outputs, validation becomes an assertion rather than a control-flow branch — but you still write it, because truncation and refusal can still produce a non-conforming body.
 
-There is a second, sharper trap. In JSON mode, most providers require the word "JSON" to appear somewhere in the prompt and will error otherwise — a guard against the degenerate case where the model, constrained to emit JSON but not told to, emits `{}` or an infinite whitespace run. That requirement is not cosmetic. It reflects the deeper truth from the first question in this section: constraints do not tell the model what you want, they only forbid what you don't. You still have to *ask*.
+There is a second, sharper trap. In JSON mode, some providers require the word "JSON" to appear somewhere in the prompt and will error otherwise — OpenAI's `json_object` mode is the canonical example. (**📅 Volatile:** which providers impose this, and whether it carries over into their newer schema-based structured-output APIs, changes; check the current docs rather than assuming it is universal.) The requirement is a guard against the degenerate case where the model, constrained to emit JSON but not told to, emits `{}` or an infinite whitespace run. That requirement is not cosmetic. It reflects the deeper truth from the first question in this section: constraints do not tell the model what you want, they only forbid what you don't. You still have to *ask*.
 
 **⚠ Trap:** shipping JSON mode and believing you have schema guarantees. The tell in a code review is a `try/except json.JSONDecodeError` with no `ValidationError` handler — that engineer thinks the risk is malformation. The risk is shape.
 
@@ -5689,6 +5698,8 @@ The recurring casualties across providers and open-source engines are: **string 
 The detection method is the actual answer, and it's the part that impresses. Build a **schema conformance probe harness**: for each keyword you care about, construct a minimal schema plus a prompt engineered to make the model *want* to violate it, run N=200 samples, and measure the violation rate.
 
 ```python
+import re
+
 PROBES = [
     ("maxLength",  {"type":"object","additionalProperties":False,
                     "required":["s"],
@@ -5791,6 +5802,8 @@ The first is **support**: some strict schema modes and some open-source grammar 
 My handling, in order. **Canonicalize first:** serialize with sorted keys, strip `title` fields (Pydantic adds them automatically and they are pure token cost — the model doesn't need `"title": "Vendor"` next to `"vendor"`), and hash that for the grammar cache. **Inline only when required:** write a small resolver that walks the schema, replaces each `$ref` with a deep copy of its `$defs` target, and drops `$defs` — but guard it, because a recursive model will make that walk diverge. Detect a `$ref` cycle before inlining and refuse rather than blowing the stack.
 
 ```python
+import copy
+
 def inline_defs(schema: dict) -> dict:
     defs = schema.get("$defs", {})
     seen = set()
@@ -5852,6 +5865,8 @@ It means you stop treating validation as a binary gate and start treating it as 
 
 ```python
 from pydantic import BaseModel, field_validator
+from datetime import date
+from typing import Literal
 import re
 
 class Extraction(BaseModel):
@@ -5918,7 +5933,7 @@ Now the stopping rule, which is the senior half of the answer. **Retry at most t
 - attempt-2 retries: `0.2 × 80,000 = 16,000 × $0.0093` (payload grows again) `= $149`
 - total overhead `$797/month` on a `$13,800` base — **5.8%**.
 
-That is affordable. What is not affordable is the latency: those 80,000 requests take roughly 2× the p50, and 16,000 take 3×. If p50 is 900 ms, 4% at ~1.8 s and 0.8% at ~2.7 s puts your p99 above 2.5 s. **Retries are a cost non-event and a tail-latency event.** State it that way and you will sound like someone who has run this.
+That is affordable. What is not affordable is the latency: those 80,000 requests take roughly 2× the p50, and 16,000 take 3×. If p50 is 900 ms, that is 3.2% of traffic landing at ~1.8 s and 0.8% at ~2.7 s — so 99.2% of requests come in at or under 1.8 s, which puts your **p99 at ~1.8 s (double the p50) and your p99.5 at ~2.7 s**. Do the percentile arithmetic rather than eyeballing it; a 4% retry rate moves p99 but not p99.9-style outliers, and quoting the wrong percentile in the room is an easy way to lose the point. **Retries are a cost non-event and a tail-latency event.** State it that way and you will sound like someone who has run this.
 
 **⚠ Trap:** `max_retries` with no jitter or budget in a batch job. A pathological input — a scanned page that OCRs to noise — fails every attempt, and if your worker retries three times on 5% of a 400k-document backfill you have added 60,000 extra LLM calls. Put a per-job retry budget on top of the per-request retry count and alert when it saturates; this is the same discipline you already apply to Celery task retries, applied to a much more expensive unit of work.
 
@@ -6220,7 +6235,7 @@ The subtle part is **rollback**. When the target rejects proposal `j`, the gramm
 
 **Batched throughput.** The mask must be computed per *sequence*, because each request is at a different automaton state, and it must be applied to a `[B, V]` logit tensor. The cost model: mask computation is CPU work that scales linearly in batch size, mask application is a GPU kernel that is trivially cheap. So constrained decoding converts some of your batch into CPU-bound work, and at large batch sizes the CPU can become the bottleneck.
 
-**💰 Math:** at 40 µs/token/sequence and batch 128, mask computation is `128 × 40 µs = 5.12 ms` per decode step of CPU time. If your decode step is 20 ms of GPU time, and the mask work is overlapped with the forward pass on another thread, you absorb it — 5.12 ms fits inside 20 ms. If the mask work is *not* overlapped (a naive Python logits processor, or a GIL-bound implementation), you have added 5.12 ms to a 20 ms step: a **25% throughput loss** at batch 128. And if the per-token cost is 2 ms instead of 40 µs — which is exactly what a pure-Python processor costs — then `128 × 2 ms = 256 ms` of CPU per step against a 20 ms GPU step, and your GPU is idle 92% of the time. **This is the entire reason the engines rewrote these in Rust and C++ and why the microsecond figure is quoted so loudly.**
+**💰 Math:** at 40 µs/token/sequence and batch 128, mask computation is `128 × 40 µs = 5.12 ms` per decode step of CPU time. If your decode step is 20 ms of GPU time, and the mask work is overlapped with the forward pass on another thread, you absorb it — 5.12 ms fits inside 20 ms. If the mask work is *not* overlapped (a naive Python logits processor, or a GIL-bound implementation), you have added 5.12 ms to a 20 ms step — a **25% longer decode step, which is about a 20% throughput loss** (`1 − 20/25.12`) at batch 128. And if the per-token cost is 2 ms instead of 40 µs — which is exactly what a pure-Python processor costs — then `128 × 2 ms = 256 ms` of CPU per step against a 20 ms GPU step, and your GPU is idle 92% of the time. **This is the entire reason the engines rewrote these in Rust and C++ and why the microsecond figure is quoted so loudly.**
 
 **⚠ Trap:** benchmarking constrained decoding at batch 1 and concluding the overhead is negligible. At batch 1 the mask is 40 µs against a 20 ms step — 0.2%, genuinely nothing. The cost is superlinear in operational impact because it competes for the CPU that also runs your scheduler, detokenizer and API server. Benchmark at your production batch size or the number is meaningless.
 
@@ -6251,7 +6266,7 @@ Take the concrete case: contracts and invoices, tenants define their own extract
 
 **💰 The cost model, which is what makes this an answer rather than a diagram.** 5M docs/month, average 6k input tokens, 250 output tokens. At $3/Mtok in and $15/Mtok out: `5e6 × (6000 × 3/1e6 + 250 × 15/1e6) = 5e6 × ($0.018 + $0.00375) = 5e6 × $0.02175 = $108,750/month`. Prefix caching does not help much here because every document is different — the only cached region is the system prompt and schema, maybe 600 tokens, saving `5e6 × 600 × 2.7/1e6 = $8,100/month`. Repairs at 4% with two-thirds resolving on attempt one add roughly `0.04 × 5e6 × $0.021 ≈ $4,200/month`. Net around **$105,000/month**, and the single biggest lever is not the constraint layer at all — it is routing the 70% of easy, short, single-page documents to a cheaper model. If a model at $0.60/$2.40 per Mtok handles 70% at equal accuracy, that tier costs `3.5e6 × (6000 × 0.6/1e6 + 250 × 2.4/1e6) = 3.5e6 × $0.0042 = $14,700` and total drops to roughly `$14,700 + 0.3 × $108,750 = $47,325/month` — a **56% reduction**. Say that in the room. Constrained decoding is the reliability story; routing is the cost story; conflating them is a junior answer.
 
-**⚠ Trap:** designing the human-review queue as an afterthought and sizing it wrong. At 5M docs and a 0.5% escalation rate, that is 25,000 documents/month to review — about 12 full-time reviewers at 2 minutes each. The escalation threshold is therefore a *staffing* decision, and it should be tunable per tenant and per field rather than a global constant.
+**⚠ Trap:** designing the human-review queue as an afterthought and sizing it wrong. At 5M docs and a 0.5% escalation rate, that is 25,000 documents/month to review — at 2 minutes each that is 50,000 minutes, or ~833 hours, or about **5 full-time reviewers** at ~168 productive hours a month (and closer to 8–10 once you allow for context-switching and the fact that escalated documents are the hard ones). The escalation threshold is therefore a *staffing* decision, and it should be tunable per tenant and per field rather than a global constant.
 
 ### Design the structured-output layer for an agent with sixty tools.
 
@@ -6317,6 +6332,8 @@ Read the logits. For a classification task with a small label set, constrained d
 The construction: pick labels whose first token is unique and single-token if possible — `A`/`B`/`C`, or ` positive`/` negative`/` neutral` verified against the tokenizer. Then either bias every other token to `-100` with `logit_bias`, or simply take `top_logprobs` and renormalize over your label set.
 
 ```python
+import math
+
 LABELS = {" positive": None, " negative": None, " neutral": None}   # verify each is 1 token
 ids = {tokenizer.encode(k)[0]: k for k in LABELS}
 
@@ -6581,7 +6598,9 @@ def steering_vector(model, tok, pos_prompts, neg_prompts, layer, pos_idx=-1):
         for p in prompts:
             out = model(**tok(p, return_tensors="pt").to(model.device),
                         output_hidden_states=True)
-            acc = acc + out.hidden_states[layer][0, pos_idx]
+            # hidden_states[0] = embeddings, so hidden_states[l+1] = output of block l,
+            # which is exactly what the forward hook on layers[l] below intercepts.
+            acc = acc + out.hidden_states[layer + 1][0, pos_idx]
         return acc / len(prompts)
     return mean_act(pos_prompts) - mean_act(neg_prompts)   # [d_model]
 
@@ -6650,6 +6669,7 @@ Two findings from that paper matter more than the circuit itself. **Negative nam
 **⚠ Trap:** citing IOI as evidence that we can explain model behavior in general. It is one narrow syntactic behavior in a 124M-parameter model, it took a team months, and later work showed the circuit is not as clean or as complete as the original presentation suggested — the "circuit" explains most but not all of the behavior, and components outside it contribute. Present it as a proof of concept for the *methodology*, not as a template for explaining GPT-4.
 
 **🗣 Say this in the room:** "IOI is the field's canonical worked example — duplicate detection feeding inhibition heads that gate name-mover heads that copy the non-duplicated name. The durable lessons for me are the methodology (path patching plus ablation validation) and the discovery of backup heads, which means I treat any single-component ablation result as a lower bound on importance."
+
 ### What is an attribution graph, and what does it give you that patching doesn't?
 
 An attribution graph is the attempt to produce, for a single prompt, a **directed computation graph over interpretable features** rather than over raw components — nodes are "the feature for capital cities," "the feature for Texas," "the say-Austin output feature," and edges are weighted causal contributions. Patching answers "does this component matter?" one component at a time; an attribution graph tries to answer "what was the whole program, end to end?"
@@ -6690,7 +6710,7 @@ Now the confounds, and I would list them unprompted because listing them is the 
 
 **The probe is a shallow readout, and shallow readouts get gamed.** If you close the loop and train against the probe, you optimize the model to fool it.
 
-**💰 Math:** the probe itself is nearly free — a `4096`-dim dot product per token, ~8k FLOPs against roughly `2 × 8e9 = 16 GFLOP/token` for an 8B forward pass, i.e. `8e3 / 1.6e10 = 0.00005%` overhead. Compare with a second-model LLM judge on every response: at a 700-token response and 300-token judge prompt, `1000 tokens × $0.30/Mtok ≈ $0.0003` per check, which at 2M responses/day is `2e6 × 0.0003 = $600/day ≈ $18k/month`. That cost gap is why probes keep getting proposed for guardrails despite their weakness — so the honest framing is that a probe is a cheap *triage* signal that routes 3% of traffic to the expensive judge, not a replacement for it.
+**💰 Math:** the probe itself is nearly free — a `4096`-dim dot product per token, ~8k FLOPs against roughly `2 × 8e9 = 16 GFLOP/token` for an 8B forward pass, i.e. `8e3 / 1.6e10 = 0.00005%` overhead. Compare with a second-model LLM judge on every response: at a 700-token response and 300-token judge prompt, `1000 tokens × $0.30/Mtok ≈ $0.0003` per check, which at 2M responses/day is `2e6 × 0.0003 = $600/day ≈ $18k/month`. (**📅 Volatile:** the `$0.30/Mtok` judge rate is an illustrative cheap-tier price — check current provider pricing before quoting a figure; the two-orders-of-magnitude *gap* is the durable point, not the dollar amount.) That cost gap is why probes keep getting proposed for guardrails despite their weakness — so the honest framing is that a probe is a cheap *triage* signal that routes 3% of traffic to the expensive judge, not a replacement for it.
 
 **⚠ Trap:** deploying a probe trained on last quarter's checkpoint against this quarter's fine-tune. Probe directions are checkpoint-specific; a LoRA merge can rotate the relevant subspace enough to silently halve AUROC while the probe keeps returning confident scores. Probes need the same retrain-and-revalidate discipline as any other model artifact, pinned to a checkpoint hash.
 
@@ -6768,7 +6788,7 @@ I would ship it only on open weights I serve myself, only after a capability-reg
 
 **The prefix-cache interaction, which is the real engineering catch.** If you apply the steering vector at *all* positions including the prompt, then the residual stream at every prompt position changes, which changes the K and V tensors written to the KV cache. Two requests with the same system prompt but different steering coefficients therefore have **different KV entries and cannot share a cache prefix**. Your prefix-cache key must include the steering configuration, and your hit rate fragments across the number of distinct coefficients in flight. With a continuous slider you have effectively destroyed prefix caching.
 
-**💰 Math:** suppose a 6,000-token shared system prompt, 200k requests/day, and prefix caching that currently gives you a 90% hit rate. Prefill of 6,000 tokens on an 8B model costs about `2 × 8e9 × 6000 = 9.6e13 FLOP`; at a realistic 300 TFLOP/s effective that is `9.6e13 / 3e14 ≈ 0.32 s` of GPU time per uncached prefill. At 90% hit rate you pay it 20,000 times/day = `6,400 s ≈ 1.8` GPU-hours; at 0% hit rate you pay it 200,000 times = `64,000 s ≈ 17.8` GPU-hours. On an H100 at roughly `$3/hr` that is the difference between `$5.3/day` and `$53/day` — call it `$1.6k/year` versus `$19k/year` on that one prompt, before counting the TTFT regression your users see. The fix is architectural, not financial: **quantize the coefficient to 3–5 discrete levels** so the cache fragments 5 ways instead of infinitely, or **apply steering only at generated positions**, which leaves prompt KV untouched and preserves the cache entirely. I would default to the second.
+**💰 Math:** suppose a 6,000-token shared system prompt, 200k requests/day, and prefix caching that currently gives you a 90% hit rate. Prefill of 6,000 tokens on an 8B model costs about `2 × 8e9 × 6000 = 9.6e13 FLOP`; at a realistic 300 TFLOP/s effective that is `9.6e13 / 3e14 ≈ 0.32 s` of GPU time per uncached prefill. At 90% hit rate you pay it 20,000 times/day = `6,400 s ≈ 1.8` GPU-hours; at 0% hit rate you pay it 200,000 times = `64,000 s ≈ 17.8` GPU-hours. On an H100 at roughly `$3/hr` (**📅 Volatile** — GPU rental rates move; recompute with your own) that is the difference between `$5.3/day` and `$53/day` — call it `$1.9k/year` versus `$19k/year` on that one prompt, before counting the TTFT regression your users see. The fix is architectural, not financial: **quantize the coefficient to 3–5 discrete levels** so the cache fragments 5 ways instead of infinitely, or **apply steering only at generated positions**, which leaves prompt KV untouched and preserves the cache entirely. I would default to the second.
 
 **The gate before shipping.** A capability suite at the exact deployed coefficient — instruction-following, one task-specific accuracy eval, and neutral-corpus perplexity — plus a check for non-monotonicity by sweeping the coefficient and plotting both the target behavior and the capability metric. You are looking for the widest coefficient band where behavior moves and capability does not, and you deploy in the middle of that band, not at its edge.
 
@@ -6818,13 +6838,13 @@ Let me do the arithmetic, because the answer is "cheaper than people fear if you
 
 **Parameter and memory cost.** For Llama-3-8B, `d_model = 4096`. A 16× expansion dictionary is `d_sae = 65,536`. Encoder plus decoder is `2 × 4096 × 65,536 ≈ 5.37e8` parameters — 537M, which at bf16 is `5.37e8 × 2 = 1.07 GB` **per hooked site**. If you naively hook all 32 layers you are carrying `32 × 1.07 = 34.4 GB` of dictionaries alongside a 16 GB model. That is a bigger memory footprint than the model, on a card whose HBM you are already fighting for KV cache. This alone kills "SAEs everywhere."
 
-**Compute cost.** Encoder plus decoder is `2 × 2 × 4096 × 65,536 ≈ 2.15 GFLOP` per token per site. The base model is `2 × 8e9 = 16 GFLOP` per token. So one hooked site adds `2.15 / 16 ≈ 13.4%` compute. Hooking four sites is +54%; hooking all 32 is +430% — you would be spending four times more compute on the microscope than on the model.
+**Compute cost.** A forward pass through the dictionary is ~`2 ×` its parameter count: `2 × 5.37e8 ≈ 1.07 GFLOP` per token per site (encoder plus decoder). The base model is `2 × 8e9 = 16 GFLOP` per token. So one hooked site adds `1.07 / 16 ≈ 6.7%` compute. Hooking four sites is +27%; hooking all 32 is +215% — you would be spending more than twice as much compute on the microscope as on the model. (With a TopK decoder you can exploit sparsity and pay much less than the dense decoder figure, but treat the dense number as your budget until you have measured the sparse kernel.)
 
-**💰 The design that actually works:** hook **one** site (a mid-depth residual layer, where behavioral features are richest), and run it on a **sampled** fraction of traffic, offline. At 1% sampling, the marginal cost is `0.01 × 13.4% ≈ 0.134%` of serving compute — genuinely free. Concretely, at 2M requests/day averaging 800 total tokens, 1% sampling is `20,000 × 800 = 1.6e7` tokens/day through one SAE, `1.6e7 × 2.15e9 = 3.4e16` FLOP; at a conservative 200 TFLOP/s effective that is `3.4e16 / 2e14 = 172 s` — under three minutes of GPU time per day, well under `$1/day` at H100 rates. And because it is offline and sampled, you can run it on a spot instance from stored activations rather than in the request path at all.
+**💰 The design that actually works:** hook **one** site (a mid-depth residual layer, where behavioral features are richest), and run it on a **sampled** fraction of traffic, offline. At 1% sampling, the marginal cost is `0.01 × 6.7% ≈ 0.067%` of serving compute — genuinely free. Concretely, at 2M requests/day averaging 800 total tokens, 1% sampling is `20,000 × 800 = 1.6e7` tokens/day through one SAE, `1.6e7 × 1.07e9 ≈ 1.7e16` FLOP; at a conservative 200 TFLOP/s effective that is `1.7e16 / 2e14 ≈ 86 s` — under two minutes of GPU time per day, well under `$1/day` at H100 rates. And because it is offline and sampled, you can run it on a spot instance from stored activations rather than in the request path at all.
 
 **What you get for that.** A daily distribution over feature-activation frequencies. The monitoring value is *drift*: feature 41,203 fired on 0.3% of tokens for six weeks and today fires on 4%. That is a change-detection signal on your input distribution or your prompt template that no output-level metric will catch, and it is interpretable enough to act on — often it turns out a new tenant onboarded with a different document format.
 
-**⚠ Trap:** putting the SAE in the request path to gate responses. Beyond the 13.4% latency tax, you have now made a research artifact a hard dependency of your availability, and SAE features are checkpoint-specific — the next model update invalidates every threshold you tuned. Feature monitoring belongs in the analytics plane, asynchronous, with alerting thresholds you expect to re-baseline on every model version.
+**⚠ Trap:** putting the SAE in the request path to gate responses. Beyond the ~7% latency tax, you have now made a research artifact a hard dependency of your availability, and SAE features are checkpoint-specific — the next model update invalidates every threshold you tuned. Feature monitoring belongs in the analytics plane, asynchronous, with alerting thresholds you expect to re-baseline on every model version.
 
 **📅 Volatile:** dictionary widths, sparsity conventions and the availability of pretrained open SAE suites (e.g. the Gemma Scope release of SAEs across layers and sites of Gemma 2 models) move quickly. Verify what pretrained dictionaries exist for your model family before assuming you must train your own — training is the expensive part.
 

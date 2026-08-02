@@ -60,6 +60,9 @@ async def generate(req: Request, prompt: str):
             seq += 1
             yield sse("delta", {"text": delta.text}, str(seq))
             now = time.monotonic()
+            # NB: this only fires *between* deltas, so it cannot keep the connection
+            # alive during an upstream stall — for that you need the race-the-next-chunk-
+            # against-a-timeout idiom in the heartbeat question below.
             if now - last_beat > 15:
                 last_beat = now
                 yield b": keep-alive\n\n"                   # SSE comment, ignored by client
@@ -101,7 +104,7 @@ data: {"id":"tc_1","name":"search_docs"}
 
 `data:` is the payload; multiple consecutive `data:` lines are joined with `\n` into one message, which is why you must never emit raw newlines inside a JSON payload without escaping — `json.dumps` handles that. `event:` sets the type the browser dispatches to, so the client does `es.addEventListener("tool_call_start", …)` instead of parsing a discriminator out of the body. `id:` sets the connection's "last event ID", which the browser stores and sends back as a `Last-Event-ID` request header on automatic reconnect. `retry:` sets the reconnect delay in milliseconds — the server-side control over client backoff, which almost nobody uses and which is genuinely useful when you are shedding load. A bare `:` comment line is a heartbeat that traverses proxies and resets idle timers without reaching application code.
 
-The `EventSource` object handles reconnect, `Last-Event-ID`, and dispatch. `fetch()` + `ReadableStream` handles none of it — you get bytes and you write the parser. The parser is about 25 lines and the two bugs everyone ships are: (a) assuming a chunk boundary aligns with a record boundary (it does not; you must buffer until you see `\n\n`), and (b) forgetting that a lone `\r\n` is also a valid line terminator per spec.
+The `EventSource` object handles reconnect, `Last-Event-ID`, and dispatch. `fetch()` + `ReadableStream` handles none of it — you get bytes and you write the parser. The parser is about 25 lines and the two bugs everyone ships are: (a) assuming a chunk boundary aligns with a record boundary (it does not; you must buffer until you see `\n\n`), and (b) forgetting that the spec accepts three line terminators — `\n`, `\r\n`, and a lone `\r` — so a parser that splits only on `\n` mis-parses a CR-terminated stream.
 
 **🗣 Say this in the room:** "SSE gives me four fields. `event` types my stream so the client dispatches instead of sniffing, `id` makes it resumable via `Last-Event-ID`, `retry` lets the server control client backoff during a brownout, and `:` comments are heartbeats that keep proxies from reaping an idle connection. The framing bug I always check for is a parser that assumes a TCP chunk equals an SSE record."
 
@@ -167,7 +170,7 @@ def parse_partial(buf: str) -> dict | None:
 
 In production I'd reach for a maintained implementation rather than this — Pydantic v2 exposes partial parsing on `pydantic_core.from_json` via an `allow_partial` flag, and there are dedicated partial-JSON packages. **📅 Volatile:** confirm the exact flag name against the installed version rather than trusting memory.
 
-Now the part that actually gets graded: **when is a field safe to show a user?** My rule has three tiers. A **scalar field is safe once the next structural token proves it terminated** — a string is final when you have seen its closing quote, a number when you have seen a `,` or `}`. Rendering a half-parsed number is how you show a user `$4` for a `$4,200,000` invoice for 300 ms. A **field is safe to *act* on only at `tool_call.end`**, never before; streaming arguments are for showing intent ("Searching for…"), never for dispatching a side effect. And an **array is never safe to render as complete** — show it as an append-only list and mark it in-progress, because the model may add three more elements.
+Now the part that actually gets graded: **when is a field safe to show a user?** My rule has three tiers. A **scalar field is safe once the next structural token proves it terminated** — a string is final when you have seen its closing quote, a number when you have seen a `,`, `}` or `]`. Rendering a half-parsed number is how you show a user `$4` for a `$4,200,000` invoice for 300 ms. A **field is safe to *act* on only at `tool_call.end`**, never before; streaming arguments are for showing intent ("Searching for…"), never for dispatching a side effect. And an **array is never safe to render as complete** — show it as an append-only list and mark it in-progress, because the model may add three more elements.
 
 **⚠ Trap:** treating "the repaired JSON parsed successfully" as "the object is complete." `{"query": "refund pol` repairs to `{"query": "refund pol"}` — perfectly valid, semantically wrong, and if you dispatch a search on it you have burned a tool call and shown the user a wrong result. Validity and completeness are orthogonal. I gate every side effect on the explicit completion event, and I have never seen a system that gated on parse success survive contact with production.
 
@@ -245,7 +248,7 @@ On the httpx side the corresponding configuration is `httpx.Timeout(connect=5.0,
 
 **⚠ Trap:** `httpx.AsyncClient(timeout=300)` on a streaming call. It sets `connect`, `read`, `write` and `pool` all to 300 s, so a connection that half-dies mid-stream hangs for five minutes holding a pool slot, a worker, and possibly a GPU slot upstream. Always construct `httpx.Timeout(...)` explicitly for streaming clients. I grep for bare integer timeouts in review.
 
-**💰 Math:** suppose 0.3% of streams stall and your stall timeout is missing, so they hang until a 300 s total cap. At 200k requests/day that is 600 hung streams × 300 s = 50 connection-hours/day pinned. With 200 concurrency slots per pod, that is ~2% of your fleet capacity burned on corpses, plus 600 users/day watching a spinner. Adding a 15 s stall clock converts that to 600 fast, retryable errors — 2.5 connection-hours.
+**💰 Math:** suppose 0.3% of streams stall and your stall timeout is missing, so they hang until a 300 s total cap. At 200k requests/day that is 600 hung streams × 300 s = 50 connection-hours/day pinned. Averaged over the day that is 50/24 ≈ 2 slots permanently occupied by corpses — ~1% of a single 200-slot pod, and far worse than that during the provider incident that caused the stalls, since stalls arrive in bursts. Plus 600 users/day watching a spinner. Adding a 15 s stall clock converts that to 600 fast, retryable errors — 2.5 connection-hours.
 
 ### Why can't you just return a 500 when generation fails halfway through, and what do you return instead?
 
@@ -259,15 +262,15 @@ There is one exception worth stating because it wins points: **delay your first 
 
 ### How do heartbeats work in practice, and how do you choose the interval?
 
-A heartbeat is a byte on the wire whose only job is to reset somebody else's idle timer. In SSE it costs 15 bytes: `: keep-alive\n\n` — a comment line, which conforming clients discard before dispatch, so it never reaches application code and never needs to be filtered.
+A heartbeat is a byte on the wire whose only job is to reset somebody else's idle timer. In SSE it costs 14 bytes: `: keep-alive\n\n` — a comment line, which conforming clients discard before dispatch, so it never reaches application code and never needs to be filtered.
 
-Choose the interval by finding **the minimum idle timeout on the path and halving it**. Enumerate honestly: AWS ALB defaults to 60 s idle; many nginx `proxy_read_timeout` defaults are 60 s; CDN edges commonly sit at 100 s; corporate proxies are the wild card and are sometimes 30 s. If the minimum you can prove is 60 s, a 20–25 s heartbeat gives you two chances to miss one without dying. I use 15 s because the bandwidth cost is irrelevant: 15 bytes every 15 s on 10,000 concurrent streams is 10,000 × 15 / 15 = 10 KB/s. That is not a number worth optimizing.
+Choose the interval by finding **the minimum idle timeout on the path and halving it**. Enumerate honestly: AWS ALB defaults to 60 s idle; many nginx `proxy_read_timeout` defaults are 60 s; CDN edges commonly sit at 100 s; corporate proxies are the wild card and are sometimes 30 s. If the minimum you can prove is 60 s, a 20–25 s heartbeat gives you two chances to miss one without dying. I use 15 s because the bandwidth cost is irrelevant: 14 bytes every 15 s on 10,000 concurrent streams is 10,000 × 14 / 15 ≈ 9.3 KB/s. That is not a number worth optimizing.
 
 Two subtleties. First, **heartbeats must come from the same code path that would emit tokens**, not from a separate task writing to the same response — two writers on one ASGI `send` interleave badly. The idiom is a `select`-style race: wait on the next provider chunk with a timeout equal to the heartbeat interval, and emit a comment when the wait times out. Second, if you are behind a proxy that *buffers*, heartbeats will be buffered too and give you exactly nothing. Heartbeats solve idle-timeout reaping; `X-Accel-Buffering: no` solves buffering; you need both and they are not substitutes.
 
 For WebSockets the equivalent is the protocol-level ping/pong frame, which your library usually sends for you (`websockets` and Starlette both have knobs) — but confirm it is enabled, because the WS default in some stacks is no automatic ping, and then you rebuild SSE's heartbeat by hand and call it "lower latency."
 
-**📐 Numbers you must know:** ALB idle timeout default 60 s (configurable 1–4000 s); nginx `proxy_read_timeout` default 60 s; heartbeat at ≤ half the tightest of these. Derivation for the bandwidth claim: 15 bytes / 15 s = 1 B/s per stream, × 10,000 streams = 10 KB/s ≈ 0.08 Mbit/s. Negligible against a single token stream at ~4 B × 40/s = 160 B/s per connection.
+**📐 Numbers you must know:** ALB idle timeout default 60 s (configurable 1–4000 s); nginx `proxy_read_timeout` default 60 s; heartbeat at ≤ half the tightest of these. Derivation for the bandwidth claim: 14 bytes / 15 s ≈ 0.93 B/s per stream, × 10,000 streams ≈ 9.3 KB/s ≈ 0.075 Mbit/s. Negligible against a single token stream at ~4 B × 40/s = 160 B/s per connection.
 
 ### How do you test a streaming endpoint so these bugs get caught before production?
 
@@ -349,7 +352,7 @@ The mechanism to name: the engine exposes an abort path (vLLM's async engine has
 The mental model: your gateway is **a connection-pool multiplexer with a very unusual traffic shape** — few destinations, long-lived responses, tiny request bodies, enormous idle-between-chunk time. Default HTTP client settings are tuned for short RPCs and are wrong on almost every axis.
 
 ```python
-limits = httpx.Limits(  # built once, in the lifespan; never per-requestmax_connections=500,
+limits = httpx.Limits(max_connections=500,        # built once, in the lifespan; never per-request
                       max_keepalive_connections=200,
                       keepalive_expiry=30.0)
 timeout = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=2.0)
@@ -778,7 +781,7 @@ I would work this backwards from the evidence, and the walkthrough is the answer
 
 **Step 3 — the overwhelmingly likely root cause, in a "worker restart" story.** The job's visibility/lease timeout was shorter than the job's runtime. Worker A picks up the message, the broker's visibility timeout expires while A is still running (Celery Redis transport default is one hour, SQS default is 30 seconds — **verify yours**, and the SQS default is the classic killer), the broker redelivers to worker B, both execute the refund tool. The "restart" is a red herring; the restart just made you notice. The tell in the logs: two workers logging the same `run_id` with overlapping timestamps.
 
-**Step 4 — why the idempotency key did not save you.** Three possibilities, in order of frequency. *(a) There isn't one at the downstream* — your `tool_exec` table deduped nothing because worker B's `INSERT ... ON CONFLICT` happened *before* worker A committed its `done` state, and you used a read-then-write rather than an atomic insert. *(b) The key included a timestamp or a fresh UUID*, so it differed between the two executions — this is the most common actual bug, and it is why the key must be `run_id:step:tool_call_id` and nothing else. *(c) The key is enforced in your DB but not passed to the payment provider*, so your table says one execution and the provider saw two calls with different keys.
+**Step 4 — why the idempotency key did not save you.** Three possibilities, in order of frequency. *(a) Your own dedupe was not atomic* — your `tool_exec` table deduped nothing because worker B's check happened *before* worker A committed its `done` state, and you used a read-then-write rather than an atomic `INSERT ... ON CONFLICT`. *(b) The key included a timestamp or a fresh UUID*, so it differed between the two executions — this is the most common actual bug, and it is why the key must be `run_id:step:tool_call_id` and nothing else. *(c) The key is enforced in your DB but not passed to the payment provider*, so your table says one execution and the provider saw two calls with different keys.
 
 **📐 Numbers you must know:** the four visibility/lease defaults that cause this bug — SQS visibility timeout 30 s (max 12 h), Celery Redis-transport `visibility_timeout` 3600 s, Kafka `max.poll.interval.ms` 300 s, and your own lease TTL. **📅 Volatile:** verify each against your pinned versions. The rule that follows from them: `lease_or_visibility_timeout > p99_job_duration`, or add a heartbeat that renews at `timeout / 3`. A 20-minute p99 against a 300-second poll interval means every long run is duplicated, deterministically.
 
@@ -840,7 +843,7 @@ The framing that wins: **this is a batch data pipeline that happens to call a mo
 
 **Use the batch tier.** Providers offer an asynchronous batch endpoint at roughly a 50% discount with a 24-hour completion window. **📅 Volatile:** confirm current discount and SLA. For an overnight job this is free money: the same work at half price, and the only cost is that you must handle the async submission/polling lifecycle and have no per-request latency control. If the deadline is overnight, the batch tier is the correct answer and saying so is a strong signal.
 
-**💰 Math — cost control.** Estimate before you start and gate on it: 50,000 docs × 12 chunks × 1,500 input tokens = 900M input tokens; × 300 output tokens × 50,000 × 12 = 180M output tokens. At $0.25/Mtok input and $1.25/Mtok output for a small model, that is 900 × $0.25 + 180 × $1.25 = $225 + $225 = **$450 per full run**. At frontier pricing ($3/$15) the same job is 900 × 3 + 180 × 15 = $2,700 + $2,700 = **$5,400**. That 12× gap is the entire architecture decision, and the right move is a **cascade**: run everything through the small model, run a cheap confidence check (self-consistency on a sample, a schema-validity check, a rubric classifier), and escalate only the uncertain 10–15% to the frontier model. 0.85 × $450 + 0.15 × $5,400 = $383 + $810 = **$1,193**, a 78% saving against all-frontier with most of the quality.
+**💰 Math — cost control.** Estimate before you start and gate on it: 50,000 docs × 12 chunks × 1,500 input tokens = 900M input tokens; × 300 output tokens × 50,000 × 12 = 180M output tokens. At $0.25/Mtok input and $1.25/Mtok output for a small model, that is 900 × $0.25 + 180 × $1.25 = $225 + $225 = **$450 per full run**. At frontier pricing ($3/$15 per Mtok — **📅 Volatile:** check current list prices) the same job is 900 × 3 + 180 × 15 = $2,700 + $2,700 = **$5,400**. That 12× gap is the entire architecture decision, and the right move is a **cascade**: run everything through the small model, run a cheap confidence check (self-consistency on a sample, a schema-validity check, a rubric classifier), and escalate only the uncertain 10–15% to the frontier model. Note the cascade pays the small-model pass on *everything* and then adds the escalated slice: $450 + 0.15 × $5,400 = $450 + $810 = **$1,260**, a 77% saving against all-frontier with most of the quality.
 
 **Reliability.** Poison-document isolation by content hash so one malformed PDF cannot consume the fleet; a DLQ with a customer-visible per-document status; step checkpointing so preemption costs one unit, which lets you run the whole thing on spot instances at a 60–70% compute discount; and a reconciliation pass at the end that asserts `count(completed) + count(dlq) == count(submitted)` before declaring success. That assertion has caught more silent data loss for me than any monitoring.
 
@@ -1065,7 +1068,7 @@ The mechanics are easy: an ordered list per route, `[claude-sonnet@vendorA, gpt-
 
 **System-prompt behavior.** The same prompt produces meaningfully different tone, verbosity, refusal rate and instruction adherence. Your prompts are tuned for the primary. A fallback answer is a *different product experience*, and if you have safety-critical instructions, "mostly follows" is not the same as "follows."
 
-**Caching.** Your carefully-ordered prefix that gets a 90% cache discount on the primary gets zero on the fallback, so your per-request cost can jump 5–10× at exactly the moment your traffic is at its most stressed.
+**Caching.** Your carefully-ordered prefix that gets a 90% cache discount on the primary gets zero on the fallback, so the cost of that prefix jumps up to 10× and your total per-request cost typically doubles or more — at exactly the moment your traffic is at its most stressed. (Worked below: $0.0271 cached versus $0.0546 uncached on the same request.)
 
 **Streaming event shapes.** Delta formats, usage reporting position, and stop-reason vocabularies differ; your SSE translation layer must be tested per provider.
 
@@ -1120,7 +1123,7 @@ Given that, the mechanics. A "backend" in the gateway's pool is a tuple of (prov
 
 **Quota-aware weighting** on top: weight each backend by its currently-remaining token quota, harvested from the response headers as described earlier and stored centrally. A backend at 5% remaining should get near-zero traffic before it starts 429ing, not after.
 
-**Latency-aware (EWMA)** as a tiebreak — regions genuinely differ, and cross-region adds real RTT: US-east to EU is roughly 80–100 ms one way, so ~180 ms round trip added to TTFT. If your TTFT budget is 500 ms, spilling to another continent costs 36% of it, which is acceptable during an incident and not acceptable as a steady state.
+**Latency-aware (EWMA)** as a tiebreak — regions genuinely differ, and cross-region adds real RTT: US-east to EU-west is roughly 35–45 ms one way, so ~70–90 ms round trip added to TTFT (US to Asia-Pacific is roughly double that). If your TTFT budget is 500 ms, spilling from the US to Europe costs ~15–18% of it, and spilling to Asia costs closer to 40% — acceptable during an incident, not acceptable as a steady state. **📅 Volatile:** measure your own inter-region RTTs; they differ by cloud and region pair.
 
 Two constraints that override all of the above. **Data residency:** an EU tenant's request must not spill to a US region if you have committed to EU processing, and that has to be a hard constraint in the router, not a weight — I implement it as a filter that runs before scoring, and I make it fail closed. **Prefix-cache affinity:** provider prompt caches are per-region and often per-account. Spraying a tenant's traffic across four backends divides your cache hit rate by four. So the router should be sticky on a cache key (typically a hash of the stable prompt prefix or the tenant) with spillover only under pressure — consistent hashing with bounded loads is the right primitive, exactly as you would for a Redis cluster.
 
@@ -1157,7 +1160,7 @@ Two disqualifiers. **Never hedge a request with side effects** — if the model 
 
 ### Two hundred users click "summarize" on the same document within a second. What does your gateway do?
 
-Single-flight it. This is request coalescing, and it is the same primitive as `golang.org/x/sync/singleflight` or a Redis lock around a cache fill — but it deserves special attention here because the cost of *not* doing it is 200× rather than the 200× of a wasted DB query, which is measured in real dollars.
+Single-flight it. This is request coalescing, and it is the same primitive as `golang.org/x/sync/singleflight` or a Redis lock around a cache fill — but it deserves special attention here because the cost of *not* doing it is 200× a real dollar amount, not 200× a wasted DB query.
 
 The mechanism: compute a coalescing key from the fully-resolved request — model, exact prompt bytes, tools, temperature, max_tokens, and any tenant/permission scoping — and keep an in-memory map from key to an in-flight future. First caller creates the future and executes; the other 199 await the same future. On completion, resolve everyone and (optionally) write to the response cache.
 
@@ -1202,7 +1205,7 @@ So: **bounded concurrency to the provider (sized by Little's law), plus an expli
 
 The ladder exists because "the model is unavailable" should never be a binary between full quality and an error page. Rank your fallbacks by (quality retained) ÷ (dependency on the failed component) and walk down it. Mine, in order:
 
-1. **Same model, different region/account.** Zero quality loss. Costs ~100–200 ms of extra RTT if cross-continent. Automatic, no user-visible change.
+1. **Same model, different region/account.** Zero quality loss. Costs ~70–200 ms of extra RTT if cross-continent (US–EU at the low end, US–APAC at the high end). Automatic, no user-visible change.
 2. **Different provider, comparable-tier model.** Small quality delta, but only if you have been running continuous canary traffic through it and know the delta. This is where your fallback evals pay off.
 3. **Smaller/cheaper model from the same family.** Measurably worse on hard queries, fine on easy ones. Pair this with the router: during degradation, shift the routing threshold so more traffic goes to the small model rather than shifting *all* traffic.
 4. **Cached answer**, including a semantic-cache hit at a *looser* threshold than normal — this is the one case where I would relax the similarity bar, and I would label the answer in the UI as previously-generated.
@@ -1269,6 +1272,7 @@ for q in sample_queries:                      # ~2000 production queries
     rows.append({"q": q, "y": int(s_small >= s_large - TOLERANCE)})
 
 X = embed([r["q"] for r in rows])             # (N, d) float32
+y = [r["y"] for r in rows]                    # (N,) labels
 clf = LogisticRegression(C=1.0, class_weight="balanced").fit(X, y)
 clf = CalibratedClassifierCV(clf, method="isotonic", cv=5).fit(X, y)  # calibrate!
 p_small_ok = clf.predict_proba(embed([query]))[0, 1]
@@ -1677,7 +1681,7 @@ The disciplines that make shadowing safe, and this is what an interviewer is che
 
 **Compare distributions, not individual outputs.** The two models will produce different text for nearly every request; that is expected and is not signal. What is signal: schema-failure rate, mean and p95 output length, refusal rate, citation-grounding rate, tool-call frequency and argument validity, latency percentiles, and cost per request. Then, on a sampled slice, pairwise judge preference with position-swapping to control for position bias.
 
-**💰 Math:** shadowing cost for a two-week validation. 200k requests/day, $0.0546 per request uncached (from the earlier worked example), shadow at 8%: 200,000 × 0.08 × $0.0546 = **$873/day**, so **$12,225** over 14 days. That is the price of not shipping a quality regression to 100% of users, and it is a trivially defensible line item next to the cost of a week-long silent regression on a feature carrying $328k/month of spend.
+**💰 Math:** shadowing cost for a two-week validation. 200k requests/day, $0.0546 per request uncached (from the earlier worked example), shadow at 8%: 200,000 × 0.08 × $0.0546 = **$873.60/day**, so **≈$12,230** over 14 days. That is the price of not shipping a quality regression to 100% of users, and it is a trivially defensible line item next to the cost of a week-long silent regression on a feature carrying $328k/month of spend.
 
 **⚠ Trap:** replaying old requests against a new model and reusing the *old retrieved context*, then concluding the new model is worse at citations — when in fact the corpus has moved on and the old context no longer contains the answer. Replay must either freeze the index at the recorded `index_version` (which is why you record it) or re-run retrieval live, and you must be explicit about which, because the two answer different questions.
 
@@ -1695,7 +1699,7 @@ The mental model: a canary for a model change is a **statistical test with a rol
 
 **The ramp** I use: 1% → 5% → 25% → 50% → 100%, with each step held long enough to reach the sample size for its detection target, minimum one full business-hours cycle at 25% and above so you cover the daily traffic mix. Never ramp overnight when nobody can read the dashboard, and never ramp on a Friday, for the same reasons you already apply to schema migrations.
 
-**📐 Numbers you must know:** the sizing arithmetic, done live. Your baseline schema-compliance is 99.0% and you must catch a drop to 97.5% (δ=0.015). Using n ≈ 16·p(1−p)/δ² per arm: 16 × 0.99 × 0.01 / 0.000225 = 16 × 0.0099 / 0.000225 ≈ **704 per arm**. At 200k requests/day, 1% canary = 2,000 requests/day, so you have power in under nine hours at the 1% step. To catch a subtler 0.5-point drop (δ=0.005) you need 16 × 0.0099 / 0.000025 ≈ **6,336 per arm** — three days at 1%, or seven hours at 5%. This is exactly why the ramp exists: coarse regressions die at 1%, fine ones need 25%.
+**📐 Numbers you must know:** the sizing arithmetic, done live. Your baseline schema-compliance is 99.0% and you must catch a drop to 97.5% (δ=0.015). Using n ≈ 16·p(1−p)/δ² per arm: 16 × 0.99 × 0.01 / 0.000225 = 16 × 0.0099 / 0.000225 ≈ **704 per arm**. At 200k requests/day, 1% canary = 2,000 requests/day, so you have power in under nine hours at the 1% step. To catch a subtler 0.5-point drop (δ=0.005) you need 16 × 0.0099 / 0.000025 ≈ **6,336 per arm** — three days at 1% (6,336 ÷ 2,000/day), or about fifteen hours at 5% (6,336 ÷ 10,000/day × 24). This is exactly why the ramp exists: coarse regressions die at 1%, fine ones need 25%.
 
 **Rollback must be a config flip, not a deploy.** If rolling back your model change requires a CI pipeline run, your mean time to recovery is your build time, and that is unacceptable for a change that can silently degrade every answer. The model ID, prompt version and routing weights live in dynamic config with a documented, tested one-command revert — and I test the revert *before* starting the canary, every time, in the same way you would verify a database backup restores before you need it.
 
@@ -1770,7 +1774,7 @@ Because **per-token price is not per-task cost**, and the gap between them is wh
 
 **1. Output verbosity.** The new model writes longer answers for the same instruction. Output tokens are typically 4–5× the price of input tokens, so verbosity dominates. If input is 15,000 tokens and output goes from 600 to 1,100 at $15/Mtok, that is an extra 500 × 15e-6 = **$0.0075 per request** — which can easily exceed the entire per-token saving on input.
 
-**2. Thinking/reasoning tokens.** A reasoning-capable model may spend thousands of hidden tokens before its visible answer, billed at output rates. A model at half the input price that emits 3,000 thinking tokens per request adds 3,000 × 15e-6 = **$0.045 per request** — five times the cost of the entire prompt in the earlier example. Always cap the thinking budget explicitly and measure actual thinking-token consumption, not the cap.
+**2. Thinking/reasoning tokens.** A reasoning-capable model may spend thousands of hidden tokens before its visible answer, billed at output rates. A model at half the input price that emits 3,000 thinking tokens per request adds 3,000 × 15e-6 = **$0.045 per request** — roughly 2.5× the entire *input* cost of the earlier cached example ($0.00846 + $0.0096 ≈ $0.018). Always cap the thinking budget explicitly and measure actual thinking-token consumption, not the cap.
 
 **3. Tokenizer differences.** The same text is a different number of tokens across model families. A 10% denser tokenizer on your specific content (code, non-English, JSON-heavy) silently changes your input cost by 10% in either direction. Measure on *your* corpus.
 
@@ -1778,7 +1782,7 @@ Because **per-token price is not per-task cost**, and the gap between them is wh
 
 **5. Retry and repair amplification.** If the new model's schema-compliance rate drops from 99.4% to 96%, your repair path — re-prompting with the validation error — now runs on 4% of requests instead of 0.6%. Each repair is roughly a full extra call. 3.4 extra percentage points × $0.0546 = **$0.0019 per request** average, plus the latency cost on those requests, plus the engineering cost of the repair path being exercised enough to matter.
 
-**💰 Math:** the composite. Suppose list price drops 20% but output length rises 40%, thinking adds 1,500 tokens, and the cache discount halves. Old: input $0.00846 (cached) + $0.0096 (uncached ctx) + 600 × 15e-6 = $0.0271. New: $0.01725 + 3,200 × 2.50e-6 ($0.008) + (840 + 1,500) × 12e-6 ($0.02808) = **$0.0533**. That is **+97%** on a 20% price cut. At 200k requests/day, $0.0271 → $0.0533 takes you from $5,420/day to $10,660/day: **an extra $157k/month** on a change that was justified in a slide as a cost reduction.
+**💰 Math:** the composite. Suppose list prices drop ~20% (input $3 → $2.50, output $15 → $12) but output length rises 40%, thinking adds 1,500 tokens, and the cache discount halves. Old: input $0.00846 (cached) + $0.0096 (uncached ctx) + 600 × 15e-6 = $0.0271. New: $0.01725 + 3,200 × 2.50e-6 ($0.008) + (840 + 1,500) × 12e-6 ($0.02808) = **$0.0533**. That is **+97%** on a 20% price cut. At 200k requests/day, $0.0271 → $0.0533 takes you from $5,420/day to $10,660/day: **an extra $157k/month** on a change that was justified in a slide as a cost reduction.
 
 **⚠ Trap:** comparing models on the pricing page. The only valid comparison is **cost per completed task, measured by replaying your own corpus**, including thinking tokens, actual output lengths, your cache hit rate under the new provider's semantics, and your observed repair rate. I make that measurement a required artifact for any model-change proposal, and it takes an afternoon.
 
@@ -1966,7 +1970,7 @@ So the promise I actually make, and I'd write it into the ADR: *"We do not promi
 
 **📄 Paper:** the batch-invariance result published in 2025 (from the Thinking Machines group, on defeating non-determinism in inference) is the clean citation for the mechanism — it showed that if you write reduction kernels whose output does not depend on batch composition, you can recover run-to-run reproducibility, at a throughput cost. **📅 Volatile:** whether your serving stack has batch-invariant kernels available is engine- and version-specific; verify before claiming it.
 
-**⚠ Trap:** believing that `temperature=0` plus a self-hosted model gives you determinism. Even with fixed weights on fixed hardware, continuous batching alone breaks it. You need batch-invariant kernels *and* a fixed batch composition — which in practice means batch size 1, which throws away most of your throughput.
+**⚠ Trap:** believing that `temperature=0` plus a self-hosted model gives you determinism. Even with fixed weights on fixed hardware, continuous batching alone breaks it. What you need is batch-invariant reduction kernels — those are precisely what removes the dependence on batch composition. Where they aren't available in your engine, the only fallback is to pin the batch composition yourself, which in practice means batch size 1 and throws away most of your throughput.
 
 ### A junior engineer says "just pass `seed=42` on every call and the tests become deterministic." What do you tell them?
 
@@ -2043,7 +2047,7 @@ class Raise:     exc: BaseException
 @dataclass
 class Stall:     seconds: float
 @dataclass
-class Chunks:    parts: list[str]; truncate: bool = False   # streaming, maybe cut off
+class Chunks:    parts: list[str]; truncate: bool = False; gap: float = 0.0; gap_before_last: float = 0.0   # streaming, maybe cut off, maybe stalled
 
 class FakeModel:
     def __init__(self, script):
@@ -2100,7 +2104,7 @@ Two design decisions are worth defending out loud. **The fake raises `AssertionE
 
 **⚠ Trap:** treating 429 and 529 as the same thing in your retry policy and therefore in your tests. 429 means *you* sent too much and the correct response is to slow your own rate — retrying immediately makes it strictly worse and can extend the penalty window. 529/503 means *they* are overloaded and a jittered retry is appropriate. A single `except Exception: retry` collapses the distinction, and the test that catches it is the one asserting *how long you slept*, not just that you retried.
 
-**💰 Math:** why this matters in dollars. Say a 200k-request/day service with an average request of 6,000 input tokens at $3/Mtok input = 6,000 / 1,000,000 × 3 = $0.018 per call, so $3,600/day. A naive `retry(3)` on a provider blip that returns 429 for ten minutes doesn't just fail — it *quadruples* the request rate into an already-saturated endpoint. Ten minutes is 200,000/144 ≈ 1,390 requests, which become ~5,560 attempts, at $0.018 = $100 of wasted spend for that single blip, plus an extended rate-limit penalty. The test that prevents it is a deterministic one: script twelve 429s, assert the client made exactly N attempts with cumulative sleep ≥ the expected backoff sum, and assert the circuit opened.
+**💰 Math:** why this matters in dollars. Say a 200k-request/day service with an average request of 6,000 input tokens at $3/Mtok input = 6,000 / 1,000,000 × 3 = $0.018 per call, so $3,600/day. **📅 Volatile:** the $3/Mtok input and $15/Mtok output rates used throughout this section are an illustrative mid-tier frontier price point, not a quoted figure — check the current price list for whatever model you name before putting digits in an interview. A naive `retry(3)` on a provider blip that returns 429 for ten minutes doesn't just fail — it *quadruples* the request rate into an already-saturated endpoint. Ten minutes is 200,000/144 ≈ 1,390 requests, which become ~5,560 attempts, at $0.018 ≈ $100 of attempted spend of which ~$75 is pure waste (the 4,170 extra attempts), plus an extended rate-limit penalty — and that is before the retry storm lengthens the outage itself. The test that prevents it is a deterministic one: script twelve 429s, assert the client made exactly N attempts with cumulative sleep ≥ the expected backoff sum, and assert the circuit opened.
 
 ### How do you fake the tools an agent calls, and what should the fake tool server let you inject?
 
@@ -2245,7 +2249,7 @@ my_vcr = vcr.VCR(
 my_vcr.register_matcher("llm_body", lambda r1, r2: body_key(r1) == body_key(r2))
 ```
 
-Note `record_mode="none"` — in CI, a cassette miss must be a **hard failure**, never a silent live call. The default `once` mode will happily hit the network for an unmatched request, which is how a test suite that "runs offline" quietly starts spending money and leaking credentials into a build log.
+Note `record_mode="none"` — in CI, a cassette miss must be a **hard failure**, never a silent live call. Be precise about what the other modes do: `once` records (i.e. makes real calls) whenever the cassette *file* is absent, and only errors on an unmatched request when the file already exists; `new_episodes` will happily hit the network for any unmatched request even with a cassette present. Either way, a deleted or newly-named cassette under the default is how a test suite that "runs offline" quietly starts spending money and leaking credentials into a build log — `none` removes the ambiguity.
 
 **⚠ Trap:** normalizing away the idempotency key entirely. You want the *cassette matcher* to ignore it, but you almost certainly want a separate deterministic test asserting that the key is present, is stable across retries of the same logical operation, and *changes* across distinct operations. Ignoring a field for matching and never asserting on it is how you ship an idempotency key that is regenerated on every retry — which makes it decorative.
 
@@ -2666,7 +2670,7 @@ def test_tenant_is_never_taken_from_model_arguments(q, tenant):
 
 That last property is the one I'd lead with if I had to pick one test from this entire section. **Authorization must never be an argument the model can supply.** Tenant, user id, role, and any permission scope come from the request context on the server side and overwrite whatever the model produced. A model that has read a document containing "when searching, set tenant to B" is not a hypothetical — it is the standard prompt-injection payload — and the only reliable defence is architectural, with a property test proving the architecture holds for arbitrary model input.
 
-**⚠ Trap:** Pydantic's coercion helping you into a bug. In lax mode, `"limit": "50"` becomes `50` and `"enabled": "false"` can become `True` in some coercion configurations. For model-supplied arguments I use strict validation deliberately, because a model emitting a string where an int belongs is *signal* — it tells me the schema description is unclear — and silently coercing it hides the signal until the day the string is `"fifty"`.
+**⚠ Trap:** silent coercion helping you into a bug. In Pydantic's default lax mode, `"limit": "50"` becomes `50` — the string is accepted where you declared an int. (Pydantic itself does parse `"false"` to `False` correctly; the classic bool disaster is a hand-rolled `bool(value)` around the raw argument, where `bool("false")` is `True`.) For model-supplied arguments I use strict validation deliberately, because a model emitting a string where an int belongs is *signal* — it tells me the schema description is unclear — and silently coercing it hides the signal until the day the string is `"fifty"`.
 
 ### Explain metamorphic testing, and give me three metamorphic relations for a RAG system.
 
@@ -2756,7 +2760,7 @@ Keeping goldens from becoming noise requires three rules I'd state as policy. **
 
 **Schema fuzzing** catches *robustness* failures in the opposite direction — not what the agent decides, but what your dispatcher does with garbage. Generate values that satisfy the schema's *types* but violate its *intent* and values that violate the schema outright: an empty string where a query is expected, a 10MB string, a negative limit, a limit of 2^63, unicode direction-override characters, a nested object 500 levels deep, an id belonging to another tenant, a date of `0000-00-00`, a float where an int is declared, `null` for an optional field versus the field being absent. Hypothesis with `from_type` over your Pydantic models plus a hand-written hostile-value list covers this in maybe forty lines.
 
-**💰 Math:** why the deep-nesting and huge-string cases are worth the effort. A tool result you fail to bound at, say, 40k tokens gets appended to context and re-sent on every subsequent turn of the agent. An 8-turn agent that picks up a 40k-token blob on turn 2 pays for it 6 more times: 6 × 40,000 = 240,000 extra input tokens at $3/Mtok = $0.72 for one request, against a normal cost of perhaps $0.06. That's a 13× blow-up on a single request from one unbounded tool result — and at 5,000 such requests a day it's 5,000 × $0.66 = $3,300/day of surprise. The test is `assert len(tokenize(result)) <= TOOL_RESULT_BUDGET` and it takes two minutes to write.
+**💰 Math:** why the deep-nesting and huge-string cases are worth the effort. A tool result you fail to bound at, say, 40k tokens gets appended to context and re-sent on every subsequent turn of the agent. An 8-turn agent that picks up a 40k-token blob on turn 2 pays for it 6 more times: 6 × 40,000 = 240,000 extra input tokens at $3/Mtok = $0.72 for one request, against a normal cost of perhaps $0.06. That's a 13× blow-up on a single request from one unbounded tool result — and at 5,000 such requests a day the extra is 5,000 × $0.72 = $3,600/day of surprise. The test is `assert len(tokenize(result)) <= TOOL_RESULT_BUDGET` and it takes two minutes to write.
 
 **🏋 Drill:** 25 minutes, unaided. Take a three-tool agent. Write (a) a golden-trace test asserting the tool-name sequence against a regex with one permitted variation, (b) a Hypothesis test proving the dispatcher returns `ToolResult | ToolError` for arbitrary argument strings and never raises, and (c) a test proving every tool result is truncated to a token budget before being appended to context. Pass criterion: all three run offline in under two seconds total, and (c) fails if you delete the truncation call.
 ### Walk me through testing a streaming SSE endpoint. What do you assert on partial chunks?
@@ -2952,7 +2956,7 @@ async def test_expensive_tools_count_against_budget(fake_model, fake_tools):
     b = Budget(usd=0.20)
     with pytest.raises(BudgetExceeded):
         await run(agent, "task", budget=b, max_turns=20)
-    assert len([c for c, _ in fake_tools.calls]) <= 5      # 0.20 / 0.05
+    assert len([c for c, _ in fake_tools.calls]) <= 5      # 0.20/0.05 = 4, +1 overshoot
 ```
 
 **⚠ Trap:** enforcing the budget only in the orchestrator while subagents get a fresh budget object. Budgets must be *shared and passed down by reference*, or an agent that spawns three subagents with a $0.50 budget each spends $2.00 on a $0.50 task. The test is a two-level fake: assert the parent's `spent` includes the children's.
@@ -3031,7 +3035,7 @@ Note that only the last category is genuinely "LLM flake." The other five are or
 
 Two different metrics get confused here and getting them straight is a differentiator.
 
-**pass@k** comes from the code-generation literature — **📄 Paper:** Chen et al. (2021), the Codex evaluation paper, which defined it as the probability that *at least one* of k sampled solutions passes, along with the unbiased estimator you compute from n samples with c correct. It's an *optimistic* metric: it measures capability under retry, and it's the right metric when a human or a verifier picks the best of several candidates, as in code generation with a test suite to filter on.
+**pass@k** comes from the code-generation literature — **📄 Paper:** Chen et al. (2021), the Codex evaluation paper ("Evaluating Large Language Models Trained on Code"), which standardized it as the probability that *at least one* of k sampled solutions passes and gave the unbiased estimator you compute from n samples with c correct. (The metric itself predates that paper — it appears in earlier program-synthesis work — so attribute the *estimator* to Chen et al. and you are safe.) It's an *optimistic* metric: it measures capability under retry, and it's the right metric when a human or a verifier picks the best of several candidates, as in code generation with a test suite to filter on.
 
 **pass^k** is the pessimistic mirror: the probability that **all k independent attempts succeed**. **📄 Paper:** it was introduced in the τ-bench work (Yao et al., 2024) on tool-agent-user interaction, precisely because for an agent doing a real task on a customer's behalf, "succeeded once out of five tries" is not a product. Reliability is the product.
 
@@ -3167,7 +3171,7 @@ This is a context-propagation bug, and the reason it only shows up in the async 
 
 **🔍 Failure taxonomy — the five causes, in order of how often I have actually seen them**, each with the check that discriminates it:
 
-1. **Coroutine created before the parent span was entered.** `coros = [call_model(x) for x in xs]` builds coroutine objects, but `asyncio.gather` schedules them — and the context is copied at `Task` creation. If the gather happens inside the `with tracer.start_as_current_span("turn")` block this is fine; if the tasks were created outside and awaited inside, the children attach to whatever was current at creation time. Fix: create *and* await inside the span, or capture the context explicitly.
+1. **Task created before the parent span was entered.** `coros = [call_model(x) for x in xs]` builds coroutine objects — which capture nothing — but `asyncio.gather` schedules them as Tasks, and *that* is the moment the context is copied. If the gather happens inside the `with tracer.start_as_current_span("turn")` block this is fine; if the tasks were created outside and awaited inside, the children attach to whatever was current at creation time. Fix: create *and* await inside the span, or capture the context explicitly.
 2. **`loop.run_in_executor` for a sync SDK.** `asyncio.to_thread` copies the current context; a bare `loop.run_in_executor(pool, fn)` does not. If you moved a synchronous provider SDK onto a thread pool for "just this one call," you severed the context. Fix: `await asyncio.to_thread(fn, ...)`, or wrap with `contextvars.copy_context().run`.
 3. **Fire-and-forget background work.** `asyncio.create_task(log_feedback())` inside a request handler: the task keeps a reference to a context whose span has already ended by the time the task runs. You get a child whose parent ended before it started — most backends render that as an orphan.
 4. **A process or queue boundary.** Celery, Kafka, an SQS hop. `contextvars` do not cross processes. You must inject the W3C `traceparent` into the message headers on publish and extract it on consume. Most instrumentation packages do this automatically for Celery and for HTTP clients, and do *not* do it for a hand-rolled Redis list queue.
@@ -3400,7 +3404,7 @@ Let me build it from a concrete workload: a support-agent product doing **300,00
 
 **💰 Math conclusion:** full-fidelity tracing at ~$1,500/month against ~$2,000,000/month of inference is **0.075% of spend**. The honest answer to "can we afford to trace everything?" is *yes, trivially, on cost* — and the reason to sample is not the money, it is (a) payload retention as a privacy and compliance liability, (b) query performance and human signal-to-noise, and (c) the CPU and tail-latency cost of serializing 300 KB per run in the request path. I want you to give that answer, because "we sample to save money" is the answer of someone who has not run the numbers, and the interviewer has.
 
-The one case where the money *does* dominate: high-QPS, tiny-payload workloads. A classification endpoint at 50M calls/day with 200-token inputs spends maybe $30k/month on inference and would spend more than that on span-priced telemetry. There, sample hard and keep metrics only.
+The one case where the money *does* dominate: high-QPS, tiny-payload workloads. A classification endpoint at 50M calls/day with 200-token inputs spends maybe $30k/month on inference, while span-priced telemetry on 1.5–3B spans/month lands in the same order of magnitude and can exceed it outright. There, sample hard and keep metrics only.
 
 ### Walk me through the LLM observability tooling landscape. What do you actually pick?
 
@@ -3709,7 +3713,7 @@ The engineering decision rule I use maps workload to instrument:
 
 - **Interactive inference with an SLO** → reserved for the baseline, on-demand for the peak. You cannot serve a p95 SLO on preemptible capacity without an over-provisioned failover pool that eats the discount.
 - **Batch inference and offline evals** → spot, always. The work is idempotent and restartable at row granularity, which is precisely the property that makes spot free money.
-- **Training and fine-tuning** → spot *if and only if* your checkpointing interval is shorter than your tolerance for lost work. The arithmetic: if checkpointing costs 90 seconds and you checkpoint every 20 minutes, an eviction costs you an expected 10 minutes of work plus 90 seconds — about 4% overhead in exchange for a 70% discount. That is an obviously good trade. If checkpointing your 400 GB optimizer state takes 25 minutes, it is not.
+- **Training and fine-tuning** → spot *if and only if* your checkpointing interval is shorter than your tolerance for lost work. The arithmetic: if checkpointing costs 90 seconds and you checkpoint every 20 minutes, the checkpointing itself is a standing 90/1,200 = **7.5% overhead**, and each eviction costs an additional expected 10 minutes of lost work plus the restart — so at a modest eviction rate you are paying on the order of 10% all-in for a 70% discount. That is an obviously good trade. If checkpointing your 400 GB optimizer state takes 25 minutes, it is not.
 - **Baseline capacity you will definitely use for a year** → reserved, and size the reservation to your *trough*, not your mean. Reserving to the mean means paying for idle capacity half the time, which erases the discount.
 
 **💰 Math:** a fleet needing 40 GPUs at trough and 100 at peak, 730 hours/month, at $2.50/hr on-demand and $1.20/hr reserved and $0.60/hr spot. All on-demand: 100 × 730 × 2.50 = **$182,500/month** (over-provisioned to peak). Reserved at trough + on-demand for the difference, assuming average utilization of 65 GPUs: 40 × 730 × 1.20 + 25 × 730 × 2.50 = $35,040 + $45,625 = **$80,665/month**, a 56% reduction. Move the 20-GPU-equivalent batch workload to spot: 20 × 730 × 0.60 = $8,760 instead of $36,500 on-demand, saving another **$27,740/month**.
@@ -3727,7 +3731,7 @@ Here is the arithmetic. Take an 8B-class open-weight model served on a single H1
 
 Now compare to a hosted small model at, say, $0.60/Mtok output. Self-hosting wins — *at 100% utilization.* But you will never see 100%. At a realistic **35% average utilization** (diurnal traffic, no perfect bin-packing), your effective cost is $0.28 / 0.35 = **$0.80/Mtok** — and you have just lost to the API while also acquiring a GPU fleet, a serving engine to upgrade, an autoscaler that has to reason about KV-cache pressure, and a 3am page class you did not have before.
 
-So the break-even condition is roughly: **utilization × hosted_price > self_hosted_price_at_full_load**, plus an engineering-cost term. In the example, you need utilization above 0.28/0.60 = **47%** just to tie on tokens, before paying for the two engineers. Amortize $500k/year of loaded engineering cost over your volume: at 3 Btok/month of output that is $500,000 / (36,000 Mtok/year) = **$13.9/Mtok of engineering overhead** — which dwarfs the token price entirely and settles the argument at that volume. You need something like 100 Btok/year before the engineering amortizes to under $0.05/Mtok.
+So the break-even condition is roughly: **utilization × hosted_price > self_hosted_price_at_full_load**, plus an engineering-cost term. In the example, you need utilization above 0.28/0.60 = **47%** just to tie on tokens, before paying for the two engineers. Amortize $500k/year of loaded engineering cost over your volume: at 3 Btok/month of output that is $500,000 / (36,000 Mtok/year) = **$13.9/Mtok of engineering overhead** — which dwarfs the token price entirely and settles the argument at that volume. You need something like 1 Ttok/year — 1,000 Btok — before that overhead falls to $500,000 / 1,000,000 Mtok = **$0.50/Mtok** and stops dominating the token price at all, and roughly 10 Ttok/year before it amortizes to under $0.05/Mtok.
 
 The reasons self-hosting *does* win, which are the reasons to state in the room: **a fine-tuned model that no provider offers** (a distilled classifier at 1% of frontier cost is a self-hosting story even at modest volume); **data residency or contractual prohibition on third-party processing**, where the alternative is not a cheaper API but no product at all; **very long shared prefixes** where you control the KV cache and can pin it across requests in ways a provider will not; **predictable, sustained, batchable volume** where you can run reserved or spot at 80%+ utilization; and **latency floors** you cannot get across the public internet.
 

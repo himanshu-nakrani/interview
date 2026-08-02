@@ -1,6 +1,6 @@
 # AI Engineer (Generative AI) — Interview Preparation Guide
 
-**19 parts · 87 sections · 4,009 questions · 2,023,935 words** — averaging 504 words per answer.
+**19 parts · 87 sections · 4,009 questions · 2,041,651 words** — averaging 509 words per answer.
 
 Written for a senior Python backend engineer moving into AI Engineer / Applied AI / GenAI Engineer roles at
 the highest-paying employers in the world, weighted toward **AI Product / Applied** (Cursor, Perplexity,
@@ -23,30 +23,42 @@ prior ML, GPU, or training knowledge, teaching those from the ground up at full 
 Recurring markers: `⚠ Trap` · `🗣 Say this in the room` · `📐 Numbers you must know` · `📄 Paper` ·
 `💰 Math` · `🔍 Failure taxonomy` · `🏋 Drill` · `📅 Volatile` (verify before your loop).
 
+## Accuracy
+
+Every section was independently fact-checked by an adversarial pass that recomputed each `💰 Math` and
+`📐 Numbers` block, re-derived formulas, checked every `📄 Paper` attribution, and ran down code and API
+claims. **758 corrections** were applied: 259 arithmetic errors, 152 false claims, 115 internal
+contradictions, 61 unflagged stale facts, 46 code bugs, 44 formula errors, and 16 unverifiable citations.
+150 of them were severe enough to fail a candidate who repeated them.
+
+Numbers marked `📅 Volatile` — model names, prices, context limits, benchmark scores, regulatory dates —
+were correct when written and should be re-verified before an interview loop. Section 5 is the single
+refreshable place where the volatile landscape lives.
+
 ## Parts
 
 | # | Part | Sections | Questions | Words |
 |---|---|---|---|---|
-| 0 | [Orientation, Routing and Getting the Interview](ai-engineering-guide/part-00-orientation-routing-and-getting-the-interview.md) | 6 | 237 | 120,015 |
-| 1 | [Foundations Interviews Actually Probe](ai-engineering-guide/part-01-foundations-interviews-actually-probe.md) | 3 | 145 | 70,351 |
-| 2 | [Model Internals](ai-engineering-guide/part-02-model-internals.md) | 8 | 353 | 168,230 |
-| 3 | [Training and Post-Training](ai-engineering-guide/part-03-training-and-post-training.md) | 8 | 376 | 192,132 |
-| 4 | [Inference, Serving and AI Infrastructure](ai-engineering-guide/part-04-inference-serving-and-ai-infrastructure.md) | 7 | 368 | 170,238 |
-| 5 | [Retrieval and RAG](ai-engineering-guide/part-05-retrieval-and-rag.md) | 7 | 357 | 185,135 |
-| 6 | [Agents and Tool Use](ai-engineering-guide/part-06-agents-and-tool-use.md) | 8 | 362 | 183,621 |
-| 7 | [Context, Memory and Prompt Systems](ai-engineering-guide/part-07-context-memory-and-prompt-systems.md) | 4 | 180 | 85,182 |
-| 8 | [Evaluation and Measurement (the spine)](ai-engineering-guide/part-08-evaluation-and-measurement-the-spine.md) | 5 | 232 | 116,526 |
-| 9 | [The AI Product Backend, LLMOps and Reliability](ai-engineering-guide/part-09-the-ai-product-backend-llmops-and-reliability.md) | 4 | 205 | 100,104 |
-| 10 | [Data and Enterprise Integration Platform](ai-engineering-guide/part-10-data-and-enterprise-integration-platform.md) | 2 | 88 | 49,560 |
-| 11 | [Safety, Security and Governance](ai-engineering-guide/part-11-safety-security-and-governance.md) | 4 | 172 | 97,070 |
-| 12 | [Beyond Text](ai-engineering-guide/part-12-beyond-text.md) | 4 | 170 | 86,102 |
-| 13 | [Adjacent High-Comp Surfaces](ai-engineering-guide/part-13-adjacent-high-comp-surfaces.md) | 1 | 47 | 28,126 |
-| 14 | [Coding Rounds](ai-engineering-guide/part-14-coding-rounds.md) | 4 | 200 | 100,774 |
-| 15 | [System Design](ai-engineering-guide/part-15-system-design.md) | 4 | 187 | 106,814 |
-| 16 | [Take-Homes, Work Trials and Defense](ai-engineering-guide/part-16-take-homes-work-trials-and-defense.md) | 4 | 153 | 80,146 |
-| 17 | [Human Rounds](ai-engineering-guide/part-17-human-rounds.md) | 3 | 135 | 64,241 |
-| 18 | [Offer, Leveling and Career](ai-engineering-guide/part-18-offer-leveling-and-career.md) | 1 | 42 | 19,568 |
-| | **Total** | **87** | **4,009** | **2,023,935** |
+| 0 | [Orientation, Routing and Getting the Interview](ai-engineering-guide/part-00-orientation-routing-and-getting-the-interview.md) | 6 | 237 | 121,066 |
+| 1 | [Foundations Interviews Actually Probe](ai-engineering-guide/part-01-foundations-interviews-actually-probe.md) | 3 | 145 | 70,771 |
+| 2 | [Model Internals](ai-engineering-guide/part-02-model-internals.md) | 8 | 353 | 170,036 |
+| 3 | [Training and Post-Training](ai-engineering-guide/part-03-training-and-post-training.md) | 8 | 376 | 194,020 |
+| 4 | [Inference, Serving and AI Infrastructure](ai-engineering-guide/part-04-inference-serving-and-ai-infrastructure.md) | 7 | 368 | 171,914 |
+| 5 | [Retrieval and RAG](ai-engineering-guide/part-05-retrieval-and-rag.md) | 7 | 357 | 186,724 |
+| 6 | [Agents and Tool Use](ai-engineering-guide/part-06-agents-and-tool-use.md) | 8 | 362 | 184,998 |
+| 7 | [Context, Memory and Prompt Systems](ai-engineering-guide/part-07-context-memory-and-prompt-systems.md) | 4 | 180 | 85,801 |
+| 8 | [Evaluation and Measurement (the spine)](ai-engineering-guide/part-08-evaluation-and-measurement-the-spine.md) | 5 | 232 | 117,143 |
+| 9 | [The AI Product Backend, LLMOps and Reliability](ai-engineering-guide/part-09-the-ai-product-backend-llmops-and-reliability.md) | 4 | 205 | 100,713 |
+| 10 | [Data and Enterprise Integration Platform](ai-engineering-guide/part-10-data-and-enterprise-integration-platform.md) | 2 | 88 | 49,924 |
+| 11 | [Safety, Security and Governance](ai-engineering-guide/part-11-safety-security-and-governance.md) | 4 | 172 | 97,787 |
+| 12 | [Beyond Text](ai-engineering-guide/part-12-beyond-text.md) | 4 | 170 | 86,768 |
+| 13 | [Adjacent High-Comp Surfaces](ai-engineering-guide/part-13-adjacent-high-comp-surfaces.md) | 1 | 47 | 28,559 |
+| 14 | [Coding Rounds](ai-engineering-guide/part-14-coding-rounds.md) | 4 | 200 | 102,364 |
+| 15 | [System Design](ai-engineering-guide/part-15-system-design.md) | 4 | 187 | 107,474 |
+| 16 | [Take-Homes, Work Trials and Defense](ai-engineering-guide/part-16-take-homes-work-trials-and-defense.md) | 4 | 153 | 81,055 |
+| 17 | [Human Rounds](ai-engineering-guide/part-17-human-rounds.md) | 3 | 135 | 64,734 |
+| 18 | [Offer, Leveling and Career](ai-engineering-guide/part-18-offer-leveling-and-career.md) | 1 | 42 | 19,800 |
+| | **Total** | **87** | **4,009** | **2,041,651** |
 
 ## All 87 sections
 

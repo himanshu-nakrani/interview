@@ -132,7 +132,7 @@ The second failure is the fully-masked row. If a batch element is entirely paddi
 
 ### Implement a KV cache. Give me the shapes, and be precise about cache position.
 
-Here is the framing that makes the whole thing inevitable: **without a cache, generating token `n` requires recomputing attention over all `n` prefix tokens, so generating a sequence of length `N` costs O(N²) work; with a cache it costs O(N).** But the deeper point is what the cache *does to the hardware profile*. Prefill is a big matmul — compute-bound, high arithmetic intensity. Decode with a cache is: read all the cached K and V out of HBM, do a matrix-vector product against a single query, write one new K and V back. Arithmetic intensity is near 1 FLOP per byte. **Decode is memory-bandwidth-bound, and the KV cache is the reason.** A KV cache is a per-request memo table whose eviction policy you do not control and whose size grows linearly with every token you emit.
+Here is the framing that makes the whole thing inevitable: **without a cache, generating token `n` means re-running the forward over the whole `n`-token prefix — O(n²) of attention work for one emitted token, so O(N³) for a length-`N` generation; with a cache each step is O(n) and the whole generation is O(N²).** But the deeper point is what the cache *does to the hardware profile*. Prefill is a big matmul — compute-bound, high arithmetic intensity. Decode with a cache is: read all the cached K and V out of HBM, do a matrix-vector product against a single query, write one new K and V back. Arithmetic intensity is near 1 FLOP per byte. **Decode is memory-bandwidth-bound, and the KV cache is the reason.** A KV cache is a per-request memo table whose eviction policy you do not control and whose size grows linearly with every token you emit.
 
 The shapes, which you must write on the board before the code: `k_cache, v_cache: (B, H_kv, T_max, dh)`, filled to position `cache_len`. During decode the query has `Tq = 1` but keys have `Tk = cache_len + 1`, so **the score matrix is rectangular `(B, H, 1, cache_len+1)`** — this is the shape people get wrong.
 
@@ -159,6 +159,7 @@ def decode_step(self, x_1tok, cache, pos):              # x_1tok: (B, 1, D), pos
     q, k, v = self.project(x_1tok)                      # each (B, H, 1, dh)
     q, k = apply_rope(q, k, positions=torch.arange(pos, pos + 1))
     K, V = cache.append(k, v)                           # (B, H_kv, pos+1, dh)
+    K, V = repeat_kv(K, self.h // self.h_kv), repeat_kv(V, self.h // self.h_kv)   # -> (B, H, pos+1, dh)
     scores = (q @ K.transpose(-1, -2)) / self.dh**0.5   # (B, H, 1, pos+1)
     # NO causal mask needed: the cache contains only the past by construction
     return (scores.softmax(-1) @ V)                     # (B, H, 1, dh)
@@ -168,7 +169,7 @@ def decode_step(self, x_1tok, cache, pos):              # x_1tok: (B, 1, D), pos
 
 **⚠ Trap 2:** applying the causal mask during decode. With a properly-managed cache the keys *are* exactly the past, so no mask is needed. If you also apply a square causal mask you will either crash on shape mismatch (good) or, with careless broadcasting, mask out real history (bad). Say aloud: "no mask in decode — the cache is the mask."
 
-**📐 Numbers you must know:** KV cache bytes = `2 (K and V) × n_layers × n_kv_heads × head_dim × seq_len × bytes_per_elem × batch`. For a 70B-class model with 80 layers, 8 KV heads (GQA), head_dim 128, at bf16: per token per sequence that is `2 × 80 × 8 × 128 × 2 = 327,680 bytes ≈ 0.33 MB/token`. At 32k context: `0.33 MB × 32768 ≈ 10.7 GB` for **one** request. On an 80 GB H100 with ~140 GB of weights sharded across two GPUs, you can hold maybe 5–6 such requests concurrently. That arithmetic — not FLOPs — is what sets your max batch size, and being able to produce it live is a strong senior signal.
+**📐 Numbers you must know:** KV cache bytes = `2 (K and V) × n_layers × n_kv_heads × head_dim × seq_len × bytes_per_elem × batch`. For a 70B-class model with 80 layers, 8 KV heads (GQA), head_dim 128, at bf16: per token per sequence that is `2 × 80 × 8 × 128 × 2 = 327,680 bytes ≈ 0.33 MB/token`. At 32k context: `0.33 MB × 32768 ≈ 10.7 GB` for **one** request. Shard the ~140 GB of bf16 weights across two 80 GB H100s and only ~20 GB of the 160 GB is left for KV — barely two such requests. Go to four GPUs (320 GB total) and you have ~180 GB of headroom, or roughly 16. That arithmetic — not FLOPs — is what sets your max batch size, and being able to produce it live is a strong senior signal.
 
 ### Explain GQA and MQA, then implement the KV-head repeat. Why does this exist at all?
 
@@ -228,7 +229,7 @@ This is the cache-position bug, and the symptom you just described is its signat
 
 The mechanism of the failure. During prefill you compute RoPE for positions `0..P-1` and store rotated keys in the cache. During decode, each new token's key must be rotated by its *true absolute position*, which is `cache.len` at the moment before you append. Three ways teams get this wrong: (a) appending to the cache and then reading `cache.len` for the position, giving every token position `+1`; (b) resetting the position counter to 0 at the start of decode, so token `P` gets rotated as if it were token 0; (c) recomputing the RoPE table with `offset=0` and length `cache_len+1` each step and then indexing `[-1]`, which is actually correct but wastes work — and is a common thing people write and then "optimize" into bug (b).
 
-Why quality degrades *gradually*. Attention logits depend on `θ_i(m − n)`. If every new query is off by a constant `+1`, then relative offsets to old cached keys are all shifted by 1. For the most recent keys (`m − n` small, say 1 or 2), an error of 1 is a 50–100% relative error in the offset — but the model's local attention is strongly content-driven and tolerates it. For distant keys, an offset of 1 out of 400 barely changes the high-frequency pairs' contribution but *accumulates* across the low-frequency pairs. The net is a slow, monotone drift in the attention pattern's calibration. Nothing NaNs. Perplexity on a 20-token test is unchanged. Perplexity at 2000 tokens is visibly worse.
+Why quality degrades *gradually*. Attention logits depend on `θ_i(m − n)`. If every new query is off by a constant `+1`, then relative offsets to old cached keys are all shifted by 1, so each dimension pair's rotation is wrong by exactly `θ_i` — roughly a radian of angular error in the fastest, highest-frequency pairs (`θ_0 = 1`) and something like `1e-4` radians in the slowest ones. Early in the generation there are few cached keys and local attention is strongly content-driven, so the corrupted phase is absorbed. As the cache grows, more and more of the keys being scored carry that corrupted phase, and each slightly-wrong attention step feeds the next one, so the error compounds through the generated text rather than through any single logit. The net is a slow, monotone drift in the attention pattern's calibration. Nothing NaNs. Perplexity on a 20-token test is unchanged. Perplexity at 2000 tokens is visibly worse.
 
 **The test that catches it, and which I insist on in any inference-path PR:**
 
@@ -266,11 +267,11 @@ class RMSNorm(nn.Module):
         return (x * rms).to(dtype) * self.weight
 ```
 
-Three details that get probed. First, **the fp32 upcast is not optional.** In bf16, `x.pow(2)` on a residual stream whose entries have grown to ~50 gives 2500, and summing 8192 of those overflows bf16's ~3.4e38 far less often than it loses precision — bf16 has 8 mantissa bits, so the running sum quantizes catastrophically. Every reference implementation upcasts. Second, **`eps` goes inside the sqrt**, added to the mean-square, not to the rms. Third, the weight multiply happens *after* the downcast in the Llama reference, which is a numerical-parity detail that matters if you are reimplementing to match a checkpoint bit-for-bit.
+Three details that get probed. First, **the fp32 upcast is not optional.** In bf16, `x.pow(2)` on a residual stream whose entries have grown to ~50 gives 2500, and summing 8192 of those overflows bf16's ~3.4e38 far less often than it loses precision — bf16 spends 8 bits on the exponent and only 7 on the mantissa, so the running sum quantizes catastrophically. Every reference implementation upcasts. Second, **`eps` goes inside the sqrt**, added to the mean-square, not to the rms. Third, the weight multiply happens *after* the downcast in the Llama reference, which is a numerical-parity detail that matters if you are reimplementing to match a checkpoint bit-for-bit.
 
 Where it goes: **pre-norm**, meaning `x = x + attn(norm(x))`, not `x = norm(x + attn(x))`. Pre-norm gives a clean identity path from embedding to output — the residual stream is never rescaled — which is why deep transformers train without warmup gymnastics. Post-norm (the original 2017 arrangement) needs careful warmup and dies past ~20 layers without tricks. Modern models also add a **final norm** before the LM head, which people forget when reimplementing and then wonder why their logits are the wrong scale.
 
-**📄 Paper:** Zhang & Sennrich (2019), "Root Mean Square Layer Normalization" — showed the re-centering in LayerNorm is unnecessary for transformers, keeping only re-scaling, at 7–64% speedup on the norm op depending on setting.
+**📄 Paper:** Zhang & Sennrich (2019), "Root Mean Square Layer Normalization" — showed the re-centering in LayerNorm is unnecessary, keeping only re-scaling, and reported 7–64% reductions in total running time across the models they tested (mostly RNN/seq2seq-scale, where normalization is a far larger share of runtime than in a modern transformer — do not quote that range as a transformer number).
 
 **⚠ Trap:** "RMSNorm is faster so it's better." It is faster *on the norm op*, which is a single-digit percentage of a transformer's runtime. The real reason it won is that it is one fewer reduction, one fewer parameter tensor, and empirically loss-neutral — so it is free. Do not oversell the speedup; an interviewer who knows the profile will catch you.
 
@@ -450,7 +451,7 @@ def flash_attention_numpy(Q, K, V, block=128):
     return O / l
 ```
 
-That is FlashAttention's mechanism in 15 lines. The real kernel adds the parts that make it fast rather than merely small: tiling over `Q` as well as `K`, keeping tiles resident in **SRAM** (roughly 20 MB per SM-group on an H100 versus 80 GB of HBM at ~3.35 TB/s), fusing the softmax and both matmuls into one kernel so intermediate tiles never touch HBM, and recomputing `S` during the backward pass from the stored `(m, l)` statistics instead of storing the full `(T,T)` matrix.
+That is FlashAttention's mechanism in 15 lines. The real kernel adds the parts that make it fast rather than merely small: tiling over `Q` as well as `K`, keeping tiles resident in **SRAM** (on-chip shared memory and registers — order 20 MB aggregate across an A100's SMs, ~30 MB on an H100, versus 80 GB of HBM at ~3.35 TB/s), fusing the softmax and both matmuls into one kernel so intermediate tiles never touch HBM, and recomputing `S` during the backward pass from the stored `(m, l)` statistics instead of storing the full `(T,T)` matrix.
 
 **⚠ Trap — the misconception that gets people rejected:** believing FlashAttention is an approximation, or that it reduces FLOPs. **It is numerically exact and does the same number of FLOPs** (slightly more, because of backward recomputation). What it reduces is HBM traffic: from `O(T²)` reads/writes of the score matrix down to `O(T·dh)`. It is an IO-complexity result, not an algorithmic-complexity one. Attention is still quadratic in time.
 
@@ -674,9 +675,9 @@ class LoRALinear(nn.Module):
         self.merged = False
 ```
 
-Four details interviewers check. **`B` is initialized to zero and `A` randomly** — so `ΔW = BA = 0` at step 0 and the adapted model is *exactly* the base model, meaning you can't blow up your starting point. Initializing both randomly injects noise into a converged model and is a real bug. **The scaling is `α/r`**, which decouples the learning rate from the rank: doubling `r` halves the per-direction contribution, so you can sweep `r` without re-tuning LR. **Merging is exact** — after `merge()` the layer is a plain `nn.Linear` with zero inference overhead, which is LoRA's headline operational property versus adapter layers that add depth. **Unmerge must be lossless**, which it is in fp32 but *not* in fp16/bf16: merging into a bf16 weight, then unmerging, does not return the original bits, because `w + δ − δ ≠ w` under 8-bit mantissa rounding. Keep a master copy or merge in fp32.
+Four details interviewers check. **`B` is initialized to zero and `A` randomly** — so `ΔW = BA = 0` at step 0 and the adapted model is *exactly* the base model, meaning you can't blow up your starting point. Initializing both randomly injects noise into a converged model and is a real bug. **The scaling is `α/r`**, which decouples the learning rate from the rank: doubling `r` halves the per-direction contribution, so you can sweep `r` without re-tuning LR. **Merging is exact** — after `merge()` the layer is a plain `nn.Linear` with zero inference overhead, which is LoRA's headline operational property versus adapter layers that add depth. **Unmerge must be lossless**, which it is in fp32 but *not* in fp16/bf16: merging into a bf16 weight, then unmerging, does not return the original bits, because `w + δ − δ ≠ w` under bf16's 7-bit mantissa rounding. Keep a master copy or merge in fp32.
 
-**📄 Paper:** Hu et al. (2021), "LoRA: Low-Rank Adaptation of Large Language Models" — showed rank-4 to rank-16 updates on attention projections match full fine-tuning on GLUE-scale tasks at ~10,000× fewer trainable parameters, replacing adapter-layer approaches that added inference latency.
+**📄 Paper:** Hu et al. (2021), "LoRA: Low-Rank Adaptation of Large Language Models" — showed rank-4 to rank-16 updates on attention projections match full fine-tuning across RoBERTa/DeBERTa GLUE tasks and GPT-2/GPT-3, with the headline ~10,000× trainable-parameter reduction quoted for GPT-3 175B, replacing adapter-layer approaches that added inference latency.
 
 **💰 Math:** a 7B model, `d = 4096`, LoRA `r=16` on Q,K,V,O of 32 layers. Per projection: `r(d_in + d_out) = 16 × (4096 + 4096) = 131,072` params. Four projections × 32 layers = `128 × 131,072 ≈ 16.8M` trainable — **0.24%** of 7B. Optimizer state at 8 bytes/param (Adam m and v in fp32) is 134 MB instead of 56 GB. That is the difference between one 24 GB consumer GPU and an 8×A100 node, and it is why the entire fine-tuning ecosystem is LoRA-shaped.
 
@@ -1296,7 +1297,7 @@ class Budget:
 
 What happens when it trips is a product decision you should state as one: for an internal batch job, hard fail and alert. For a user-facing agent, finish the current turn, return the partial result with an explicit "I ran out of budget for this task" message, and expose the trace. **Never silently truncate the loop and present the partial answer as complete** — that is the version that generates support tickets and erodes trust.
 
-**💰 Math showing why preflight matters:** an agent with `max_turns=12`, ~2,000 tokens of new input per turn and cumulative context, running 800 sessions/day. Worst case per session from the earlier arithmetic is ~143k input tokens plus ~4k output: `143,000 × $3/1e6 + 4,000 × $15/1e6 = $0.429 + $0.060 = $0.489`. Times 800 = **$391/day = $11.7k/month** at the *cap*. If 2% of sessions loop pathologically and your cap is absent, and a looping session runs 200 turns before someone notices, one session costs `200×2000 + 1800×19900 ≈ 36.2M` input tokens ≈ **$108** — sixteen such sessions in a day doubles your entire bill. The budget enforcer is not hygiene; it is the thing standing between you and a five-figure incident.
+**💰 Math showing why preflight matters:** an agent with `max_turns=12`, ~2,000 tokens of new input per turn and cumulative context, running 800 sessions/day. Worst case per session from the earlier arithmetic is ~143k input tokens plus ~4k output: `143,000 × $3/1e6 + 4,000 × $15/1e6 = $0.429 + $0.060 = $0.489`. Times 800 = **$391/day = $11.7k/month** at the *cap*. If 2% of sessions loop pathologically and your cap is absent, and a looping session runs 200 turns before someone notices, one session costs `200×2000 + 1800×19900 ≈ 36.2M` input tokens ≈ **$109** — more than 200 well-behaved sessions. Two percent of 800 sessions is sixteen of them: `16 × $109 ≈ $1,740/day`, roughly **four and a half times** your entire budgeted bill. The budget enforcer is not hygiene; it is the thing standing between you and a five-figure incident.
 
 ### Write a streaming SSE endpoint with cancellation that actually frees the upstream request.
 
@@ -1486,7 +1487,7 @@ class FlatIndex:
 
 **Mistake three: float64.** `np.asarray` on a Python list of floats gives float64, doubling memory and halving BLAS throughput. `1e6 × 768 × 4 bytes = 3.07 GB` in float32; in float64 it is 6.14 GB and no longer fits comfortably alongside the rest of your process. Force `float32` at the boundary.
 
-**📐 Numbers you must know:** a flat index at dimension `d` and `N` vectors costs `N × d × 4` bytes in float32. `1M × 1536 × 4 = 6.14 GB`; `10M × 768 × 4 = 30.7 GB`. Query time is one `(1, d) × (d, N)` GEMM ≈ `2Nd` FLOPs; at `N=1M, d=768` that is 1.5 GFLOP, roughly 5–15 ms single-threaded on a modern CPU. **The decision rule I use: under ~1M vectors and p99 budget above ~50 ms, use flat and skip the index entirely.** Say that in the room — reaching for HNSW at 50k vectors is over-engineering, and interviewers notice.
+**📐 Numbers you must know:** a flat index at dimension `d` and `N` vectors costs `N × d × 4` bytes in float32. `1M × 1536 × 4 = 6.14 GB`; `10M × 768 × 4 = 30.7 GB`. Query time is one `(1, d) × (d, N)` GEMM ≈ `2Nd` FLOPs; at `N=1M, d=768` that is 1.5 GFLOP, roughly 5–15 ms with a multithreaded BLAS — and note it is memory-bandwidth-bound, not FLOP-bound, because you stream the whole 3 GB matrix per query, so single-threaded it is several times slower than that. **The decision rule I use: under ~1M vectors and p99 budget above ~50 ms, use flat and skip the index entirely.** Say that in the room — reaching for HNSW at 50k vectors is over-engineering, and interviewers notice.
 
 ### Implement a mini IVF index. Explain the recall knob.
 
@@ -1604,13 +1605,13 @@ class MiniHNSW:
         return self._search_layer(q, ep, max(ef, k), 0)[:k]
 ```
 
-The three knobs and what each costs. **`M`** — neighbors per node — sets memory (`M × 4 bytes` of link IDs per node per layer, roughly `1.5 × M × 4` bytes amortized) and recall ceiling; 16–48 is the usual range. **`efConstruction`** — beam width at insert — sets build time and graph *quality*; too low and you build a graph that no `efSearch` can rescue. **`efSearch`** — beam width at query — is the pure runtime recall/latency dial, adjustable per query with no rebuild. That last property is why HNSW dominates for interactive search: you can trade recall for latency at request time, per tenant, per SLA tier.
+The three knobs and what each costs. **`M`** — neighbors per node — sets memory (`M × 4 bytes` of link IDs per node per layer, and because layer 0 alone holds `M0 = 2M` links while the upper layers add about one more on average, roughly `2 × M × 4` bytes amortized) and recall ceiling; 16–48 is the usual range. **`efConstruction`** — beam width at insert — sets build time and graph *quality*; too low and you build a graph that no `efSearch` can rescue. **`efSearch`** — beam width at query — is the pure runtime recall/latency dial, adjustable per query with no rebuild. That last property is why HNSW dominates for interactive search: you can trade recall for latency at request time, per tenant, per SLA tier.
 
 **⚠ Trap:** deletions. HNSW has no real delete — the standard approach is a tombstone that filters results post-hoc, which means the graph keeps degrading as deleted nodes remain as routing hops that lead nowhere useful. A corpus with 30% churn per month needs periodic full rebuilds, and that rebuild is an operational event you must plan for (build to a new index, verify recall against a golden query set, then atomically swap the alias). **A stale alias pointing at last month's build is one of the classic RAG production bugs** — the index is healthy, the queries are fine, and the answers are all from before the last reindex.
 
 **📄 Paper:** Malkov & Yashunin (2018), "Efficient and Robust Approximate Nearest Neighbor Search Using Hierarchical Navigable Small World Graphs" — added the probabilistic layer hierarchy and a neighbor-selection heuristic to NSW graphs, replacing tree-based and LSH methods as the default for in-memory ANN.
 
-**💰 Math:** 10M vectors, `d=768`, `M=32`. Vectors: `10e6 × 768 × 4 = 30.7 GB`. Links: roughly `10e6 × 1.5 × 32 × 4 bytes ≈ 1.9 GB` — **the graph is ~6% overhead on top of the vectors**, which is the number to know when someone asks "how much does HNSW cost." Query touches maybe 1,000–3,000 vectors at `efSearch=64` versus 10M for flat: a 3,000–10,000× scan reduction at 95–99% recall@10. That is why it wins over IVF at interactive latencies, and the price is memory and no cheap deletes.
+**💰 Math:** 10M vectors, `d=768`, `M=32`. Vectors: `10e6 × 768 × 4 = 30.7 GB`. Links: roughly `10e6 × 2 × 32 × 4 bytes ≈ 2.6 GB` — **the graph is under 10% overhead on top of the vectors**, which is the number to know when someone asks "how much does HNSW cost." Query touches maybe 1,000–3,000 vectors at `efSearch=64` versus 10M for flat: a 3,000–10,000× scan reduction at 95–99% recall@10. That is why it wins over IVF at interactive latencies, and the price is memory and no cheap deletes.
 
 ### Write BM25 from scratch. Explain every term, and tell me why it hasn't been replaced.
 
@@ -1839,12 +1840,12 @@ The other biases to control, all of which I would name: **verbosity bias** — j
 
 **The validation step people skip:** a judge is a measurement instrument and must itself be measured. Human-label 100–200 pairs, compute the judge's agreement with human labels (Cohen's κ, not raw agreement — raw agreement is inflated when one class dominates), and **only trust the judge on the slices where κ is acceptable**, roughly 0.6+. Report the κ alongside every judge-derived number. Without it, "the judge says we improved 4 points" is an unfalsifiable claim.
 
-**💰 Math:** 500 golden cases × 2 orders × 2 systems compared = 2,000 judge calls. At ~1,500 input and 16 output tokens with a mid-tier model at $3/$15 per Mtok: `2,000 × (1500×3 + 16×15)/1e6 = 2,000 × $0.00474 = $9.48` per eval run. That is cheap enough to run on every PR, and saying so is the point — the position-swap doubling is not a cost concern, so there is no excuse for skipping it.
+**💰 Math:** 500 golden cases × 2 orders × 2 candidate systems each compared against the baseline = 2,000 judge calls. At ~1,500 input and 16 output tokens with a mid-tier model at $3/$15 per Mtok: `2,000 × (1500×3 + 16×15)/1e6 = 2,000 × $0.00474 = $9.48` per eval run. That is cheap enough to run on every PR, and saying so is the point — the position-swap doubling is not a cost concern, so there is no excuse for skipping it.
 
 **🗣 Say this in the room:** "I always judge each pair twice with the positions swapped and only count agreeing verdicts as decisive; the disagreement rate is my position-bias metric. And I validate the judge against a few hundred human labels with Cohen's κ before I let it gate a release — an unvalidated judge is a random number generator with good prose."
 ### The round bans PyTorch — NumPy only. What changes, and what's your checklist?
 
-Anthropic, DeepMind, xAI and several quant shops run rounds with no frameworks and no autocomplete, and the NumPy-only variant is the common form. What changes is not the algorithm; it is that **you now own the backward pass, the parameter initialization, and the optimizer**, and there is no `.to(device)` to hide behind. What does *not* change is the shape contract, and that is your anchor.
+Several frontier labs and quant shops run rounds with no frameworks and no autocomplete, and the NumPy-only variant is the common form — **📅 Volatile:** which companies do this, and in which round, changes constantly, so ask your recruiter rather than assuming a named company's format. What changes is not the algorithm; it is that **you now own the backward pass, the parameter initialization, and the optimizer**, and there is no `.to(device)` to hide behind. What does *not* change is the shape contract, and that is your anchor.
 
 The concrete translation table, which I would write on the board at the start:
 
@@ -1860,7 +1861,7 @@ The concrete translation table, which I would write on the board at the start:
 | `torch.topk` | `np.argpartition(-x, k)[:k]` then sort those k |
 | `nn.Parameter` | a plain array plus a matching gradient array |
 
-The five-item checklist I run before saying "done" in a NumPy round. **(1) dtype** — force `np.float32` at every boundary; NumPy defaults to float64 from Python lists and your matmuls silently halve in speed. Except during gradient checking, where you want float64 deliberately. **(2) `keepdims`** — the single most common NumPy bug in this context: `x.sum(-1)` drops the axis and then broadcasting silently does something plausible and wrong. **(3) In-place aliasing** — `a[:] = a @ b` and views into the same buffer bite you in ways autograd used to prevent. **(4) Broadcasting asserts** — `assert scores.shape == (B, H, T, T)` after every reshape-heavy line; it costs one line and saves ten minutes. **(5) Init scale** — no `nn.Linear` means no default init; use `W = rng.normal(0, (1/fan_in)**0.5, (out, in)).astype(np.float32)` and say why, because an interviewer will ask.
+The five-item checklist I run before saying "done" in a NumPy round. **(1) dtype** — force `np.float32` at every boundary; NumPy defaults to float64 from Python lists and your matmuls silently halve in speed. Except during gradient checking, where you want float64 deliberately. **(2) `keepdims`** — the single most common NumPy bug in this context: `x.sum(-1)` drops the axis and then broadcasting silently does something plausible and wrong. **(3) In-place aliasing** — `a[:] = a @ b` and views into the same buffer bite you in ways autograd used to prevent. **(4) Broadcasting asserts** — `assert scores.shape == (B, H, T, T)` after every reshape-heavy line; it costs one line and saves ten minutes. **(5) Init scale** — no `nn.Linear` means no default init; use `W = rng.normal(0, (1/fan_in)**0.5, (fan_out, fan_in)).astype(np.float32)` and say why (note `in` is a Python keyword, so name the dims), because an interviewer will ask.
 
 **🗣 Say this in the room:** "NumPy-only just means I own the backward and the init. I'll write the forward with explicit shape asserts, then the backward, then I'll gradient-check it against a central finite difference in float64 — that's how I know it's right without a framework to check me."
 
@@ -2066,7 +2067,7 @@ I have graded enough of these to have a short list, and none of the items is abo
 
 **They verify rather than assert.** "This is correct" versus "here's the equivalence test that proves it, and here's the finite-difference check for the backward." The second is a two-minute addition and it changes the entire character of the round from a memory exercise into an engineering demonstration.
 
-**They connect the code to a number.** The strong answer to "why GQA" is not "it uses less memory" — it is "0.33 MB per token at 8 KV heads versus 2.62 MB at 64, so 32k context goes from 86 GB to 10.7 GB per request, which is the difference between one request per GPU and six." Every from-scratch topic in this section has such a number attached and the ones that appear most often are the KV-cache formula, the score-matrix size, the optimizer's 16 bytes per parameter, and the `~4 chars per token` conversion.
+**They connect the code to a number.** The strong answer to "why GQA" is not "it uses less memory" — it is "0.33 MB per token at 8 KV heads versus 2.62 MB at 64, so 32k context goes from 86 GB to 10.7 GB per request — an 8× cut that turns a single request which will not fit on an 80 GB GPU at all into eight that fit in the same KV budget." Every from-scratch topic in this section has such a number attached and the ones that appear most often are the KV-cache formula, the score-matrix size, the optimizer's 16 bytes per parameter, and the `~4 chars per token` conversion.
 
 **They scope out loud and admit what they skipped.** "I've written the naive cache; production allocates in blocks because of fragmentation, which is what PagedAttention addresses" turns an omission into a demonstration of range. Silence about it turns the same omission into a gap.
 
@@ -2136,7 +2137,7 @@ The concrete rule I use: **call `.contiguous()` only immediately before an op th
 
 Two adjacent facts worth having. First, `torch.save` on a slice serializes the *entire underlying storage*, not the slice — `torch.save(big[0])` can write gigabytes. `.clone()` before saving. Second, NCCL collectives require contiguous buffers; if you hand `all_reduce` a non-contiguous tensor PyTorch will copy into a temporary, and that temporary is invisible in your memory accounting until it shows up as an OOM at exactly the moment gradients sync.
 
-**⚠ Trap:** confusing `is_contiguous()` with `channels_last`. A `(N,C,H,W)` tensor in `channels_last` memory format reports `is_contiguous() == False` under the default check but `is_contiguous(memory_format=torch.channels_last) == True`. Calling `.contiguous()` on it silently converts it back to `NCHW` and destroys the layout you deliberately chose for tensor-core convolution throughput. This matters for vision encoders in multimodal stacks — CLIP/SigLIP towers in a VLM — where the layout choice can be worth 20–30% on the vision path.
+**⚠ Trap:** confusing `is_contiguous()` with `channels_last`. A `(N,C,H,W)` tensor in `channels_last` memory format reports `is_contiguous() == False` under the default check but `is_contiguous(memory_format=torch.channels_last) == True`. Calling `.contiguous()` on it silently converts it back to `NCHW` and destroys the layout you deliberately chose for tensor-core convolution throughput. This matters for *convolutional* vision backbones — ResNet/ConvNeXt-style encoders and conv stems in a multimodal stack — where `channels_last` plus AMP can be worth 20–30%, because cuDNN's tensor-core convolution kernels want NHWC and will otherwise transpose for you on every call. Be careful not to overclaim it for ViT-based towers (CLIP/SigLIP): after the single patch-embedding conv they are matmul-dominated, so the memory format buys far less there.
 
 ### Walk me through dtype discipline in a modern stack — fp32, tf32, bf16, fp16, fp8 — and where promotion silently bites.
 
@@ -2146,17 +2147,18 @@ fp32 is 1/8/23 — sign, exponent, mantissa. bf16 is 1/8/7: same exponent field 
 
 The rule I enforce: **bf16 for everything on Ampere and later; fp16 only if you are on hardware without bf16 or serving a model whose released weights were fp16 and you cannot re-tune.** The precision loss of bf16 is real but the range safety is worth more, and you delete the entire `GradScaler` failure surface.
 
-Promotion is where it bites. PyTorch type promotion is NumPy-like: mixing dtypes promotes to the "larger" one, and — critically — **Python scalars are treated as weak types that do not force promotion**, while 0-dim tensors of a concrete dtype do.
+Promotion is where it bites. PyTorch type promotion is NumPy-like and runs on a *category* ladder — bool < integer < floating < complex. The rule people get wrong: **Python scalars *and* 0-dim tensors are both "weak"** — they only force promotion when they sit in a *higher category* than the dimensioned operands, never merely because they carry a wider dtype in the same category. A dimensioned fp32 tensor does force promotion.
 
 ```python
 x = torch.ones(4, dtype=torch.bfloat16, device="cuda")
 (x * 2).dtype                                   # bfloat16  — Python scalar is weak
-(x * torch.tensor(2.0)).dtype                   # float32   — CPU fp32 tensor wins
-(x / x.sum()).dtype                             # bfloat16  — and the sum is bf16-accumulated
+(x * torch.tensor(2.0)).dtype                   # bfloat16  — a 0-dim fp32 tensor is weak too
+(x * torch.ones(4, device="cuda")).dtype        # float32   — a *dimensioned* fp32 tensor wins
+(x / x.sum()).dtype                             # bfloat16  — the reduction's OUTPUT is bf16
 x.sum(dtype=torch.float32).dtype                # float32   — what you actually wanted
 ```
 
-The third line is the one that costs you. Summing 4096 bf16 values with bf16 accumulation loses roughly `log2(4096)/2 ≈ 6` bits of the 7 you had; softmax denominators, RMSNorm variance, and loss reductions all do exactly this. Every normalization and every reduction in a low-precision network should accumulate in fp32 — that is why `LayerNorm` upcasts internally and why a hand-rolled RMSNorm that forgets `.float()` on the mean-square trains visibly worse.
+The fourth line is where the risk lives — though be precise about it, because the folklore overshoots. PyTorch's built-in CUDA reductions (`sum`, `mean`, `var`, `softmax`) already use an fp32 accumulator for bf16/fp16 inputs and only round the *result* back down, so a single `x.sum()` is safer than "bf16 accumulation" suggests. What is not safe is everything you assemble yourself: a hand-rolled accumulation loop, or a chain like `x.pow(2).mean(-1)` where every intermediate is *stored* in bf16 before the reduction ever sees it, or feeding a bf16-rounded denominator into the next op. Summing 4096 values with a genuine bf16 accumulator loses roughly `log2(4096)/2 ≈ 6` bits of the 7 you had. So: keep normalization and loss reductions in fp32 end to end, and pass `dtype=torch.float32` so the output stays fp32 too — that is why `LayerNorm` upcasts internally and why a hand-rolled RMSNorm that forgets `.float()` on the mean-square trains visibly worse.
 
 **⚠ Trap:** an `nn.Embedding` lookup or a `torch.arange` inside a model that produces fp32 while everything around it is bf16, silently promoting the residual stream back to fp32 and doubling activation memory. Under `autocast` this is masked because autocast casts matmul inputs anyway; outside autocast, in an inference path, it is a 2× memory regression with no error message. Add `assert h.dtype == torch.bfloat16` at two or three checkpoints in the block and it never happens again.
 
@@ -2168,7 +2170,7 @@ The mental model a backend engineer already owns: the GPU is a remote worker beh
 
 Ordinary Python/PyTorch CPU memory is *pageable* — the OS may move or swap those pages. A DMA engine cannot chase moving pages, so a copy from pageable memory is executed as: allocate a staging buffer in pinned memory, `memcpy` into it on the CPU (synchronous, blocking, at maybe 10 GB/s of CPU memcpy), then DMA from staging to device. `non_blocking=True` on a pageable source is therefore **a no-op that people believe is doing something** — the copy still blocks the calling thread.
 
-Pinned (page-locked) memory removes the staging step: the DMA engine reads host RAM directly at PCIe speed and the CPU is free immediately. So the two must go together: `pin_memory=True` on the DataLoader **and** `non_blocking=True` on the `.to(device)` call. Either alone buys you nothing.
+Pinned (page-locked) memory removes the staging step: the DMA engine reads host RAM directly at PCIe speed and the CPU is free immediately. So the two go together: `pin_memory=True` on the DataLoader **and** `non_blocking=True` on the `.to(device)` call. Be precise about what each one buys, because interviewers probe this: `non_blocking=True` on a pageable source buys you *nothing at all*; `pin_memory=True` without `non_blocking` still speeds the copy itself (no staging buffer, no CPU memcpy) but gives you no overlap, because the call still blocks until the DMA completes. Only the pair gives you a fast copy *and* a CPU free to run ahead.
 
 ```python
 loader = DataLoader(ds, batch_size=32, num_workers=8,
@@ -2205,7 +2207,7 @@ def sdpa_einsum(q, k, v, mask=None):
     return torch.einsum("bhqk,bhkd->bhqd", attn, v)   # (B,H,Tq,dh)
 ```
 
-What einsum gives you: correct dispatch to batched GEMM for two-operand contractions (it reshapes to `bmm` under the hood, so there is no performance penalty versus writing the matmul yourself), free broadcasting of size-1 axes, and readable code. What it does **not** give you: it does not fuse anything — `einsum(...)/sqrt(d)` is still two kernels; it does not avoid materializing the `(B,H,Tq,Tk)` score tensor, which is the entire reason FlashAttention exists; and for three-or-more-operand expressions PyTorch will pick a contraction order via the `opt_einsum` path when that package is available and otherwise contract left-to-right, which can be catastrophically wrong. `einsum("bi,ij,bj->b", x, W, y)` contracted left-to-right builds a `(B, j)` intermediate — fine — but reorder the operands and you can accidentally build a `(B, i, j)` tensor.
+What einsum gives you: correct dispatch to batched GEMM for two-operand contractions (it permutes and reshapes to `bmm` under the hood, so it is usually within noise of writing the matmul yourself — with the caveat that if the permutation it needs is not view-expressible it inserts a real `contiguous()` copy, so "einsum is free" is true only when the axis order already suits `bmm`), free broadcasting of size-1 axes, and readable code. What it does **not** give you: it does not fuse anything — `einsum(...)/sqrt(d)` is still two kernels; it does not avoid materializing the `(B,H,Tq,Tk)` score tensor, which is the entire reason FlashAttention exists; and for three-or-more-operand expressions PyTorch will pick a contraction order via the `opt_einsum` path when that package is available and otherwise contract left-to-right, which can be catastrophically wrong. `einsum("bi,ij,bj->b", x, W, y)` contracted left-to-right builds a `(B, j)` intermediate — fine — but reorder the operands and you can accidentally build a `(B, i, j)` tensor.
 
 **⚠ Trap:** using einsum in a hot decode loop and assuming it is as fast as a fused path. For attention specifically, `torch.nn.functional.scaled_dot_product_attention` dispatches to a FlashAttention or memory-efficient backend that never materializes the `T×T` scores. At `B=8, H=32, T=8192` that score tensor is 8·32·8192·8192·2 bytes = **34.4 GB** in bf16, per layer, and your einsum version OOMs on hardware where the fused version is comfortable. Write einsum to *explain* attention; call SDPA to *run* it.
 
@@ -2344,7 +2346,7 @@ Decision four: **pad to a multiple.** Tensor cores want the K and N dimensions o
 
 Worker hangs are almost always one of five things, and the reason they feel mysterious is that a deadlock in a forked child looks identical to "the GPU is just slow." Establish which it is first: run with `num_workers=0`. If the hang disappears, it is the worker layer; if it persists, you have a model or collective problem and you are debugging the wrong subsystem.
 
-**One: fork-inherited locks.** The default start method on Linux is `fork`, which copies the parent's memory including the *state of every lock*. If any thread in the parent held a lock at fork time — OpenMP's, a Rust tokenizer's Rayon pool, a CUDA context's internal mutex, a logging handler's — the child inherits a permanently-held lock and blocks on first use. Symptom: hangs immediately on the first batch of an epoch (workers respawn per epoch unless `persistent_workers=True`, which is why epoch two is a classic). Fix: `multiprocessing_context="spawn"` or `"forkserver"`, and never touch CUDA before the workers spawn.
+**One: fork-inherited locks.** The start method that causes this is `fork`, which copies the parent's memory including the *state of every lock*. (**📅 Volatile:** `fork` was CPython's long-standing Linux default, but CPython 3.14 switched the POSIX default to `forkserver`; confirm what your interpreter and PyTorch version actually use with `multiprocessing.get_start_method()` rather than assuming.) If any thread in the parent held a lock at fork time — OpenMP's, a Rust tokenizer's Rayon pool, a CUDA context's internal mutex, a logging handler's — the child inherits a permanently-held lock and blocks on first use. Symptom: hangs immediately on the first batch of an epoch (workers respawn per epoch unless `persistent_workers=True`, which is why epoch two is a classic). Fix: `multiprocessing_context="spawn"` or `"forkserver"`, and never touch CUDA before the workers spawn.
 
 **Two: CUDA in a forked worker.** CUDA contexts are not fork-safe. Any `.cuda()`, `torch.cuda.is_available()` that initializes, or a dataset holding a GPU tensor, and the child either hangs or raises `Cannot re-initialize CUDA in forked subprocess`. Datasets must be CPU-only; move to device in the main process.
 
@@ -2420,11 +2422,11 @@ for step, batch in enumerate(loader):
     opt.zero_grad(set_to_none=True)
 ```
 
-**Bug one: dividing by `ACC` after backward.** Gradients accumulate additively, so `ACC` micro-batches produce a gradient `ACC×` too large unless you scale the loss before `.backward()`. Doing it afterwards means iterating parameters and dividing — correct but slow — and doing it not at all means your effective learning rate is 16× what you configured, which usually shows up as a loss spike at step 200 that gets misdiagnosed as bad data.
+**Bug one: dividing by `ACC` after backward.** Gradients accumulate additively, so `ACC` micro-batches produce a gradient `ACC×` too large unless you scale the loss before `.backward()`. Doing it afterwards means iterating parameters and dividing — correct but slow. Doing it not at all is a real bug, but be precise about *why*, because this is exactly where an interviewer pushes back. With SGD it is literally a 16× learning rate. With Adam/AdamW the per-parameter update `m/(√v + ε)` is very nearly invariant to a constant rescaling of the gradient, so the damage arrives indirectly: the global norm is now 16× larger, `clip_grad_norm_(…, 1.0)` fires on *every* step and becomes the thing that actually sets your step size, and `ε` stops mattering. Either way the run is wrong, but "it's a 16× LR" is only the whole story for SGD-family optimizers — say the Adam caveat out loud.
 
 **Bug two: clipping before `unscale_`.** With fp16 the scaler multiplies the loss by ~65536 so small gradients survive. Clipping to norm 1.0 on *scaled* gradients clips essentially everything to nothing. `scaler.unscale_(opt)` divides gradients back in place; only then does the norm mean anything. Bf16 needs no scaler at all, which is the strongest practical argument for it.
 
-**Bug three: stepping the scheduler per micro-batch.** With `ACC=16` you burn through the entire LR schedule 16× too fast; the warmup completes in 1/16 the intended tokens and the cosine decay is at its floor a fifth of the way through training. This is the one that survives review most often because "the loss goes down."
+**Bug three: stepping the scheduler per micro-batch.** With `ACC=16` you burn through the entire LR schedule 16× too fast; the warmup completes in 1/16 the intended tokens and the cosine decay is already at its floor a *sixteenth* of the way through training, so fifteen-sixteenths of your run trains at the minimum LR. This is the one that survives review most often because "the loss goes down."
 
 **Bug four: not guarding for skipped steps.** When `GradScaler` detects inf/nan it *skips* `opt.step()` but you still call `sched.step()`. Over a run with many skips your LR schedule drifts ahead of your optimizer. It is small and usually acceptable; say that you know it rather than pretending it doesn't happen.
 
@@ -2542,7 +2544,7 @@ Silent quality regressions come from a short list, and the order matters because
 
 Clipping is a trust-region hack: it says "I believe the gradient *direction* but not its *magnitude*." `clip_grad_norm_(params, max_norm)` computes the global L2 norm across the concatenation of all parameter gradients — not per-tensor — and if that total exceeds `max_norm`, scales every gradient by `max_norm / total_norm`. Direction preserved exactly, length capped. Per-tensor clipping (`clip_grad_value_`) does not preserve direction and is almost never what you want for transformers.
 
-The global-norm detail matters under DDP and FSDP. The norm must be computed over *all* parameters across *all* ranks, which means an all-reduce of the squared norm before scaling. `torch.nn.utils.clip_grad_norm_` handles this correctly for DDP because gradients are already all-reduced by the time you call it; for FSDP you must use `model.clip_grad_norm_(...)`, the FSDP method, because each rank only holds a shard and a naive global norm would be the norm of a shard. Getting this wrong gives you a *different effective clip per rank*, which silently breaks the guarantee that all ranks apply the same update.
+The global-norm detail matters under DDP and FSDP. The norm must be computed over *all* parameters across *all* ranks, which means an all-reduce of the squared norm before scaling. `torch.nn.utils.clip_grad_norm_` handles this correctly for DDP because gradients are already all-reduced by the time you call it; for FSDP1 (`FullyShardedDataParallel`) you must use `model.clip_grad_norm_(...)`, the FSDP method, because each rank only holds a shard and a naive global norm would be the norm of a shard. Getting this wrong gives you a *different effective clip per rank*, which silently breaks the guarantee that all ranks apply the same update. **📅 Volatile:** under FSDP2 / `fully_shard` the gradients are `DTensor`s and the plain `torch.nn.utils.clip_grad_norm_` performs the cross-rank reduction for you — check which FSDP API your pinned version actually exposes before repeating either rule.
 
 Value: 1.0 is the near-universal default for LLM training and I would need a reason to deviate. The useful practice is to **log the pre-clip norm every step**. That series is one of the two or three most informative diagnostics you have:
 
@@ -2565,11 +2567,11 @@ but unallocated. If reserved but unallocated memory is large try setting
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.
 ```
 
-Four numbers, and each one answers a different question. **"Tried to allocate 2.00 GiB"** is the *incremental* request, not the problem — it tells you the granularity of what failed, and 2 GiB is a large-pool allocation, so this is an activation or a weight, not bookkeeping. **"Total capacity 79.15 GiB"** confirms you are on an 80 GB card and that the driver/context overhead has already eaten ~0.85 GiB. **"71.20 GiB allocated by PyTorch"** is live tensors — this is the number that tells you whether you have a *budget* problem. **"4.52 GiB reserved but unallocated"** is cached-but-free memory inside the allocator's segments; this is the number that tells you whether you have a *fragmentation* problem.
+Four numbers, and each one answers a different question. **"Tried to allocate 2.00 GiB"** is the *incremental* request, not the problem — it tells you the granularity of what failed, and 2 GiB is a large-pool allocation, so this is an activation or a weight, not bookkeeping. **"Total capacity 79.15 GiB"** confirms you are on an 80 GB card — and note that this is already the *usable* figure the driver reports after ECC and firmware reserve, which is why it is smaller than the number on the spec sheet and why you cannot reclaim the difference. **"71.20 GiB allocated by PyTorch"** is live tensors — this is the number that tells you whether you have a *budget* problem. **"4.52 GiB reserved but unallocated"** is cached-but-free memory inside the allocator's segments; this is the number that tells you whether you have a *fragmentation* problem.
 
 The diagnosis follows mechanically from the ratio of those last two. Here, 71.20 GiB is genuinely live out of ~79 GiB, and the 4.52 GiB of cached-free could not satisfy a contiguous 2 GiB request. That is a **budget problem with a fragmentation garnish**: even perfect defragmentation gets you 4.52 GiB of headroom, and you need more than that to be safe. Contrast the other shape — 30 GiB allocated, 45 GiB reserved-but-unallocated, failing on a 2 GiB request — which is pure fragmentation and where `expandable_segments:True` is the actual fix.
 
-What I do, in order. First, **is this reproducible at step 1 or does it appear later?** Step-1 OOM is a sizing problem; later OOM is a leak, a length outlier, or fragmentation from varying shapes. Second, `torch.cuda.max_memory_allocated()` at the end of a successful step gives me the true peak versus the 71.20 GiB steady state — if peak is much higher than steady, the transient (usually the backward pass's largest activation, or the optimizer's first step allocating `m` and `v`) is what I need to shrink. Third, I reach for the ladder in cost order: smaller micro-batch with more accumulation (free, costs nothing but a little launch overhead) → gradient checkpointing (costs ~30% step time, saves most activation memory) → `expandable_segments` (free, sometimes nothing) → 8-bit optimizer states (saves 8 bytes/param) → FSDP/ZeRO sharding (costs communication) → more GPUs.
+What I do, in order. First, **is this reproducible at step 1 or does it appear later?** Step-1 OOM is a sizing problem; later OOM is a leak, a length outlier, or fragmentation from varying shapes. Second, `torch.cuda.max_memory_allocated()` at the end of a successful step gives me the true peak versus the 71.20 GiB steady state — if peak is much higher than steady, the transient (usually the backward pass's largest activation, or the optimizer's first step allocating `m` and `v`) is what I need to shrink. Third, I reach for the ladder in cost order: smaller micro-batch with more accumulation (free, costs nothing but a little launch overhead) → gradient checkpointing (costs ~30% step time, saves most activation memory) → `expandable_segments` (free, sometimes nothing) → 8-bit optimizer states (Adam `m`+`v` go from 8 bytes/param to 2, so it saves 6) → FSDP/ZeRO sharding (costs communication) → more GPUs.
 
 **⚠ Trap:** calling `torch.cuda.empty_cache()` in an `except OutOfMemoryError` handler and retrying. It sometimes appears to work, which is why it spreads. It releases *entirely free* segments back to the driver, so it can only recover memory that was already cached-and-free, and it costs a full device synchronize, killing your launch pipeline. It never recovers fragmented-but-partially-used segments. If your recovery strategy is `empty_cache` + retry you have a system that intermittently runs at half throughput and still OOMs under load. Fix the budget.
 
@@ -2745,7 +2747,7 @@ What I read, in order:
 
 **3. The trace timeline** (Chrome trace / TensorBoard / Perfetto). Two rows matter: the CPU row showing op dispatch, and the CUDA row showing kernel execution. **Gaps in the CUDA row are the whole game.** A gap with a busy CPU row above it means launch-bound. A gap with an idle CPU row means you are waiting on the host — a sync, or the DataLoader.
 
-**4. `record_shapes=True` grouping.** Group the GEMMs by input shape and check whether your shapes are tensor-core friendly (multiples of 8/16 on the contracted dims). A vocabulary of 32000 versus 32768 is a real, measurable difference in the output projection.
+**4. `record_shapes=True` grouping.** Group the GEMMs by input shape and check whether your shapes are tensor-core friendly (multiples of 8/16 on the contracted dims, and ideally of the kernel's tile size). The canonical demonstration is nanoGPT's GPT-2 vocabulary: padding 50257 — an odd number, so the worst possible `N` — up to 50304, the next multiple of 64, is a large measured win in the output projection for 0.1% more FLOPs.
 
 **⚠ Trap:** profiling without `torch.cuda.synchronize()` and then hand-timing regions with `time.perf_counter()`. Wall-clock timers around async launches measure launch time, not execution time, and produce the beloved result "the forward pass takes 0.8 ms and the loss takes 42 ms." Either use the profiler, or use `torch.cuda.Event` pairs with `elapsed_time`, which record on the stream and measure the right thing.
 
@@ -2877,7 +2879,7 @@ def step(ids, pos):
 
 The consequence for KV cache design: because shapes must be static, you preallocate the cache at `max_seq_len` and index by position, rather than concatenating a growing tensor. That is not a coincidence — it is why production engines allocate fixed-capacity, position-indexed caches, and it is upstream of why paged KV caches exist.
 
-**💰 Math:** a 32-layer model at ~15 unfused kernels per layer is ~480 launches per decode step. At 7 µs of host CPU per launch that is 3.4 ms of host time per token. If the GPU's actual work is 4.2 ms (the bandwidth floor for a 14 GB bf16 model), the host can *just* keep up at batch 1 and cannot at all once you shorten GPU time by quantizing. Graph replay is one launch, so host time drops to well under 0.1 ms and you get the full 4.2 ms/token → **238 tok/s instead of ~130 tok/s** once the queue was starving. That is the win, and it is bigger the smaller your model.
+**💰 Math:** a 32-layer model at ~15 unfused kernels per layer is ~480 launches per decode step. At 7 µs of host CPU per launch that is ~3.4 ms of host time per token. If the GPU's actual work is 4.2 ms (the bandwidth floor for a 14 GB bf16 model), the host is *just* keeping up — with no margin at all, so a single stray `.item()` in the loop tips you into starvation. Now quantize the weights to fp8: GPU work halves to ~2.1 ms/token, the host's 3.4 ms becomes the binding constraint, and you are capped at ~294 tok/s instead of the ~478 tok/s the bandwidth would allow. Graph replay is one launch, so host time drops to well under 0.1 ms and you get the full 2.1 ms/token back — **~478 tok/s instead of ~294**. That is the win: it is bigger the smaller your model, and it grows every time you make the GPU faster.
 
 **⚠ Trap:** capturing a graph that includes an operation which allocates from the regular allocator, or reading `static_logits` into a Python variable and expecting it to persist. The output tensor is *reused* on every replay — clone it if you need to keep it. People store `static_logits` in a list across tokens and are baffled when every entry is identical.
 
@@ -2986,7 +2988,7 @@ This is cheap, it preserves the run through outlier batches, and — critically 
 
 **⚠ Trap:** restarting from an earlier checkpoint with a different data order "to skip the bad batch," without recording that you did it. You have now made the run irreproducible and you have quietly removed data. If you must skip, skip *in the loop* with a counter, so the intervention is in the logs and in the metrics.
 
-**💰 Math:** a 7-day pretraining run on 64 H100s at ~$2/GPU-hour is 64 × 24 × 7 × 2 = **$21,504**. Restarting from a 12-hour-old checkpoint burns 64 × 12 × 2 = **$1,536** of compute plus a day of calendar time. That asymmetry is exactly why the correct response to a spike is *measure first*: a fifteen-minute classification exercise is protecting a four-figure decision.
+**💰 Math:** a 7-day pretraining run on 64 H100s at ~$2/GPU-hour is 64 × 24 × 7 × 2 = **$21,504**. Restarting from a 12-hour-old checkpoint burns 64 × 12 × 2 = **$1,536** of compute plus a day of calendar time. That asymmetry is exactly why the correct response to a spike is *measure first*: a fifteen-minute classification exercise is protecting a four-figure decision. **📅 Volatile:** the $2/GPU-hour figure is a placeholder — re-derive with your own contracted rate, the arithmetic is what matters.
 
 ### Here's a training step with six planted bugs. Find them.
 
@@ -3016,7 +3018,7 @@ for batch in loader:
 
 **Bug 4 — the causal LM labels are not shifted.** `cross_entropy(logits, x)` asks the model to predict position `t` from position `t`, which it can see. The loss will drop to near zero and look wonderful. It should be `logits[:, :-1]` against `x[:, 1:]`, and padding positions should be `-100`, not the pad ID.
 
-**Bug 5 — clipping before `scaler.unscale_(opt)`.** Gradients are still scaled by ~65536, so clipping to norm 1.0 annihilates them. Every step becomes a step of magnitude `lr × (1/‖g‖)` in a nearly random direction. Fix: `scaler.unscale_(opt)` immediately before the clip.
+**Bug 5 — clipping before `scaler.unscale_(opt)`.** Gradients are still scaled by ~65536, so the global norm you compute is ~65536× too large, the clip coefficient fires on every single step, and every gradient is renormalized to norm 1.0 regardless of its true magnitude. `scaler.step()` then unscales, leaving an update ~65536× smaller than intended. The *direction* is preserved — that is what norm clipping does — but all magnitude information is destroyed and your effective step size is set by the scaler rather than by your LR. Fix: `scaler.unscale_(opt)` immediately before the clip.
 
 **Bug 6 — `total_loss += loss` retains the graph.** Linear memory growth, OOM in a few hundred steps, traceback pointing at an innocent matmul. Fix: `+= loss.detach()`.
 
@@ -3298,7 +3300,7 @@ The gates, in the order data flows and therefore the order I check:
 
 **🗣 Say this in the room:** "Corpus, retrieved, ranked, read, stated. Recall gates precision gates faithfulness — I never look at faithfulness before I've established that recall is high, because a faithfulness score computed over context that doesn't contain the answer is measuring the wrong thing."
 
-**📄 Paper:** Es et al. (2023) — *RAGAS* packaged this metric set (context recall, context precision, faithfulness, answer relevance) as a reference-light evaluation suite, which is why those four names are now the lingua franca in interviews. Know the definitions even if you compute them yourself; the names are what the interviewer will use.
+**📄 Paper:** Es et al. (2023) — *RAGAS: Automated Evaluation of Retrieval Augmented Generation* introduced the reference-light idea and three metrics: **faithfulness**, **answer relevance** and **context relevance**. Context **precision** and context **recall** — the two names you will hear most often in interviews — came with the open-source `ragas` framework rather than the paper itself. Worth knowing the split, because a research-literacy interviewer may ask which metrics were in the paper. Know the definitions even if you compute them yourself; the names are what the interviewer will use.
 
 **⚠ Trap:** reporting a single "RAG accuracy" number. It cannot route you. Two systems at 60% accuracy where one has recall 0.95/faithfulness 0.63 and the other has recall 0.62/faithfulness 0.97 need completely opposite fixes — the first needs a better generator or better context construction, the second needs a better retriever. Refusing to be routed by a scalar is the senior move.
 
@@ -3625,11 +3627,11 @@ Then read that pair cold. The failure patterns that produce a confusable pair:
 
 **Parameter names that lie.** `id` that is actually an email; `date` that must be ISO-8601 but is described as "the date"; `limit` that is capped server-side at 10 but documented as unbounded. Encode constraints in the JSON Schema, not the prose — `"enum"`, `"pattern"`, `"format"`, `"maximum"` — because the schema is what constrained decoding enforces. Prose is advice; schema is law.
 
-**Too many tools.** Beyond roughly 15–20 tools, selection accuracy degrades measurably for most models. The fix is hierarchical: a small set of top-level tools, with a `list_available_operations` or namespaced sub-tools, or retrieval over tool definitions so only the relevant 8 are in the prompt.
+**Too many tools.** Past a few dozen tools, selection accuracy degrades measurably for most models; the working rule of thumb people quote is somewhere around 15–20. **📅 Volatile:** that threshold is a property of the model generation you are on, not a law — each generation handles more, so measure it on your own tool set rather than quoting a number. The fix is hierarchical: a small set of top-level tools, with a `list_available_operations` or namespaced sub-tools, or retrieval over tool definitions so only the relevant 8 are in the prompt.
 
 **🗣 Say this in the room:** "Before I touch the model I'd write out the confusion matrix over tool choices. If the errors concentrate on one pair, that's a description ambiguity and I fix it with a sentence saying explicitly when *not* to use each — which is the clause almost every tool description is missing. Swapping to a bigger model to fix a spec problem is expensive and it doesn't converge."
 
-**📐 Numbers you must know:** tool definitions are prompt tokens on every single call. Twenty tools with verbose schemas is easily 4,000–6,000 tokens. At $3/Mtok input and 500k agent calls/month with 6k tokens of definitions, that is 500,000 × 6,000 = 3e9 tokens = $9,000/month **just to describe your tools**, before any conversation content. With prefix caching at a 90% read discount it drops to ~$900. That arithmetic is why tool definitions belong at the very front of a cached prefix and why nobody should be casually adding a 21st tool.
+**📐 Numbers you must know:** tool definitions are prompt tokens on every single call. Twenty tools with verbose schemas is easily 4,000–6,000 tokens. At $3/Mtok input and 500k agent calls/month with 6k tokens of definitions, that is 500,000 × 6,000 = 3e9 tokens = $9,000/month **just to describe your tools**, before any conversation content. With prefix caching at a 90% read discount it drops to ~$900. **📅 Volatile:** the $3/Mtok input rate and the cache-read discount are illustrative and move — recompute against your provider's current table; the ratio is the point, not the absolute. That arithmetic is why tool definitions belong at the very front of a cached prefix and why nobody should be casually adding a 21st tool.
 
 ### The agent runs 40 turns and then hits max_turns. What's your instrumentation plan?
 
@@ -3807,7 +3809,7 @@ Break the bill into `calls × (input_tokens × price_in + output_tokens × price
 
 **🔍 Failure taxonomy as a decision procedure:** (1) plot calls/day, input tokens/call, cached-input ratio, output tokens/call, and model mix, all on one dashboard with the deploy markers overlaid. (2) Whichever line has the step, that is the branch. (3) If two lines step at the same timestamp, it is one deploy — go read that diff. (4) If a line ramps rather than steps, it is data or session growth, not a deploy.
 
-**⚠ Trap:** attacking cost with a smaller model before you have found the factor that moved. Downgrading the model when the actual bug is a cache kill saves 30% and degrades quality, when fixing the prefix ordering saves 88% and degrades nothing. Always find the factor first. I have seen a team ship a quality regression to "fix" a cost incident whose root cause was a timestamp.
+**⚠ Trap:** attacking cost with a smaller model before you have found the factor that moved. Downgrading the model when the actual bug is a cache kill saves 30% and degrades quality, when fixing the prefix ordering saves ~79% of the input-token cost on that block — that is the $0.036 → $0.0077 arithmetic above — and degrades nothing. Always find the factor first. I have seen a team ship a quality regression to "fix" a cost incident whose root cause was a timestamp.
 
 **💰 Math on retries specifically:** naive `retry(3)` on a request costing $0.04 turns a degraded-dependency window into 4× spend on the affected fraction. If 20% of a 500k-call day is affected: 100,000 × 3 extra attempts × $0.04 = **$12,000** for one bad afternoon. Add jitter, add a circuit breaker, add a budget cap per request, and cap total attempts across nested layers.
 
@@ -3841,21 +3843,24 @@ RETRYABLE = (TimeoutError, ConnectionError)
 
 def call_with_retry(fn, *, attempts=3, base=0.5, cap=8.0, deadline=None):
     for i in range(attempts):
+        last = i == attempts - 1
         try:
             return fn()
         except RETRYABLE:
-            pass
+            if last: raise                                    # re-raise inside the handler
+            wait = min(cap, base * 2**i) * random.random()     # full jitter
         except RateLimited as e:
-            wait = e.retry_after or min(cap, base * 2**i)
-            _sleep(wait, deadline); continue
+            if last: raise
+            wait = e.retry_after or min(cap, base * 2**i) * random.random()
         except ServerError as e:
-            if e.status < 500: raise
-        else_wait = min(cap, base * 2**i) * random.random()   # full jitter
-        if i == attempts - 1: raise
-        _sleep(else_wait, deadline)
+            if e.status < 500 or last: raise                   # 4xx is never retryable
+            wait = min(cap, base * 2**i) * random.random()
+        _sleep(wait, deadline)
 ```
 
 plus, above it, a circuit breaker keyed per provider/model so that a sustained failure stops sending traffic entirely instead of hammering, and a metric on `retries_per_request` that alerts when it exceeds a threshold. **The metric matters more than the code**: an unnoticed 4× retry rate is a silent 4× bill.
+
+Two structural details in that wrapper are load-bearing, and they are what I check in someone else's retry code. The final-attempt `raise` must sit *inside* an `except` block: a bare `raise` placed after the `try/except` statement has no active exception in Python 3 and dies with `RuntimeError: No active exception to reraise`, masking the real error. And every exception branch must reach the exhaustion check — a `continue` in the rate-limit branch that skips it lets the function fall off the end of the loop and return `None`, which the caller will happily treat as a successful empty response.
 
 **⚠ Trap:** retrying inside a streaming handler after tokens have already been sent to the client. You cannot un-send them, so the user sees a partial answer followed by a restarted answer. Streaming retries are only safe before the first token; after that the correct behaviour is to fail the stream with an explicit error event.
 
@@ -3892,7 +3897,7 @@ def attn(q, k, v, mask):                 # q,k,v: (B, H, L, D); mask: (B, L)
     return torch.softmax(scores, dim=-1) @ v
 ```
 
-`scores` is `(B, H, L, L)` and `mask` is `(B, L)`. Broadcasting aligns from the right, so `(B, L)` becomes `(1, 1, B, L)` and then broadcasts against `(B, H, L, L)` — which either raises if `B != L`, or, in the case that will actually ruin your week, **silently succeeds when B happens to equal L**, applying the mask along the query axis instead of the key axis and mixing batch elements into head positions. Toy tests with batch 4 and sequence 4 pass. Production with batch 32 and sequence 512 raises, or worse, a validation run with batch 128 and seqlen 128 quietly produces garbage.
+`scores` is `(B, H, L, L)` and `mask` is `(B, L)`. Broadcasting aligns from the right, so `(B, L)` becomes `(1, 1, B, L)` and then broadcasts against `(B, H, L, L)` — which either raises if `B != L`, or, in the case that will actually ruin your week, **silently succeeds when B happens to equal L**, applying the mask along the query axis instead of the key axis — batch element *i*'s mask row lands on query position *i*, broadcast identically across every real batch element and head. Toy tests with batch 4 and sequence 4 pass. Production with batch 32 and sequence 512 raises, or worse, a validation run with batch 128 and seqlen 128 quietly produces garbage.
 
 Two more defects in three lines. The mask is presumably a 0/1 tensor; adding 1s and 0s to logits shifts them by a constant, and softmax is invariant to a constant added across the whole row — so a 0/1 additive mask is a **no-op on unmasked rows and a mild perturbation elsewhere**, not a mask. An additive mask must be 0 for keep and a large negative for drop. And there is no causal mask at all, so a decoder here attends to future tokens — which trains beautifully and generates nonsense, because at inference the future is not there.
 
@@ -4125,7 +4130,7 @@ The distribution shape is the diagnosis before I read a single line of code: **p
 
 The metrics say exactly why. Prompt tokens tripled, KV-cache usage went from 54% to 97%, and preemption started. The causal chain, stated in the terms that matter: KV cache is the binding resource on an LLM server, and its footprint per sequence is linear in sequence length. Tripling the mean prompt length roughly triples per-sequence KV footprint, so the number of sequences that fit concurrently drops by roughly the same factor. The scheduler can now admit maybe a third as many concurrent sequences at the same arrival rate — so the queue grows, and once the queue is non-trivial, waiting time dominates TTFT for everything at the tail. The 240 preemptions/minute confirms it: the engine is evicting running sequences to make room, and an evicted sequence must have its prefill recomputed when it resumes, which burns compute and makes the situation worse. That is a positive feedback loop, which is why it went from fine to catastrophic overnight rather than degrading gradually.
 
-**📐 Numbers you must know:** KV cache bytes per token = `2 (K and V) × n_layers × n_kv_heads × head_dim × bytes_per_element`. For a model with 32 layers, 8 KV heads (GQA), head_dim 128, in fp16: 2 × 32 × 8 × 128 × 2 = **131,072 bytes = 128 KB per token**. A 3.1k-token prompt holds 3,100 × 128 KB ≈ 397 MB; a 9.4k-token prompt holds ≈ 1.20 GB. On an 80 GB GPU with ~20 GB taken by weights, you have ~60 GB of KV budget: that is ~151 concurrent sequences before and ~50 after. Same hardware, one third the concurrency. Little's Law then gives you the queue: at 438 req/s with a mean service time of, say, 1.2 s you need 526 concurrent slots to have no queue at all — you have 50, so you are deeply oversubscribed and the tail is unbounded.
+**📐 Numbers you must know:** KV cache bytes per token = `2 (K and V) × n_layers × n_kv_heads × head_dim × bytes_per_element`. For a model with 32 layers, 8 KV heads (GQA), head_dim 128, in fp16: 2 × 32 × 8 × 128 × 2 = **131,072 bytes = 128 KiB per token**. A 3.1k-token prompt holds 3,100 × 131,072 B ≈ 406 MB (388 MiB); a 9.4k-token prompt holds ≈ 1.23 GB. On an 80 GB GPU with ~20 GB taken by weights, you have ~60 GB of KV budget: that is ~148 concurrent sequences before and ~49 after. Same hardware, one third the concurrency. Little's Law then gives you the queue: at 438 req/s with a mean service time of, say, 1.2 s you need 526 concurrent slots to have no queue at all — you have ~49, so you are deeply oversubscribed and the tail is unbounded.
 
 Now the actual root cause, which is upstream: **what tripled the prompt?** The candidates are a retrieval `k` increase, a chunk-size increase, tool-result bloat, a new few-shot block, conversation history that stopped being compacted, or a new system prompt. One config diff finds it. The fix is upstream (cut context) or capacity (more GPUs, or GQA/quantized KV cache to shrink per-token footprint) — but the *mitigation* right now is admission control: bound the queue and shed load with 429s so that requests fail fast instead of all timing out after 14 seconds.
 
@@ -4300,7 +4305,8 @@ Contract:
   clamp to capacity, update last_ts unconditionally.
 - Return (True, 0.0) if n_tokens were consumed, else (False, seconds_until_available).
 - n_tokens may exceed capacity -> must return (False, inf), never loop.
-- No locking, no I/O, no logging. Pure function on the dataclass. Python 3.11, typed.
+- No locking, no I/O, no logging. The only state it touches is the bucket's
+  own fields (it mutates them in place). Python 3.11, typed.
 
 Do not write tests. Do not write the class wrapper.
 ```
@@ -4484,11 +4490,13 @@ The behavior differs enormously; the underlying competence does not, and that is
 
 At an AI-native product company — Cursor's paid onsite project is the archetype, and the same tell shows up in Sierra, Harvey and Glean loops — **fluency with the tool is itself the artifact.** Not using it, or using it timidly, reads as someone who will not be productive in a codebase where everyone else is running agents. So I use it visibly and at scale: multi-file edits, agent mode on a scoped task, a rules file if the repo has conventions, a fast generate-review-fix cadence. But I keep every one of the verification behaviors — I still write tests first, still read diffs in the fixed order, still reject and say why. The rubric there is "productive *and* in control," not "productive."
 
-At Anthropic, DeepMind, xAI, HRT — tools banned, and I have to be honest that this is where two years of Cursor has cost me something real. The measured thing is unaided fluency: can you write multi-head attention, a KV cache, a BPE encoder, a beam search from memory without autocomplete filling in the loop bounds. There is no substitute for having drilled it. Practicing assisted work does not build this capability and mildly erodes it.
+At Anthropic, DeepMind, xAI, HRT — tools off in the coding round, and I have to be honest that this is where two years of Cursor has cost me something real. The measured thing is unaided fluency: can you write multi-head attention, a KV cache, a BPE encoder, a beam search from memory without autocomplete filling in the loop bounds. There is no substitute for having drilled it. Practicing assisted work does not build this capability and mildly erodes it.
 
 Microsoft's shape — one AI-assisted round and one raw round in the same loop — is the honest version of the industry's actual position, and I would say so if asked: nobody knows yet which correlates better with on-the-job performance, so the serious employers measure both.
 
 The practical consequence for preparation is that these are **two separate training regimens** and you cannot substitute one for the other. Assisted practice is prompt discipline, review speed, knowing the tool's failure modes. Unaided practice is typing algorithms cold with a timer. I schedule them on different days so I do not contaminate one with the other.
+
+**📅 Volatile:** every company-specific claim in this answer is a policy, not a law of nature, and these policies have moved fast in both directions over the last two years — several labs that once asked candidates not to touch AI at all have since loosened that, and several product companies have tightened. Treat the names above as a prior about *shape* (tool-fluent product loop versus unaided lab loop) and confirm the actual rules with your recruiter before the loop. Saying "I understood this round is unaided — is that right?" costs nothing.
 
 **⚠ Trap:** showing up to an AI-native company and doing the round entirely by hand to demonstrate rigor. I have seen this reasoning and it is backwards — at a company whose product is an AI coding tool, refusing to use one reads as either ideology or inability, and neither helps. Use it, and demonstrate control *through* the usage rather than through abstention.
 
@@ -4498,7 +4506,7 @@ The practical consequence for preparation is that these are **two separate train
 
 A rejection is the densest signal you will emit in the whole round, so it should not be a mumble and a keystroke. It should be a three-part sentence: **what it gave me, why it's wrong or wrong-for-here, what I'm doing instead.** Three clauses, ten seconds, and it demonstrates that you evaluated rather than pattern-matched.
 
-Correctness rejection: "It's catching `Exception` around the whole request and returning a default. That swallows a `CancelledError`, so when the client disconnects, this task never unwinds and I leak the upstream call. I'm narrowing that to the two exceptions I actually expect and letting the rest propagate."
+Correctness rejection: "It's wrapping the whole request in a bare `except:` and returning a default. Since 3.8, `asyncio.CancelledError` inherits from `BaseException` rather than `Exception` specifically so that `except Exception` *won't* eat it — but a bare `except:` still does, so when the client disconnects this task never unwinds and I leak the upstream call. I'm narrowing that to the two exceptions I actually expect and letting the rest propagate. Even `except Exception` here is wrong for a second reason: it turns a timeout or a 500 into a default that the caller cannot distinguish from a legitimate empty result."
 
 Fit rejection — the more interesting kind, because the code is *right* and I am still declining it: "It gave me a threading lock around the counter. This whole path is single-threaded asyncio, so a lock buys nothing and costs a reader ten seconds working out whether there's a thread I don't know about. I'm dropping it and putting a comment saying the invariant is single-task access."
 
@@ -4592,7 +4600,7 @@ Then the second half, which is where the learning is: **watch the recording at 1
 
 Three things change, and none of them is "be more robotic" — the transcript is usually read by a human afterward, so an answer optimized purely for a machine grader reads badly to the person making the decision. What actually changes is that **implicit signals stop working.**
 
-**Rapport shortcuts are gone.** With a human you can nod at shared context — "you know how it is with vector DBs" — and get credit for the unstated part. An agent interviewer does not grant unstated credit and will not laugh at the joke that buys you three seconds of thinking time. Everything you want scored has to be said. The practical adjustment is that I state conclusions I would normally let hang: not "obviously we'd cache the prefix" but "we'd cache the prefix, because the system prompt is 12k tokens and unchanged across calls, so at a 90% cached-input discount that's the single biggest cost lever available."
+**Rapport shortcuts are gone.** With a human you can nod at shared context — "you know how it is with vector DBs" — and get credit for the unstated part. An agent interviewer does not grant unstated credit and will not laugh at the joke that buys you three seconds of thinking time. Everything you want scored has to be said. The practical adjustment is that I state conclusions I would normally let hang: not "obviously we'd cache the prefix" but "we'd cache the prefix, because the system prompt is 12k tokens and unchanged across calls, so at a cached-input discount on the order of 90% — the exact figure is provider-specific and I'd re-check it — that's the single biggest cost lever available."
 
 **Structure is load-bearing.** Agent graders (and the humans reading their summaries) score against a rubric with named dimensions. Answers that map onto that structure get scored on every dimension; answers that are one flowing paragraph get scored on whichever dimensions the grader happened to extract. So I signpost aggressively: "Three parts — the mechanism, the failure mode, the cost." Then deliver three parts. This is good practice with humans too; it is close to mandatory with an agent.
 
@@ -4793,9 +4801,9 @@ But the exceptions are specific and they are on this list, so the decision rule 
 
 **Skip the general grind entirely if your list is** Cursor, Notion, Figma, Sierra, Harvey, Glean, Ramp, most AI-native startups, and frontier-lab applied teams. Those loops spend their coding time on §72's from-scratch drills and on real-codebase work. Time moved from LeetCode into evaluation, retrieval and agent-harness fluency is a straight upgrade.
 
-**Everyone does the weighted list, regardless.** The fifteen structures in the rest of this section are not there as interview trivia — they are the actual data structures inside the systems you will be asked to design and debug. HNSW traversal *is* a graph search question. Prefix-affinity routing *is* consistent hashing. The p99 dashboard *is* a streaming quantile sketch. A candidate who can implement these is not doing DSA prep, they are demonstrating that they understand their own infrastructure one layer down. That transfers to system design in a way that "invert a binary tree" never did.
+**Everyone does the weighted list, regardless.** The fourteen structures in the rest of this section are not there as interview trivia — they are the actual data structures inside the systems you will be asked to design and debug. HNSW traversal *is* a graph search question. Prefix-affinity routing *is* consistent hashing. The p99 dashboard *is* a streaming quantile sketch. A candidate who can implement these is not doing DSA prep, they are demonstrating that they understand their own infrastructure one layer down. That transfers to system design in a way that "invert a binary tree" never did.
 
-**📐 Numbers you must know:** a defensible allocation for a 10-week prep, if your target list has no algorithmic-round companies: 0 hours of general LeetCode, ~15 hours on the weighted list below (fifteen structures × ~1 hour), and the rest into §72 drills, evaluation and design. If your list includes Perplexity or big-tech applied: add 60–80 hours of pattern-based practice, and start it early, because it is the one component that does not compress.
+**📐 Numbers you must know:** a defensible allocation for a 10-week prep, if your target list has no algorithmic-round companies: 0 hours of general LeetCode, ~14 hours on the weighted list below (fourteen structures × ~1 hour), and the rest into §72 drills, evaluation and design. If your list includes Perplexity or big-tech applied: add 60–80 hours of pattern-based practice, and start it early, because it is the one component that does not compress.
 
 **🗣 Say this in the room** — when asked whether you have been doing algorithm prep: "I've focused on the structures that actually appear in this stack — heaps for top-k, LSH for dedup, HNSW traversal, streaming quantiles for the latency dashboard, consistent hashing for prefix affinity. I can write any of those cold. If you want a general algorithms round I'll do it, but I'd rather show you the ones I use."
 
@@ -5159,11 +5167,12 @@ class NGramWindow:
             self.counts[g] += 1
 
     def would_repeat(self, token, threshold=1):
-        cand = tuple(list(self.buf)[-(self.n - 1):] + [token])
-        return self.counts.get(cand, 0) >= threshold
+        tail = list(self.buf)[-(self.n - 1):] if self.n > 1 else []
+        cand = tuple(tail + [token])            # NOT buf[-(n-1):] unguarded: at n=1
+        return self.counts.get(cand, 0) >= threshold   # that is buf[-0:] == the whole buffer
 ```
 
-Two details I would name. The `del` when a count hits zero is not cosmetic — without it the `Counter` grows monotonically for the life of the stream and you have rebuilt the unbounded-map bug inside a structure whose entire purpose is boundedness. And the "what leaves" step is where sliding-window implementations are almost always wrong: adding on the right is obvious, correctly identifying and removing the aggregate contribution of what fell off the left is not, particularly when the aggregate spans multiple elements as an n-gram does.
+Three details I would name. The `self.n > 1` guard on the tail slice is the one I would point at, because it is the exact bug this section is about: `list(buf)[-(n - 1):]` looks obviously right and is silently wrong at `n = 1`, where `-0` is `0` and the slice returns the *entire* buffer instead of the empty suffix, so a unigram repetition guard never fires. Negative-index slicing with a computed offset is a place to always check the zero case. The `del` when a count hits zero is not cosmetic — without it the `Counter` grows monotonically for the life of the stream and you have rebuilt the unbounded-map bug inside a structure whose entire purpose is boundedness. And the "what leaves" step is where sliding-window implementations are almost always wrong: adding on the right is obvious, correctly identifying and removing the aggregate contribution of what fell off the left is not, particularly when the aggregate spans multiple elements as an n-gram does.
 
 **Where the window abstraction shows up elsewhere in this stack:** a rolling token-per-minute count for rate limiting (sum over a time window, which needs timestamped entries rather than a fixed count); a rolling error rate for a circuit breaker; a rolling context-budget check before deciding to compact; a rolling perplexity or repetition score for a degeneracy detector.
 
@@ -5188,7 +5197,7 @@ def edit_distance(a, b):
     return prev[-1]
 ```
 
-O(len(a) · len(b)) time, O(min) space with the rolling row, which is the version to write — the full matrix is only needed if you must reconstruct the alignment, and you should say that rather than silently choosing.
+O(len(a) · len(b)) time and O(len(b)) space with the rolling row, which is the version to write; swap the arguments up front so `b` is the shorter string and that becomes O(min(len(a), len(b))). The full matrix is only needed if you must reconstruct the alignment, and you should say that rather than silently choosing.
 
 **Why real diff tools do not use this.** Three reasons, and the third is the one that matters for code agents.
 
@@ -5291,7 +5300,7 @@ What I would actually build is **tail-based sampling with per-class rates**:
 
 The mental model: **prefix caching turns a stateless service into a stateful one, and the moment you have per-replica state, your load balancer's round-robin becomes a cache-invalidation machine.** If a request whose 12k-token system prompt is warm on replica 3 gets routed to replica 7, you pay full prefill again. So the routing key stops being "nothing" and becomes a hash of the prompt prefix.
 
-Consistent hashing is the standard answer: hash each replica to multiple points on a 2^32 ring (virtual nodes), hash the request's prefix, walk clockwise to the first replica point. **📄 Paper:** Karger and colleagues (1997) — consistent hashing, which replaced modulo-N assignment specifically because adding one node under `hash % N` remaps nearly every key.
+Consistent hashing is the standard answer: hash each replica to multiple points on a fixed-width hash ring — 2^32 in the classic descriptions, 2^64 in the code below (virtual nodes) — hash the request's prefix, walk clockwise to the first replica point. **📄 Paper:** Karger and colleagues (1997) — consistent hashing, which replaced modulo-N assignment specifically because adding one node under `hash % N` remaps nearly every key.
 
 ```python
 import bisect, hashlib
@@ -5319,7 +5328,7 @@ class Ring:
 
 **Three things I would raise unprompted**, because this is where the design is actually won:
 
-*Virtual nodes are mandatory.* With one point per replica the load variance is brutal — you routinely get 2–3× imbalance across 10 nodes. 100–200 vnodes per replica brings the standard deviation of load to a few percent. This is the most common omission.
+*Virtual nodes are mandatory.* With one point per replica the load variance is brutal — you routinely get 2–3× imbalance across 10 nodes (the expected max arc for N random points is H_N/N of the ring, so at N = 10 that is ~2.9× the mean). Load imbalance falls as 1/√vnodes, so 100–200 vnodes per replica gets the standard deviation of load to roughly 7–10% — good enough, and the reason 100–200 is the number everyone uses. This is the most common omission.
 
 *Pure affinity creates hot spots.* If 60% of traffic shares one system prompt, that prefix hashes to one replica and that replica melts while nine idle. So affinity must be **bounded**: route to the affine replica *unless* its queue depth exceeds a threshold, then fall back to the least-loaded — "consistent hashing with bounded loads." The fallback costs you a cache miss and saves you a queueing collapse, and that trade should be explicit and tunable.
 

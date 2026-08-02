@@ -37,7 +37,7 @@ Because everything in your training says: build the vertical slice, get it worki
 
 LLM output breaks that assumption in a specific way: **it is fluent regardless of whether it is correct.** A wrong summary reads exactly like a right one. A hallucinated citation has the same typographic confidence as a real one. Your eyes are not a correctness oracle anymore, so the "get it working, then test" loop silently becomes "get it plausible, then ship." I have seen this produce a document-extraction service that was 61% field-accurate in production while everyone on the team believed it was "basically working," because the demo inputs were the four PDFs the engineer had open while developing.
 
-The second thing that goes wrong is worse and more subtle: **without a baseline you cannot detect a regression, so you optimize by anecdote.** The loop becomes "PM forwards a bad output → engineer adds a sentence to the system prompt → the bad output goes away → ship." Nobody checks whether that sentence broke eleven other cases, because there is nothing to check against. Prompts under this regime accumulate scar tissue: I have inherited a 4,000-token system prompt where the last 1,200 tokens were fourteen accreted "IMPORTANT: never do X" clauses, half of which contradicted each other, none of which anyone dared delete because nobody knew what they were load-bearing for. That prompt cost $0.012 per call at $3/Mtok just in accumulated instructions, at 400k calls/day is $4,800/month, and roughly a third of it was dead weight — but with no eval set, deleting any of it was an unbounded risk.
+The second thing that goes wrong is worse and more subtle: **without a baseline you cannot detect a regression, so you optimize by anecdote.** The loop becomes "PM forwards a bad output → engineer adds a sentence to the system prompt → the bad output goes away → ship." Nobody checks whether that sentence broke eleven other cases, because there is nothing to check against. Prompts under this regime accumulate scar tissue: I have inherited a 4,000-token system prompt where the last 1,200 tokens were fourteen accreted "IMPORTANT: never do X" clauses, half of which contradicted each other, none of which anyone dared delete because nobody knew what they were load-bearing for. That prompt cost $0.012 per call at $3/Mtok for its 4,000 tokens, which at 400k calls/day is $4,800/day — roughly $144k/month — and about a third of it (the ~1,200 tokens of accreted clauses, some $0.0036 per call) was dead weight — but with no eval set, deleting any of it was an unbounded risk.
 
 Third: the pipeline-first order defers the hardest question — *what does good look like* — past the point where the architecture is fixed. If you discover at week six that the real metric is "did the user accept the edit without modification," and you built a system that returns prose explanations, you rebuild.
 
@@ -47,7 +47,7 @@ The reframe I use: you already believe in this. You would never ship a payments 
 
 ### Give me your 60-second opener. An interviewer says "design a system that answers customer questions from our docs." What are the first words out of your mouth?
 
-This is the single highest-leverage rehearsed answer in the whole loop, because the most reliably-reported rejection cause in applied AI interviews is a candidate who describes a working architecture and cannot say how they'd know it works. Leading with measurement flips you from "built a demo" to "shipped a system" in the first thirty seconds, and the interviewer's notes change accordingly.
+This is the single highest-leverage rehearsed answer in the whole loop, because one of the most reliably-reported rejection causes in applied AI interviews is a candidate who describes a working architecture and cannot say how they'd know it works. Leading with measurement flips you from "built a demo" to "shipped a system" in the first thirty seconds, and the interviewer's notes change accordingly.
 
 **🗣 Say this in the room:** "Before architecture, let me pin down measurement, because it determines the architecture. First: what's the unit of success — is a 'good answer' one the user doesn't follow up on, one a support agent would have sent, or one that cites a real doc? Second: I'd build a golden set of 50–100 real questions stratified by intent and difficulty, sourced from your actual support logs, labelled with the correct answer and the doc that contains it. Third: my metrics are task success as the primary, with faithfulness — is every claim supported by a retrieved chunk — and context recall — did retrieval even surface the right doc — as diagnostics so I can localize a failure to retrieval versus generation. Fourth: cost per resolved question and p95 latency are first-class outputs of the same eval run, not an afterthought. Fifth: guardrails that must not regress — refusal rate on out-of-scope questions, and PII leakage. Then I'd run the dumbest baseline — top-5 BM25 plus a single prompt — get a number, and every design decision after that is a diff against it. Now, given that, here's the architecture I'd start with..."
 
@@ -556,7 +556,7 @@ Without a taxonomy, the improvement loop is: score is 0.72, try something plausi
 
 With a taxonomy, you know 31% of failures are stale documents, and the fix is a `valid_until` metadata filter — half a day of work by a data engineer, and it moves your score more than the three weeks did.
 
-**💰 Math on the trade:** three hours of one senior engineer reading traces, call it $150 of loaded cost. Against three weeks of two engineers making prior-driven changes — 240 engineer-hours, roughly $24,000 loaded — with a substantial chance of no durable improvement. The ratio is not close. And this understates it, because the taxonomy is durable: it keeps paying every time you get a new batch of failures, and it turns your eval report from a number into a diff of named categories.
+**💰 Math on the trade:** three hours of one senior engineer reading traces, call it $300 of loaded cost. Against three weeks of two engineers making prior-driven changes — 240 engineer-hours, roughly $24,000 loaded — with a substantial chance of no durable improvement. The ratio is not close. And this understates it, because the taxonomy is durable: it keeps paying every time you get a new batch of failures, and it turns your eval report from a number into a diff of named categories.
 
 The second cost is strategic, and it's the one that matters at senior level. Without error analysis you cannot tell an *AI problem* from a *data problem* from a *product-definition problem*. In my experience the split on a real enterprise deployment is roughly: 40% data and corpus issues, 25% retrieval, 20% product definition (the users wanted something different from what was specified), 15% actual model capability. If you believe you have a model problem when you have a corpus problem, you will escalate to a more expensive model, get a 2-point lift, triple your inference bill, and still have the corpus problem.
 
@@ -614,7 +614,7 @@ def score_sql(pred_sql: str, case) -> dict:
 
 Three design points that make this work in practice. **The fixture database must be adversarial**, not empty and not tiny — it needs rows that distinguish an inner join from a left join (customers with zero orders), rows that distinguish `SUM` from `COUNT`, NULLs in the columns being aggregated, and duplicate names to catch a missing `DISTINCT`. A fixture where every query returns the same three rows will score wrong queries as correct, and this is the single most common way execution-based SQL evals give false confidence. **Order-insensitivity must be per-case** — a query with `ORDER BY` in the intent must be order-checked, one without must not be. **Read-only enforcement is a gate, not a score**, because your eval harness will eventually execute a generated `DROP TABLE` and you want that to be structurally impossible.
 
-The same pattern generalizes: unit tests for generated code, a type-checker and linter run for generated TypeScript, a schema validator plus a real API call in a sandbox for generated tool arguments, `pandoc`/parser round-trips for generated markup. **The rule: wherever the artifact is executable, execute it. Execution is a perfect judge, it costs milliseconds, and it never drifts.**
+The same pattern generalizes: unit tests for generated code, a type-checker and linter run for generated TypeScript, a schema validator plus a real API call in a sandbox for generated tool arguments, `pandoc`/parser round-trips for generated markup. **The rule: wherever the artifact is executable, execute it. Execution is the closest thing to a perfect judge you get — it costs milliseconds and it never drifts — and its only real weakness is the quality of the fixture it runs against.**
 
 **⚠ Trap:** result-set comparison on a query that happens to return zero rows for both. Empty == empty scores 1.0, and a fixture where many gold queries return nothing will inflate your score badly. I require every SQL case's gold query to return at least one row, asserted at eval-set build time as a lint on the dataset itself. Linting your eval set is a real practice and almost nobody does it.
 ### Design the eval harness. I want the data model and the runner — assume you're writing it yourself rather than buying one.
@@ -706,7 +706,7 @@ Cadence design is a latency-and-cost budgeting problem exactly like any other CI
 
 **Tier 4 — weekly / on-demand.** The expensive stuff: long-horizon agent trajectories, adversarial suites, cross-model comparison sweeps, the full test split (which per the train/dev/test discipline you should not be running constantly, since running it constantly is how you start optimizing against it).
 
-**💰 Math for the tier-1 budget:** 50 cases × (3,000 input + 500 output tokens) at $3/$15 per Mtok = 50 × ($0.009 + $0.0075) = $0.83 per run. At 30 PRs/day plus reruns, call it 50 runs/day → $41/day → ~$1,250/month. That is a defensible number. The same suite at 500 cases with a judge on each is $4.50 + $4.50 = $9/run → $13,500/month, and it takes 25 minutes, and it will be turned off. **The size of the per-PR suite is a budget decision, and the honest way to make it is to compute both numbers and put them in the ADR.**
+**💰 Math for the tier-1 budget:** 50 cases × (3,000 input + 500 output tokens) at $3/$15 per Mtok = 50 × ($0.009 + $0.0075) = $0.83 per run. At 30 PRs/day plus reruns, call it 50 runs/day → $41/day → ~$1,250/month. That is a defensible number. The same suite at 500 cases with a judge on each is $8.25 of generation + $4.50 of judging = $12.75/run → about $19,000/month, and it takes 25 minutes, and it will be turned off. **The size of the per-PR suite is a budget decision, and the honest way to make it is to compute both numbers and put them in the ADR.**
 
 **⚠ Trap:** running the same suite at every tier. Then tier 1 is either too slow or tier 2 is too weak. The tiers should differ in *breadth and repetition*, not just in schedule — tier 1 is one seed over a stratified subset, tier 2 is three seeds over everything.
 
@@ -811,7 +811,7 @@ The number has to come from unit economics or it's arbitrary, and an arbitrary t
 
 **Step 4 — set the gate below it with headroom.** Production traffic has a fatter tail than your eval set. I set the eval gate at 60–70% of the derived ceiling: **hard block at $0.15 per case p95, warn at $0.10 p50.** The gap is the buffer for the long tail you didn't sample.
 
-Now the implementation detail that matters more than the number: **gate on the p95 across cases, not the mean.** A mean hides the pathological cases entirely. If 5% of your cases cost $1.20 because the agent looped, the mean barely moves and the p95 screams. And in a real product, the cost distribution is heavily skewed — I regularly see p99 at 8–15× p50 in agentic systems — so the mean is close to useless as a control.
+Now the implementation detail that matters more than the number: **gate on the p95 across cases, not the mean.** A mean hides the pathological cases entirely. If 5% of your cases cost $1.20 because the agent looped, that adds only about six cents to the mean — small enough to hide under any mean bound you set with headroom — while the p95 sits right on the pathology and screams. And in a real product, the cost distribution is heavily skewed — I regularly see p99 at 8–15× p50 in agentic systems — so the mean is close to useless as a control.
 
 Second implementation detail: **add a per-case hard ceiling that fails that individual case rather than the suite.** Any case exceeding, say, $0.50 is scored zero with `reason: "cost_ceiling_exceeded"` regardless of whether its answer was correct. This makes runaway loops show up as a *quality* failure, which is right — an answer that costs $2.40 to produce in a product priced at $2.00 is not a correct answer, it's a bug that happened to output the right string. Encoding that in the scorer is the cleanest way I know to make cost a real constraint rather than a chart.
 
@@ -911,7 +911,7 @@ First, the honest framing: **these are not eight products in one category, they'
 
 **Category 2 — eval platform first.** Braintrust (strong on the experiment-comparison and diff-review workflow, playground-driven iteration), W&B Weave (strong if your org already lives in Weights & Biases). You pick these when the primary problem is "we run many experiments and need to compare them, share results, and have non-engineers review outputs."
 
-**Category 3 — libraries and CLI harnesses.** promptfoo (config-file-driven, excellent for red-teaming and matrix comparisons across providers, trivially CI-able), DeepEval (pytest-shaped, ships a metric library), Inspect (from the UK AI Safety Institute, designed for rigorous model evaluation with solvers/scorers and strong agent-task support). You pick these when the primary problem is "I want evals in CI and I don't want a platform."
+**Category 3 — libraries and CLI harnesses.** promptfoo (config-file-driven, excellent for red-teaming and matrix comparisons across providers, trivially CI-able), DeepEval (pytest-shaped, ships a metric library), Inspect (from the UK AI Security Institute — renamed from the AI Safety Institute in early 2025 — designed for rigorous model evaluation with solvers/scorers and strong agent-task support). You pick these when the primary problem is "I want evals in CI and I don't want a platform."
 
 **📅 Volatile:** feature sets, pricing and even category boundaries here move every couple of quarters — verify current capabilities before your loop rather than reciting this table.
 
@@ -1290,7 +1290,7 @@ And the thing I would insist on adding: **pairwise alone cannot tell you both mo
 
 ### Design the scale for a direct-scoring judge. Why 0–5 and not 1–10, and how does it end up in the code?
 
-**📐 Numbers you must know:** the practical hierarchy is *binary < 0–5 with anchors < 1–10*, and the reason is resolution versus reliability. A 1–10 scale asks the judge to make distinctions it cannot make reliably — nobody, human or model, can articulate a falsifiable difference between a 6 and a 7 — so the extra granularity is pure noise. Empirically judges on 1–10 scales pile up on 7 and 8 and the effective resolution collapses to about three usable levels anyway, while the noise stays. A binary pass/fail is maximally reliable but throws away the partial-credit signal you need to see a change move the needle. A 0–5 scale with a written anchor for *every* level is the widely-reported sweet spot for human alignment — practitioner reports put Pearson correlation with human ratings around 0.89 on well-anchored 5-point rubrics versus materially worse for 10-point ones. Verify the exact figure against your own validation set rather than citing it; the *ordering* of the three options is the durable fact, the 0.89 is not something I would quote as a law.
+**📐 Numbers you must know:** ordered by *nominal resolution* the options run *binary < 0–5 with anchors < 1–10*, and reliability runs in exactly the opposite direction — which is the whole trade, and why the pick is the middle one. A 1–10 scale asks the judge to make distinctions it cannot make reliably — nobody, human or model, can articulate a falsifiable difference between a 6 and a 7 — so the extra granularity is pure noise. Empirically judges on 1–10 scales pile up on 7 and 8 and the effective resolution collapses to about three usable levels anyway, while the noise stays. A binary pass/fail is maximally reliable but throws away the partial-credit signal you need to see a change move the needle. A 0–5 scale with a written anchor for *every* level is the widely-reported sweet spot for human alignment — practitioner reports put Pearson correlation with human ratings around 0.89 on well-anchored 5-point rubrics versus materially worse for 10-point ones. Verify the exact figure against your own validation set rather than citing it; the *ordering* of the three options is the durable fact, the 0.89 is not something I would quote as a law.
 
 The mechanism behind this is worth stating because it makes the choice feel inevitable rather than folkloric. The judge emits a token. The distinction between the token "6" and the token "7" in the model's output distribution is not grounded in anything you specified — you never wrote down what separates them. The distinction between "the answer contains a claim not supported by the source" (score 1) and "all claims supported but one is incomplete" (score 3) *is* grounded, because you wrote the anchor. **Scale points without written anchors are hallucinated distinctions.** So the real rule is not "use 0–5" — it is "use as many points as you can write falsifiable anchors for," and in practice that is four to six.
 
@@ -1343,19 +1343,30 @@ Procedure — follow in order:
    5 = every claim supported by a quoted span.
    4 = every claim supported, but one span only partially covers its claim.
    3 = one minor unsupported claim that does not change the answer's meaning.
+   2 = more than one minor unsupported claim, or one unsupported claim that
+       changes the answer's emphasis but not its substance.
    1 = one unsupported claim that a reader would act on.
    0 = a claim that CONTRADICTS the context, or fabricated citation.
 
-Return JSON: {"claims": [{"claim": str, "span": str|null}], "reasoning": str, "score": int}
+Return JSON: {"evidence": [{"claim": str, "span": str|null}], "reasoning": str, "score": int}
 ```
 
 And the call, with the pieces I would not skip in production:
 
 ```python
+class Claim(BaseModel):
+    claim: str
+    span: str | None                     # verbatim span from CONTEXT, or None
+
+class FaithfulnessVerdict(BaseModel):    # field order is load-bearing, see below
+    evidence: list[Claim]
+    reasoning: str
+    score: int = Field(ge=0, le=5)
+
 JUDGE_PROMPT_VERSION = "faithfulness/v4"
 JUDGE_MODEL = "<pinned-model-id>"        # 📅 Volatile: pin an exact version string
 
-async def judge_faithfulness(context: str, answer: str) -> Verdict:
+async def judge_faithfulness(context: str, answer: str) -> FaithfulnessVerdict:
     resp = await client.messages.create(
         model=JUDGE_MODEL,
         max_tokens=1500,
@@ -1363,7 +1374,7 @@ async def judge_faithfulness(context: str, answer: str) -> Verdict:
         system=RUBRIC,                    # static → cacheable prefix
         messages=[{"role": "user", "content": render(context, answer)}],
     )
-    v = Verdict.model_validate_json(extract_json(resp.content[0].text))
+    v = FaithfulnessVerdict.model_validate_json(extract_json(resp.content[0].text))
     emit_metric("judge.score", v.score / 5,
                 tags={"prompt": JUDGE_PROMPT_VERSION, "model": JUDGE_MODEL})
     return v
@@ -1513,7 +1524,7 @@ def judge_pair_debiased(case, a, b):
 
 The design decision hiding in that last line: **an inconsistent pair is a tie, not a coin flip.** Resolving it randomly injects noise into your win rate; resolving it by "first-order wins" reintroduces the bias you just paid to remove. Treating it as a tie is the honest reading — the judge could not distinguish them — and it makes your win rate a statement about *decided* pairs, which you then report explicitly.
 
-**💰 Math:** at 500 pairs, 2.1k input and 400 output tokens per call, and reference pricing of $3/Mtok in and $15/Mtok out, one call costs 2100/1e6 × 3 + 400/1e6 × 15 = $0.0063 + $0.0060 = $0.0123. Single-order: 500 × $0.0123 = $6.15. Swapped: $12.30. Twelve dollars to make your migration decision trustworthy is not a conversation worth having — just do it. The calculus changes at production-sampling volume: 100k judged requests/day × $0.0123 × 2 = $2,460/day = about $74k/month, and *there* you drop swap-and-average for continuous monitoring and keep it only for the periodic decision runs. That asymmetry — debias the decisions, not the dashboard — is the practical rule.
+**💰 Math:** at 500 pairs, 2.1k input and 400 output tokens per call, and reference pricing of $3/Mtok in and $15/Mtok out — **📅 Volatile: verify current pricing before your loop** — one call costs 2100/1e6 × 3 + 400/1e6 × 15 = $0.0063 + $0.0060 = $0.0123. Single-order: 500 × $0.0123 = $6.15. Swapped: $12.30. Twelve dollars to make your migration decision trustworthy is not a conversation worth having — just do it. The calculus changes at production-sampling volume: 100k judged requests/day × $0.0123 × 2 = $2,460/day = about $74k/month, and *there* you drop swap-and-average for continuous monitoring and keep it only for the periodic decision runs. That asymmetry — debias the decisions, not the dashboard — is the practical rule.
 
 **⚠ Trap:** running swap-and-average and then reporting only the win rate, hiding the inconsistency rate. The inconsistency rate is the more informative number. An inconsistency rate above ~20% usually means the rubric is underspecified rather than the models being close — the judge doesn't know what you're asking. When I see 25% inconsistency my next move is to read ten inconsistent pairs by hand, and roughly every time the rubric turns out to be silent about the dimension on which the two responses actually differ.
 
@@ -1775,7 +1786,7 @@ The recipe, end to end:
 
 Often yes, and this is one of the more counterintuitive results in the area, so it is worth having the mechanism and the citation ready.
 
-**📄 Paper:** Verga et al. (2024), *Replacing Judges with Juries: Evaluating LLM Generations with a Panel of Diverse Models* — a panel of several smaller models from *different* families, aggregated by vote, correlated better with human judgments than a single large judge while costing substantially less (they report roughly an order-of-magnitude cost reduction). The key word is **diverse**: the benefit comes from decorrelated errors, so a panel of three checkpoints from one family buys you variance reduction only, while a panel spanning three families also cancels family-specific bias — self-preference and formatting preferences most of all.
+**📄 Paper:** Verga et al. (2024), *Replacing Judges with Juries: Evaluating LLM Generations with a Panel of Diverse Models* — a panel of several smaller models from *different* families, aggregated by vote, correlated better with human judgments than a single large judge while costing substantially less (their PoLL of three small models from different providers was **over 7× less expensive** than the single large judge, not an order of magnitude — quote the 7× figure, it is the one in the paper). The key word is **diverse**: the benefit comes from decorrelated errors, so a panel of three checkpoints from one family buys you variance reduction only, while a panel spanning three families also cancels family-specific bias — self-preference and formatting preferences most of all.
 
 The mechanism is ordinary ensembling. Each judge's verdict is signal plus bias plus noise. Averaging three judges reduces the noise term by roughly √3 if errors are independent. Bias only cancels if the biases differ, which is precisely why family diversity matters more than model size. A single frontier judge has less noise but its bias is undiluted, and bias is the term that does not shrink with more cases.
 
@@ -2163,7 +2174,7 @@ Two levers change this dramatically and you should know both cold. **Lever one i
 
 **⚠ Trap:** the phrase "we ran it on our eval set and it was better." Almost every internal eval set is 50 to 500 cases. At n = 200, the 95% CI half-width on a single accuracy near 70% is 1.96 × √(0.21/200) = 1.96 × 0.0324 = 6.4 points. Independent (unpaired) comparison of two such scores has SE = √(0.0324² + 0.0324²) = 0.0458, so you cannot resolve anything smaller than ~9 points. If your team reports unpaired deltas off a 200-case set and celebrates 3-point moves, you are running a random number generator with a dashboard attached.
 
-**💰 Math:** suppose you decide you genuinely need to detect a 2-point move and you go get 8,000 cases per arm. At a mid-tier frontier model, a case averaging 2,000 input + 600 output tokens costs 2,000/1e6 × $3 + 600/1e6 × $15 = $0.006 + $0.009 = $0.015. Two arms × 8,000 = 16,000 runs → $240 per sweep. That is cheap. The expensive part is *labeling* 8,000 cases: at a realistic $0.40/label for expert review, that's $3,200 one-time, and at 90 seconds per label it's 200 person-hours. **This is why the correct answer is usually "reduce the effect size you're trying to detect, or pair the design," not "buy more cases."**
+**💰 Math:** suppose you decide you genuinely need to detect a 2-point move and you go get 8,000 cases per arm. At a mid-tier frontier model, a case averaging 2,000 input + 600 output tokens costs 2,000/1e6 × $3 + 600/1e6 × $15 = $0.006 + $0.009 = $0.015. Two arms × 8,000 = 16,000 runs → $240 per sweep. That is cheap. The expensive part is *labeling* 8,000 cases: at a realistic $0.40/label for expert review, that's $3,200 one-time, and at 90 seconds per label it's 200 person-hours. **This is why the correct answer is usually "reduce the effect size you're trying to detect, or pair the design," not "buy more cases."** **📅 Volatile:** the $3/$15 per-Mtok input/output rate used for every dollar figure in this section is a stand-in for a mid-tier frontier model — re-check current list prices before quoting any of these totals.
 
 ### You mentioned pairing. Explain why it helps so much and redo the sample-size math for a paired design.
 
@@ -2173,9 +2184,9 @@ Concretely: define per-case d_i = correct₂(i) − correct₁(i) ∈ {−1, 0, 
 
     n = (z_{α/2} + z_β)² × Var(d) / δ² = 7.84 × (π_d − δ²) / δ²
 
-For a 2-point delta with 10% discordance: n = 7.84 × (0.10 − 0.0004) / 0.0004 = 7.84 × 249 = **1,952 cases**. Compare to 16,067 total evaluations unpaired. That is an **8× reduction in required data from a change in analysis, not a change in data collection.**
+For a 2-point delta with 10% discordance: n = 7.84 × (0.10 − 0.0004) / 0.0004 = 7.84 × 249 = **1,952 cases**. Compare to 2 × 8,067 = 16,134 cases unpaired. That is an **8× reduction in required data from a change in analysis, not a change in data collection.**
 
-The memorizable insight, and it's the one that separates people who've done this from people who've read about it: **paired sample size depends on the discordance rate, not on the accuracy level.** Two models that are both 90% accurate and agree on 96% of cases (π_d = 0.04) need n = 7.84 × 0.0396/0.0004 = 776 cases to detect 2 points. Two models that are both 60% accurate and disagree on 30% of cases need 7.84 × 0.2996/0.0004 = 5,872. Nearly identical accuracies, 7.5× different data requirements. So before you plan a study, **run 200 cases through both models and measure π_d** — that one cheap pilot tells you what the real study costs.
+The memorizable insight, and it's the one that separates people who've done this from people who've read about it: **paired sample size depends on the discordance rate, not on the accuracy level.** Two models that are both 90% accurate and agree on 96% of cases (π_d = 0.04) need n = 7.84 × 0.0396/0.0004 = 776 cases to detect 2 points. Two models that are both 60% accurate and disagree on 30% of cases need 7.84 × 0.2996/0.0004 = 5,872. Same 2-point effect being chased, 7.5× different data requirements — and the driver is the discordance rate, not the accuracy level. So before you plan a study, **run 200 cases through both models and measure π_d** — that one cheap pilot tells you what the real study costs.
 
 **🗣 Say this in the room:** "I always analyze model comparisons as paired, because the cases are the same and the case-difficulty variance cancels. Sample size then depends on the discordance rate, not the accuracy — at 10% discordance I need about 2,000 cases to resolve 2 points, versus about 16,000 unpaired. I'd run a 200-case pilot first just to measure discordance and cost the real study."
 
@@ -2204,7 +2215,8 @@ def mcnemar(a_correct: list[bool], b_correct: list[bool]) -> dict:
     c = sum(1 for x, y in zip(a_correct, b_correct) if y and not x)  # B only
     n = len(a_correct)
     if b + c == 0:
-        return {"b": 0, "c": 0, "p": 1.0, "delta": 0.0}
+        return {"b_only_A": 0, "c_only_B": 0, "discordant": 0,
+                "discordance_rate": 0.0, "delta": 0.0, "p": 1.0}
     res = binomtest(c, b + c, 0.5, alternative="two-sided")
     return {
         "b_only_A": b, "c_only_B": c, "discordant": b + c,
@@ -2260,7 +2272,7 @@ It matters exactly where you're most likely to be looking, which is small n and 
 
 The Wald interval is p̂ ± z√(p̂(1−p̂)/n), which is what everyone writes from memory. Its failure mode is structural: it centers on p̂ and its width is driven by p̂, so when p̂ hits 0 or 1 the width collapses to zero and the interval becomes the single point [1.0, 1.0]. Your agent passed 20 out of 20 tool-calling cases and Wald tells you the pass rate is 100% ± 0%. That is obviously false — 20 successes is entirely consistent with a true rate of 88%.
 
-Wilson fixes it by inverting the test rather than approximating the estimate. The interval is centered on a shrunk estimate (p̂ pulled toward 0.5 by z²/2n pseudo-counts) and never leaves [0,1]. For 20/20 at 95%, Wilson gives roughly [0.839, 1.0] — you can only claim the true rate is above ~84%. That is the honest statement.
+Wilson fixes it by inverting the test rather than approximating the estimate. The interval is centered on a shrunk estimate — (x + z²/2)/(n + z²), i.e. p̂ pulled toward 0.5 by z²/2 ≈ 1.92 pseudo-successes and 1.92 pseudo-failures at 95% — and never leaves [0,1]. For 20/20 at 95%, Wilson gives roughly [0.839, 1.0] — you can only claim the true rate is above ~84%. That is the honest statement.
 
 ```python
 from statsmodels.stats.proportion import proportion_confint
@@ -2275,7 +2287,7 @@ lo, hi = proportion_confint(count=20, nobs=20, alpha=0.05, method="wilson")
 
 I say you found approximately the number of winners you'd expect from a model that is identical to the baseline, and I'd show the arithmetic before saying anything else.
 
-If all 14 comparisons are null and independent, the probability of at least one p < 0.05 is 1 − 0.95¹⁴ = 1 − 0.4877 = **0.512**. A coin flip. The expected number of false positives is 14 × 0.05 = 0.7. Getting 3 is more than expected but not dramatically so — and this is before accounting for the fact that nobody ran exactly 14 comparisons. In practice you ran 14 benchmarks × 3 prompt variants × 2 temperature settings and reported the slice that looked good, which is 84 comparisons and an expected 4.2 false positives.
+If all 14 comparisons are null and independent, the probability of at least one p < 0.05 is 1 − 0.95¹⁴ = 1 − 0.4877 = **0.512**. A coin flip. The expected number of false positives is 14 × 0.05 = 0.7. Getting 3 is above that — under the pure-null model P(≥3) ≈ 3% — but that calculation only holds if exactly 14 comparisons were planned in advance, and nobody ever runs exactly 14. In practice you ran 14 benchmarks × 3 prompt variants × 2 temperature settings and reported the slice that looked good, which is 84 comparisons and an expected 4.2 false positives.
 
 The two corrections, and when I use each. **Bonferroni** tests each hypothesis at α/m: 0.05/14 = 0.00357. It controls the family-wise error rate — the probability of *any* false positive — and it is brutally conservative, which makes it exactly right for a **gating decision**. If a single regression on any of 14 guardrail benchmarks blocks the release, Bonferroni (or Holm, which is uniformly more powerful and just as easy) is the correct frame, because one false alarm costs you a blocked release.
 
@@ -2310,7 +2322,7 @@ There are four, they have very different magnitudes, and knowing which one domin
 
 **Minimum three, and I report a band, never a point.** Three is not a statistical principle; it is the smallest number that lets you distinguish "this run" from "this configuration," and it's the number I'll defend as the floor in any code review of an eval harness. With one run you literally cannot tell whether a 2-point move is the change you made or the dice. With three you get a crude spread. Five is better if the runs are cheap.
 
-The reporting format I enforce: **mean ± (max − min)/2 over seeds, alongside the case-sampling CI, with n and the seeds themselves recorded.** For example: `task_success = 71.3% (seeds: 70.1, 71.4, 72.4; run spread ±1.2pp) ± 3.2pp case-sampling CI (n=200, seeds=[0,1,2], model=<dated-snapshot>, prompt=v7, judge=faithfulness-v4 @ T=0)`. Reading that line, a reviewer knows immediately that the run-to-run noise is ±1.2 and the case noise is ±3.2, so **adding cases is the higher-leverage investment** — a fact that is invisible if you report `71.3%`.
+The reporting format I enforce: **mean ± (max − min)/2 over seeds, alongside the case-sampling CI, with n and the seeds themselves recorded.** For example: `task_success = 71.3% (seeds: 70.1, 71.4, 72.4; run spread ±1.2pp); case-sampling SE 3.2pp → 95% CI ±6.3pp (n=200, seeds=[0,1,2], model=<dated-snapshot>, prompt=v7, judge=faithfulness-v4 @ T=0)`. Reading that line, a reviewer knows immediately that the run-to-run spread is ±1.2 and the case-sampling standard error is 3.2 (a ±6.3-point 95% interval), so **adding cases is the higher-leverage investment** — a fact that is invisible if you report `71.3%`.
 
 There is a genuine budget question underneath: given a fixed number of model calls, do you spend them on more cases or more seeds per case? The variance of your mean estimate is approximately σ²_case/n + σ²_run/(n·k) where k is samples per case — note that *both* terms shrink with n, and only the second shrinks with k. **Therefore, when case variance dominates, more cases always beats more seeds.** The exception is high-variance agent tasks where a single case's outcome is nearly a coin flip; there, k > 1 per case is what makes any individual case informative at all, and the right metric is pass^k or the per-case success *rate*, not a single pass/fail.
 
@@ -2372,6 +2384,7 @@ from scipy.optimize import minimize
 def fit_bradley_terry(battles, models, reg=1e-4):
     """battles: list of (winner_idx, loser_idx). Returns Elo-scaled ratings."""
     M = len(models)
+    battles = np.asarray(battles, dtype=int)   # need an (N, 2) array for column slicing
 
     def nll(beta):
         # log-likelihood of observed outcomes under P(i>j) = sigmoid(b_i - b_j)
@@ -2402,11 +2415,11 @@ For confidence intervals, bootstrap the *battles*: resample the battle list with
 
 Nothing. And being able to say that crisply, with the arithmetic, is a strong signal in an interview.
 
-Eight Elo points is a predicted win rate of σ(8 × ln(10)/400) = σ(0.046) = **50.7%** — that is, out of 1,000 head-to-head battles you'd expect 507 wins instead of 500. The CI on a rating is what settles it. If a model has n battles, its rating's standard error scales roughly as 1/√n in β-space; in Elo units, a model with ~2,000 battles typically carries a bootstrap 95% CI of roughly ±10 to ±20 points on public leaderboards, and newly-added models with a few hundred battles carry much wider ones. Two models 8 points apart with ±12 CIs are **statistically indistinguishable**, and the honest reading of the leaderboard is not "rank 3 beats rank 5" but "ranks 2 through 7 are one undifferentiated tier."
+Eight Elo points is a predicted win rate of σ(8 × ln(10)/400) = σ(0.046) = **51.2%** — that is, out of 1,000 head-to-head battles you'd expect about 512 wins instead of 500. The CI on a rating is what settles it. If a model has n battles, its rating's standard error scales roughly as 1/√n in β-space; in Elo units, a model with ~2,000 battles typically carries a bootstrap 95% CI of roughly ±10 to ±20 points on public leaderboards, and newly-added models with a few hundred battles carry much wider ones. Two models 8 points apart with ±12 CIs are **statistically indistinguishable**, and the honest reading of the leaderboard is not "rank 3 beats rank 5" but "ranks 2 through 7 are one undifferentiated tier."
 
 The reporting discipline that follows: **read the rank column as a partial order, not a total order.** Good leaderboards publish a "rank (upper bound)" that groups models whose CIs overlap into the same tier, exactly so that people stop over-reading the ordering. When someone in a design review says "we should use model X because it's rank 2," my response is to ask for the CI and the number of battles, and about half the time the answer moves X into a tie with the cheaper option we were already using.
 
-**🗣 Say this in the room:** "Eight Elo points is a 50.7% predicted win rate. With typical bootstrap CIs of ten to twenty points on those ratings, that's a tie. I read leaderboard rank as a tier grouping, not an ordering — and then I run my own in-domain set anyway, because the Arena prompt distribution isn't my traffic."
+**🗣 Say this in the room:** "Eight Elo points is a 51.2% predicted win rate. With typical bootstrap CIs of ten to twenty points on those ratings, that's a tie. I read leaderboard rank as a tier grouping, not an ordering — and then I run my own in-domain set anyway, because the Arena prompt distribution isn't my traffic."
 
 **⚠ Trap:** rank instability being reported as model improvement. A model can move up three ranks with *zero* change to itself because two models above it were removed, or because the prompt mix shifted toward its strengths, or simply because it accumulated more battles and its estimate tightened. Rank deltas over time are among the least trustworthy numbers in the field.
 
@@ -2474,7 +2487,7 @@ These are the knowledge-and-reasoning trio and they occupy very different positi
 
 **MMLU-Pro** (2024, TIGER-Lab) is the direct response: harder questions, more reasoning-heavy, and critically **ten answer options instead of four**, which drops the random-guess floor from 25% to 10% and widens the usable range. It restored several tens of points of headroom and is the sensible replacement wherever someone reflexively asks for MMLU.
 
-**GPQA** — **📄 Paper:** Rein et al. (2023), *GPQA: A Graduate-Level Google-Proof Q&A Benchmark* — 448 questions in biology, physics and chemistry written by domain PhDs, with the explicit design goal that **skilled non-experts with unrestricted web access still fail them** (reported around 34%, versus roughly 65% for in-domain experts). The **Diamond** subset (198 questions) keeps only items where the expert answered correctly and the majority of non-experts did not — the highest-signal core. It is the current default for "does this model have real graduate-level reasoning."
+**GPQA** — **📄 Paper:** Rein et al. (2023), *GPQA: A Graduate-Level Google-Proof Q&A Benchmark* — 448 questions in biology, physics and chemistry written by domain PhDs, with the explicit design goal that **skilled non-experts with unrestricted web access still fail them** (reported around 34%, versus roughly 65% for in-domain experts). The **Diamond** subset (198 questions) keeps only items where both expert validators answered correctly and the majority of non-experts did not — the highest-signal core. It is the current default for "does this model have real graduate-level reasoning."
 
 And here is the thing about GPQA-Diamond that almost nobody says out loud: **198 items is small.** SE at 70% accuracy is √(0.21/198) = 3.3 points; 95% interval ±6.4. Every 2-point GPQA-Diamond delta you've seen in a launch post is noise unless it was paired and analyzed as such.
 
@@ -2877,7 +2890,7 @@ The design I'd whiteboard has four components and it looks like a data pipeline,
 ```
 $ evalctl compare --base run_8f21 --candidate run_9c04
 primary task_success: 74.2% vs 71.0%  delta +3.2pp  CI95 [+0.4, +6.1]  (paired bootstrap, n=400, 3 seeds)
-flips: 41 fail->pass, 28 pass->fail   discordance 17.2%   run-to-run band ±1.1pp
+flips: 24 fail->pass, 11 pass->fail   discordance 8.8%    run-to-run band ±1.1pp
 slices: multi_hop +9.1 [+1.2,+16.8] n=61 | extraction +0.4 [-2.9,+3.6] n=204 | ...
 guardrails (Holm): refusal_rate ok | schema_validity ok | p95_latency REGRESSED +0.5s
 cost: $0.021 vs $0.014 per case (+50%)
@@ -2934,7 +2947,7 @@ So evaluating an agent means answering three separate questions, and conflating 
 
 ### Give me the three levels of agent evaluation and tell me what each one is for.
 
-**Level 1 — end-to-end outcome.** Did the task get done? This is the only level that maps directly to a business metric, and it is the one your VP reads. The critical design choice is *what you assert on*: not the agent's final message, but the state of the world after the run. Did row `refunds` gain exactly one entry with `amount_cents = 8420` and `order_id = X`? Does the repo now compile and do the previously-failing tests pass? Is the calendar event on the right day with the right attendees? Outcome eval is binary or near-binary, it is cheap to compute if you built the environment right, and it is the number that gates a launch.
+**Level 1 — end-to-end outcome.** Did the task get done? This is the only level that maps directly to a business metric, and it is the one your VP reads. The critical design choice is *what you assert on*: not the agent's final message, but the state of the world after the run. Did table `refunds` gain exactly one row with `amount_cents = 8420` and `order_id = X`? Does the repo now compile and do the previously-failing tests pass? Is the calendar event on the right day with the right attendees? Outcome eval is binary or near-binary, it is cheap to compute if you built the environment right, and it is the number that gates a launch.
 
 **Level 2 — trajectory.** Given that it succeeded (or failed), what path did it take? Here you score tool-call precision and recall against a reference set of calls, argument validity, ordering constraints that actually matter, redundant and repeated calls, steps taken, tokens burned, wall-clock, dollars, and dangerous detours — actions that were out of scope, irreversible, or touched data the task never needed. Trajectory eval is what tells you the agent is *fragile* before production tells you. A run that succeeds by calling `search` eleven times with slightly different phrasings succeeded by brute force; it will fail the moment the corpus grows or the rate limiter bites.
 
@@ -2950,7 +2963,7 @@ This is a list worth having memorized because interviewers ask it almost verbati
 
 **Wrong tool selection that still lands.** The agent needed `get_order_status` and instead called `search_knowledge_base("where is my order")`, got a generic article, and paraphrased plausible-sounding nonsense. The answer text reads fine. The user's package is still in Memphis. Output graders — human or LLM — are notoriously bad at this because the *text* is coherent; the failure is that no authoritative source was consulted.
 
-**Malformed or subtly-wrong arguments.** Schema-valid, semantically wrong: `date="2026-03-07"` when the user said "next Friday" and today is a Tuesday; `limit=100` when the tool caps at 50 and silently truncates; currency in dollars where the API expects cents (this one is a real, repeated production bug class — a $84.20 refund issued as $8,420 is schema-valid). A JSON-schema validator catches none of these.
+**Malformed or subtly-wrong arguments.** Schema-valid, semantically wrong: `date="2026-03-06"` — the *coming* Friday — when the user said "next Friday" on Tuesday 2026-03-03 and meant 2026-03-13; `limit=100` when the tool caps at 50 and silently truncates; currency in dollars where the API expects cents (this one is a real, repeated production bug class — a $84.20 refund issued as $8,420 is schema-valid). A JSON-schema validator catches none of these.
 
 **Unnecessary actions.** Calls that cost money or time but contributed nothing. Ten searches where two sufficed. A full table scan tool invoked because the agent forgot it already had the data in context.
 
@@ -3067,7 +3080,7 @@ Now the production consequence, which is what the interviewer is really asking a
 
 Start with the mental model, because the naive version of this metric is actively misleading. **Tool-call precision and recall are set metrics over an unordered multiset of (tool, canonicalized-args) pairs, and the interesting engineering is entirely in the canonicalization.** If you compare raw arg dicts with `==`, every semantically-identical call with a different whitespace, key order or default-filled field scores as a miss, and your metric bottoms out around 0.4 while the agent is fine.
 
-Definitions I'd state out loud before writing anything: **precision = |predicted ∩ reference| / |predicted|** — of the calls the agent made, what fraction were warranted; it catches unnecessary, hallucinated and duplicated calls. **Recall = |predicted ∩ reference| / |reference|** — of the calls the task required, what fraction did it make; it catches missing steps and wrong-tool substitutions. The two catch opposite failures and you must report both; an agent that calls every tool it has scores recall 1.0.
+Definitions I'd state out loud before writing anything: **precision = |predicted ∩ reference| / |predicted|** — of the calls the agent made, what fraction were warranted; it catches unnecessary, hallucinated and duplicated calls. **Recall = |predicted ∩ reference| / |reference|** — of the calls the task required, what fraction did it make; it catches missing steps and wrong-tool substitutions. The two catch opposite failures and you must report both; an agent that shotguns every tool it has can drive recall toward 1.0 while precision collapses.
 
 ```python
 from collections import Counter
@@ -3225,6 +3238,7 @@ Now the objection. **Averaging these four into one number destroys the property 
 **⚠ Trap:** letting `optimal_plan_execution` be judged by an LLM. It is the dimension teams most often hand to a judge because "efficiency is subjective," and it is the dimension where deterministic computation is most complete. Steps, duplicates, ordering violations and dollars are all arithmetic. Spend the judge budget on grounding and adherence, which genuinely need it.
 
 **📐 Numbers you must know:** the ratio I aim for in a mature agent eval suite is roughly **70% of scored signals deterministic, 20% per-case annotated checks, 10% judge**. If the judge share is above about a third, your suite is expensive, slow, and has an unvalidated classifier on its critical path. That ratio is my own operating heuristic, not a published constant — but the direction is not contested, and being able to state a target ratio at all is what separates a candidate who has run a suite from one who has read about them.
+
 ### Some of what matters can't be checked deterministically. How do you do step-level rubric grading, and what does it cost you?
 
 Step-level grading is what you reach for when the question is "was this decision reasonable *given what the agent knew at that moment*" — a question no post-hoc state assertion can answer. The mental model: **you are grading the agent as you would grade a junior engineer's PR, one commit at a time, without the benefit of hindsight.** That framing is important because the most common step-grading error is leaking the future into the prompt: if the grader can see that step 7 succeeded, it will retroactively bless step 3's questionable choice.
@@ -3280,7 +3294,7 @@ The design decision that matters is **prefix credit, not count credit**. If you 
 
 Why I'm nervous, and I would say this unprompted because it is the senior tell: **partial credit is a development signal, never a ship signal.** The launch metric stays binary — `complete`. Partial credit lives on the dashboard next to it so you can see whether last week's change moved the distribution rightward. The moment someone puts mean prefix credit in a launch doc as "the agent is 78% good," you have a number that is compatible with 0% of tasks actually finishing. On a task where the user only benefits from completion, 78% partial credit is worth exactly zero dollars.
 
-**📐 Numbers you must know:** the base-rate arithmetic that makes long-horizon agents hard. If each step succeeds independently with probability p, a k-step task succeeds with p^k. At p = 0.99 and k = 40, success is 0.99^40 = 0.669 — a 99% reliable step yields a **67% reliable task**. At p = 0.97, 0.97^40 = 0.296. This is why per-step reliability is the lever that matters on long tasks and why "the model is 2% better per step" translates into a 20-point swing at k = 40. Steps are not independent in reality, but the geometry of the argument is exactly right and interviewers respond to it.
+**📐 Numbers you must know:** the base-rate arithmetic that makes long-horizon agents hard. If each step succeeds independently with probability p, a k-step task succeeds with p^k. At p = 0.99 and k = 40, success is 0.99^40 = 0.669 — a 99% reliable step yields a **67% reliable task**. At p = 0.97, 0.97^40 = 0.296. This is why per-step reliability is the lever that matters on long tasks and why "the model is 2 points better per step" translates into a **37-point swing** at k = 40 (0.669 − 0.296). Steps are not independent in reality, but the geometry of the argument is exactly right and interviewers respond to it.
 
 ### How do you grade a 42-step, 180,000-token trajectory with a judge without blowing the context window and the budget?
 
@@ -3427,7 +3441,7 @@ Pass on outcome, flagged on trajectory, and whether it ships depends on which of
 
 So the metric design that follows: I do not gate on turn count directly. I gate on **repeated-question rate** and **constraint-retention** (did every constraint stated in turn *k* still hold in the final action), both of which are computable, and I track turn count as a cost and latency input rather than a quality input. Turns cost money and user patience; that belongs in the cost budget, not the quality score.
 
-**💰 Math:** turns are not free and this is where you connect it to the business. A support conversation at 12 turns instead of 4, with ~6,000 tokens of context per turn on the input side and growing: turn *n* costs roughly n × 3,000 input tokens if the transcript grows 3k/turn, so 12 turns is Σ(3,000n) for n=1..12 = 3,000 × 78 = 234,000 input tokens versus 3,000 × 10 = 30,000 for 4 turns. At $3/Mtok that is $0.70 vs $0.09 — **7.8× the cost**, from a 3× increase in turns, because context accumulates quadratically. At 20,000 conversations/day that difference is $12,200/day. **The quadratic growth of transcript cost with turn count is the number to have in your head**; it is why turn count is a cost metric even when it is not a quality metric.
+**💰 Math:** turns are not free and this is where you connect it to the business. A support conversation at 12 turns instead of 4, with the transcript growing ~3,000 tokens per turn on the input side: turn *n* costs roughly n × 3,000 input tokens, so 12 turns is Σ(3,000n) for n=1..12 = 3,000 × 78 = 234,000 input tokens versus 3,000 × 10 = 30,000 for 4 turns. At $3/Mtok that is $0.70 vs $0.09 — **7.8× the cost**, from a 3× increase in turns, because context accumulates quadratically. At 20,000 conversations/day that difference is $12,200/day. **The quadratic growth of transcript cost with turn count is the number to have in your head**; it is why turn count is a cost metric even when it is not a quality metric.
 
 ### Is an agent that asks a clarifying question winning or losing? How do you score it?
 
@@ -3464,6 +3478,7 @@ The asymmetry has to be stated explicitly and defended with money, because that 
 **💰 Math:** suppose a human handoff costs $6 in agent time and an unwarranted autonomous action costs, on average, $180 (refund error, remediation, escalation, churn risk). Then a false negative on escalation is 30× a false positive, so the optimal operating point is heavily biased toward escalating — you should accept roughly 30 unnecessary escalations to prevent one unwarranted action. Concretely: 20,000 tasks/day, 5% should-escalate base rate, so 1,000 true-escalation cases. At recall 0.82 / precision 0.70 you get TP = 820, missed = 180, and total escalations = 820 / 0.70 = 1,171, so FP = 351. At recall 0.95 / precision 0.45 you get TP = 950, missed = 50, total = 950 / 0.45 = 2,111, so FP = 1,161. The cautious setting saves 130 missed escalations × $180 = **$23,400/day** and costs (1,161 − 351) = 810 extra handoffs × $6 = **$4,860/day**. Net **+$18,540/day** to be more cautious. That arithmetic is the answer, not "safety first."
 
 **🗣 Say this in the room:** "Escalation is a classifier and I report it as one — recall, precision, and turns-to-escalation. Then I price the two error types: if a missed escalation costs 30× a false one, the correct operating point is aggressively cautious, and I'd show the arithmetic rather than asserting it. The metric people forget is time-to-escalation; escalating correctly at turn 11 is a much worse product than escalating at turn 2."
+
 ### Design the sandbox for an agent eval suite. What does the environment actually have to give you?
 
 **Mental model: the environment is the fixture, and an agent eval suite is only as good as its ability to put the world back exactly the way it was.** Everything hard about agent eval — reproducibility, parallelism, cost, safety — reduces to environment engineering. This is also the part of the job where a backend engineer has an enormous, under-claimed advantage, and I would say so in the room: building a hermetic, resettable, seeded world with fakes for third-party services is a problem you have solved a dozen times for integration tests. The novelty is only that the client is nondeterministic.
@@ -3548,7 +3563,7 @@ class ToolCassette:
         return result
 
     def finish(self):
-        if self.mode.startswith("record"):
+        if "record" in self.mode:          # covers "record" and "replay_or_record"
             self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True))
         unused = set(self.data) - self.used
         return {"misses": self.misses, "unused": sorted(unused)}
@@ -3707,6 +3722,7 @@ This is the interesting case and the honest answer is that the regression lives 
 And one non-composition possibility to rule out, because it is common and embarrassing: **the eval set changed.** Someone added 20 hard cases, or a data refresh changed a fixture. Pin the dataset version in every run and diff it; this is the first thing I check when nothing else explains the number.
 
 **🗣 Say this in the room:** "If every component is flat and end-to-end moved, the bug is in composition — context assembly, ordering, budgets, tool descriptions, or retry behaviour. My first move is to diff the fully-rendered prompt at step one between a good run and a bad run, because four of those five show up there. That's why I log the rendered prompt, not just the messages I intended to send."
+
 ### Build me a regression suite out of recorded production traces. Walk me through it end to end.
 
 **Mental model: a production trace is a free eval case with a free label, and the label is what your users already told you.** Authoring eval cases by hand is slow and biased toward what the author imagines; production has thousands of real cases a day with real distributions. The engineering is in converting a trace into something *replayable*, and that is entirely a fixtures problem — which is your home turf.
@@ -3779,7 +3795,7 @@ FAIL the build if:
 
 **💰 Math — the arithmetic I'd put in the launch doc.** A support agent, 20,000 tasks/day. Version A: 88% success, mean 9 steps, ~48,000 total input tokens (with 60% prefix-cache hits) and 2,400 output tokens per task. On a $3/Mtok input, $0.30/Mtok cached-input, $15/Mtok output model: uncached input 19,200 × 3/1e6 = $0.0576, cached input 28,800 × 0.30/1e6 = $0.00864, output 2,400 × 15/1e6 = $0.036 → **$0.102/task = $2,040/day = $61,200/month.** Version B: 91% success but mean 16 steps and 96,000 input / 4,000 output tokens → uncached 38,400 × 3/1e6 = $0.115, cached 57,600 × 0.30/1e6 = $0.0173, output 4,000 × 15/1e6 = $0.06 → **$0.192/task = $3,840/day = $115,200/month.** So +3 points of success costs **+$54,000/month**. Whether that is worth it depends on the value of a resolved task: if a deflected ticket saves $6 of human handling, 3 points × 20,000 × 30 = 18,000 extra deflections/month × $6 = $108,000 saved. Ship B. **The point is that the eval report has to contain enough numbers for that comparison to be doable at all** — and an eval that reports only success rate cannot make it.
 
-**⚠ Trap:** measuring cost as tokens rather than dollars. Token counts do not compose across a heterogeneous system — a cheap model doing 40 steps can be cheaper than an expensive model doing 4, and cached input is 10× cheaper than uncached on most providers. Price everything at the boundary and report dollars, with the token breakdown as a drill-down.
+**⚠ Trap:** measuring cost as tokens rather than dollars. Token counts do not compose across a heterogeneous system — a cheap model doing 40 steps can be cheaper than an expensive model doing 4, and cached input is far cheaper than uncached — commonly a 50–90% discount depending on the provider (**📅 Volatile:** cache-read pricing and the discount ratio differ per provider and change; check current rates before quoting one). Price everything at the boundary and report dollars, with the token breakdown as a drill-down.
 
 ### Design the step and token budget for an agent. Where does the number come from?
 
@@ -3820,7 +3836,7 @@ def has_cycle(calls, window=12, min_period=1, max_period=4, reps=2):
 
 Each detector produces a *finding* on the trajectory, and the findings become metrics: `loop_rate`, `duplicate_write_rate`, `no_progress_rate`. Those are the numbers I put on the agent-health dashboard next to success rate, because they move first — an agent degrades into looping before its success rate visibly drops, since the step cap is still catching it.
 
-**💰 Math:** a loop that runs to a 50-step cap on a task whose reference is 8 steps. Using the quadratic: 50 steps at 4,000 tokens/step growth ≈ 4,000 × 50 × 51 / 2 = 5.1M input tokens ≈ $15.30 at $3/Mtok, versus 8 steps ≈ 4,000 × 36 = 144k ≈ $0.43. **One looped run costs 35 healthy runs.** If 1.5% of 20,000 daily tasks loop, that is 300 × $15.30 = $4,590/day = **$137,700/month from 1.5% of traffic.** Detecting and short-circuiting at step 12 instead of 50 cuts that by roughly (12×13)/(50×51) = 6% of the cost, saving about $129,000/month. This arithmetic is why loop detection is not a nice-to-have.
+**💰 Math:** a loop that runs to a 50-step cap on a task whose reference is 8 steps. Using the quadratic: 50 steps at 4,000 tokens/step growth ≈ 4,000 × 50 × 51 / 2 = 5.1M input tokens ≈ $15.30 at $3/Mtok, versus 8 steps ≈ 4,000 × 36 = 144k ≈ $0.43. **One looped run costs 35 healthy runs.** If 1.5% of 20,000 daily tasks loop, that is 300 × $15.30 = $4,590/day = **$137,700/month from 1.5% of traffic.** Detecting and short-circuiting at step 12 instead of 50 cuts that **to** roughly (12×13)/(50×51) = 6% of the cost, saving about $129,000/month. This arithmetic is why loop detection is not a nice-to-have.
 
 ### Tell me about τ-bench and τ²-bench. What do they measure, and where do they mislead?
 
@@ -4136,7 +4152,7 @@ This is your home turf recast, so the interviewer is checking whether you make t
 
 **⚠ Trap:** logging the rendered prompt string only, or the template only. You need both — the template ID/hash to group interactions across users, and the rendered string (or the exact variable bindings) to reproduce one. Teams log the rendered prompt, then can't answer "how did prompt v7 do overall," or log the template, then can't reproduce a single bad answer. Log the template hash plus the bindings; reconstruct the rendered string on demand.
 
-**💰 Math:** 50M interactions/month at 40 KB = 2 TB/month. Object storage at $0.023/GB-month ≈ $46/month for the newest month, growing to ~$600/month at steady state with 13-month retention and no compression; gzip at ~5× brings that to ~$120/month. Warehouse: ~1.5 KB of structured columns per interaction = 75 GB/month, entirely tractable. **The telemetry is not the expensive part — the eval compute is, and that's the next thing to budget.**
+**💰 Math:** 50M interactions/month at 40 KB = 2 TB/month. Object storage at $0.023/GB-month ≈ $46/month for the newest month, growing to ~$600/month at steady state with 13-month retention and no compression; gzip at ~5× brings that to ~$120/month. Warehouse: ~1.5 KB of structured columns per interaction = 75 GB/month, entirely tractable. **📅 Volatile:** the $0.023/GB-month figure is a current standard-tier object-storage list price — re-check your provider's rate card and tier before quoting it. **The telemetry is not the expensive part — the eval compute is, and that's the next thing to budget.**
 ### You're A/B testing a new model behind a chat feature. What's your randomization unit, and why?
 
 The rule: **randomize at the coarsest unit that experiences the change coherently, because anything finer leaks.** For LLM features that is almost always the user (or the account, if the product is collaborative), not the request and not the session.
@@ -4276,7 +4292,7 @@ Two correct approaches:
 
 **⚠ Trap:** analyzing at the row level when you randomized at the user level. Your warehouse has one row per interaction, `GROUP BY variant` is one line of SQL, and it will give you standard errors that are 1.5–3× too small on typical LLM telemetry, because interactions within a user are correlated. This produces confident false positives at scale and it is the most common statistical defect I find in AI-product experiment readouts. The fix is one line too — cluster on user, or bootstrap over users — but only if you know to look.
 
-**📐 Numbers you must know:** the design effect, 1 + (m̄ − 1)ρ. With 5 sessions per user and ICC ρ = 0.25, that's 1 + 4(0.25) = 2.0 — your effective sample size is *half* your row count. If someone reports an experiment result with row-level standard errors on a per-user-randomized test, mentally double their p-value's exponent before believing it.
+**📐 Numbers you must know:** the design effect, 1 + (m̄ − 1)ρ. With 5 sessions per user and ICC ρ = 0.25, that's 1 + 4(0.25) = 2.0 — your effective sample size is *half* your row count. If someone reports an experiment result with row-level standard errors on a per-user-randomized test, mentally inflate their standard errors by √2 before believing it — that turns a z of 3.0 into a z of 2.1, and a p of 0.003 into a p of 0.03.
 
 ### You're at Harvey, selling into 40 law firms. You can't randomize users within a firm. How do you evaluate a model change?
 
@@ -4379,7 +4395,7 @@ My default ladder is: replay for iteration and sweeps (dozens of runs, cheap, on
 
 The mental model: **a canary is not a smaller launch, it is a hypothesis test with a pre-committed abort condition and a very short decision loop.** The thing that makes it work is not the small percentage — it's that the abort is automated and unemotional.
 
-**Ramp schedule.** 1% → 5% → 25% → 50% → 100%, with a bake time at each stage that is long enough to accumulate the events your triggers need. For a fast-signal trigger like error rate, 30 minutes at 1% of 50M/month traffic gives you 50M/30/24/2 ≈ 35,000 requests — plenty. For a slow-signal trigger like 7-day recontact, no canary stage is long enough, which is why recontact is an experiment metric and not a canary trigger. **Match the trigger's signal latency to the stage duration or the trigger is decorative.**
+**Ramp schedule.** 1% → 5% → 25% → 50% → 100%, with a bake time at each stage that is long enough to accumulate the events your triggers need. Do that arithmetic explicitly, because it is where canary plans quietly fail: 50M/month is 50M/30/24/2 ≈ 35,000 requests per 30 minutes *in total*, so a 1% stage sees only ~350 requests in 30 minutes — enough to catch a gross error-rate breach, nowhere near enough to resolve a half-point difference. You either bake the 1% stage for hours, or you accept that the fast triggers at 1% only catch catastrophes and the subtler reads come at 5% and 25%. For a slow-signal trigger like 7-day recontact, no canary stage is long enough, which is why recontact is an experiment metric and not a canary trigger. **Match the trigger's signal latency to the stage duration or the trigger is decorative.**
 
 **Trigger tiers.**
 
@@ -4531,7 +4547,7 @@ The reweighting discipline: since three of four streams are non-random, any popu
 
 **⚠ Trap:** letting the labeled set become the eval set without re-weighting or re-basing. Cases sampled because the judge was uncertain are, by construction, the cases the judge is worst on; promoting them wholesale into a fixed offline suite creates a benchmark that is adversarial to your current judge and unrepresentative of production. Promote them, but tag their provenance and track the suite's composition against the production distribution, or your offline suite slowly becomes a museum of last year's hard cases.
 
-**💰 Math:** 2,000 labels at a $1.67 rubric-labeling cost with the N=2-plus-adjudication multiplier of 2.2 and 8% gold injection = 2,000 × $1.67 × 2.2 × 1.08 = **$7,935/month**, or 2,000 × 2.2 × 4 min = 293 annotator-hours ≈ 1.8 FTE-months at 3 productive annotation hours a day. Against a 50M-interaction month that is 0.004% coverage — which is precisely why the human budget's real job is **validating and calibrating a judge that scores the other 99.996%**, not measuring quality directly.
+**💰 Math:** 2,000 labels at a $1.67 rubric-labeling cost with the N=2-plus-adjudication multiplier of 2.2 and 8% gold injection = 2,000 × $1.67 × 2.2 × 1.08 = **$7,935/month**, or 2,000 × 2.2 × 4 min = 293 annotator-hours ≈ 98 annotator-days at 3 productive annotation hours a day, which is ~4.7 FTE-months on a 21-working-day month (it collapses to ~1.8 only if you pretend annotators do eight productive hours a day, which they don't). Against a 50M-interaction month that is 0.004% coverage — which is precisely why the human budget's real job is **validating and calibrating a judge that scores the other 99.996%**, not measuring quality directly.
 
 **🗣 Say this in the room:** "I'd split it four ways — a genuinely random probe to anchor the population rate, uncertainty and disagreement sampling to improve judge calibration where the judge is weakest, quota-stratified coverage on slices we can't be blind in, and a reserve for whatever we're currently investigating. Then report population numbers with inverse-propensity weights, because three of those four streams are biased by design."
 
@@ -4646,7 +4662,7 @@ The construction:
 
 **⚠ Trap:** running eval sandboxes in the same cluster and network namespace as your production services because "it's just eval." Model-generated code has, in documented incidents across the industry, attempted network calls, filesystem exploration outside the working directory, and package installation from arbitrary indices. Treat it as you would a public CI runner accepting PRs from strangers — because functionally that is exactly what it is.
 
-**💰 Math:** sandbox overhead is not free. A 500-case agentic benchmark at 420 s/case wall-clock is 58 CPU-hours per pass; at 3 repetitions, 175 CPU-hours. On general-purpose cloud compute at ~$0.05/vCPU-hour with 4 vCPU per sandbox, that's 175 × 4 × $0.05 = $35 of compute — trivially small next to the inference cost of 500 × 3 × (180k × $3/M + 12k × $15/M) = 1,500 × ($0.54 + $0.18) = **$1,080 per full pass**. The lesson: for agentic evals, compute is noise and tokens are the bill, so optimize caching and repetition count, not container efficiency.
+**💰 Math:** sandbox overhead is not free. A 500-case agentic benchmark at 420 s/case wall-clock is 58 sandbox-hours per pass; at 3 repetitions, 175 sandbox-hours. On general-purpose cloud compute at ~$0.05/vCPU-hour with 4 vCPU per sandbox, that's 175 × 4 = 700 vCPU-hours × $0.05 = $35 of compute — trivially small next to the inference cost of 500 × 3 × (180k × $3/M + 12k × $15/M) = 1,500 × ($0.54 + $0.18) = **$1,080 per full pass**. The lesson: for agentic evals, compute is noise and tokens are the bill, so optimize caching and repetition count, not container efficiency.
 
 ### How do you make eval runs reproducible, and what do you do about the cases that still flake?
 
