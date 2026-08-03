@@ -1898,7 +1898,7 @@ The catch with Pre-LN, and this is the part a good answer includes: because noth
 
 ### How would you initialize a transformer from scratch? Give me the actual numbers and justify the residual scaling.
 
-Mental model: initialization has one job — make the forward activations and the backward gradients have roughly unit scale at every layer *before any training happens*. If activations grow by 1.2× per layer, an 80-layer model has a 1.2^80 ≈ 1.6e6 amplification and the first forward pass overflows. Every init scheme is a variance-preservation argument, and the residual scaling is a variance-preservation argument specifically about the residual stream.
+Mental model: initialization has one job — make the forward activations and the backward gradients have roughly unit scale at every layer *before any training happens*. If activations grow by 1.2× per layer, an 80-layer model has a 1.2^80 ≈ 2.2e6 amplification and the first forward pass overflows. Every init scheme is a variance-preservation argument, and the residual scaling is a variance-preservation argument specifically about the residual stream.
 
 **Xavier/Glorot** (Glorot and Bengio, 2010): `Var(W) = 2/(fan_in + fan_out)`, derived by requiring variance preservation in both the forward *and* backward direction simultaneously, for a linear/tanh network. **Kaiming/He** (He et al., 2015): `Var(W) = 2/fan_in`, which adds the factor of 2 to compensate for ReLU zeroing half the activations. For a transformer with GELU/SwiGLU the Kaiming form is the right family.
 

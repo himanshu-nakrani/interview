@@ -2915,13 +2915,13 @@ The FFN is the same matmul in both phases; what changes is how many tokens share
 
 Arithmetic intensity for a weight matrix of `P` parameters processing `B` tokens: you move `P · bytes_per_param` bytes once and do `2 · P · B` FLOPs, so intensity is `2B / bytes_per_param` FLOP per byte. In bf16 that is `B` FLOP/byte. It depends *only on the token count*, not on the matrix shape — which is why the answer to "compute or memory bound?" is always "what's the batch?"
 
-An H100 SXM does roughly 495 TFLOP/s dense bf16 against 3.35 TB/s of HBM. The ridge point is `495e12 / 3.35e12 ≈ 148 FLOP/byte`. So:
+An H100 SXM does roughly 989 TFLOP/s dense bf16 against 3.35 TB/s of HBM. The ridge point is `989e12 / 3.35e12 ≈ 295 FLOP/byte`. So:
 
-- **Prefill** of a 4k-token prompt: `B = 4096` tokens flow through each FFN weight in one pass. Intensity ≈ 4096 FLOP/byte, ~28× past the ridge. Solidly compute-bound. Prefill is where you burn tensor-core FLOPs and where MFU numbers of 40–50% are achievable.
-- **Decode at batch 1:** `B = 1`. Intensity ≈ 1 FLOP/byte, ~148× *below* the ridge. You are reading the entire weight matrix from HBM to do one vector-matrix product. Utterly memory-bound; tensor cores are idle ~99% of the time.
-- **Decode at batch 256:** intensity ≈ 256 FLOP/byte, just past the ridge. This is why continuous batching exists and why "batch until you hit the ridge point" is the single most valuable serving lever.
+- **Prefill** of a 4k-token prompt: `B = 4096` tokens flow through each FFN weight in one pass. Intensity ≈ 4096 FLOP/byte, ~14× past the ridge. Solidly compute-bound. Prefill is where you burn tensor-core FLOPs and where MFU numbers of 40–50% are achievable.
+- **Decode at batch 1:** `B = 1`. Intensity ≈ 1 FLOP/byte, ~295× *below* the ridge. You are reading the entire weight matrix from HBM to do one vector-matrix product. Utterly memory-bound; tensor cores are idle ~99% of the time.
+- **Decode at batch 256:** intensity ≈ 256 FLOP/byte, just below the ridge (~295). This is why continuous batching exists and why "batch until you hit the ridge point" is the single most valuable serving lever.
 
-**📐 Numbers you must know:** the H100 bf16 ridge point is **~148 FLOP/byte**; at fp8 (≈990 TFLOP/s dense, 1 byte/param) it is `990/3.35 ≈ 295` FLOP/byte but the bytes-per-param halves too, so the *token* threshold works out similar — roughly **a few hundred tokens in flight before you leave the memory-bound regime.** Derive it, do not memorize it: `ridge_tokens ≈ peak_FLOPs / (bandwidth · FLOPs_per_byte_per_token)`.
+**📐 Numbers you must know:** the H100 bf16 ridge point is **~295 FLOP/byte**; at fp8 (≈1,979 TFLOP/s dense, 1 byte/param) it is `1979/3.35 ≈ 590` FLOP/byte but the bytes-per-param halves too, so the *token* threshold works out the same — roughly **300 tokens in flight before you leave the memory-bound regime.** Derive it, do not memorize it: `ridge_tokens ≈ peak_FLOPs / (bandwidth · FLOPs_per_byte_per_token)`.
 
 **💰 Math:** at batch 1 on Llama-3-8B in bf16 (16 GB of weights), the theoretical floor per decode step is `16e9 / 3.35e12 = 4.8 ms`, i.e. ~210 tok/s, and *no amount of FLOPs helps.* At batch 64 you read the same 16 GB and produce 64 tokens: still 4.8 ms, now 13,300 tok/s. Same hardware, 64× the throughput, near-identical per-token latency. That is the entire economic argument for a shared serving tier over per-tenant dedicated instances.
 
@@ -3214,7 +3214,7 @@ Per MoE layer, per forward step, the sequence is:
 
 Two collectives per MoE layer. In a 61-layer model with 58 MoE layers, that is 116 all-to-alls per forward pass.
 
-**📐 Numbers you must know — the interconnect ratio that decides your topology.** On H100, NVLink gives ~900 GB/s bidirectional per GPU (~450 GB/s each way); a single InfiniBand NDR port gives 400 Gb/s = 50 GB/s each way. That is roughly a **9× cliff** the moment your expert-parallel group crosses a node boundary. Now compute the arithmetic intensity of an EP step: per token per MoE layer, expert FLOPs = `2 · k · 3 · d_model · d_ff_expert = 2 · 8 · 3 · 7168 · 2048 ≈ 705 MFLOP`; network bytes ≈ `2 · 57 KB = 114 KB`. Ratio ≈ **6,200 FLOP per network byte**. An H100 at ~990 TFLOP/s fp8 needs 990e12/450e9 ≈ **2,200 FLOP/byte** to stay compute-bound on NVLink — 6,200 comfortably clears it. Over InfiniBand it needs 990e12/50e9 ≈ **19,800 FLOP/byte** — 6,200 misses by roughly 3×. **Conclusion: expert parallelism belongs inside an NVLink domain; cross-node EP is communication-bound by about 3× and you must overlap or shrink it.** (Derate all of this by real achieved efficiency; the ratio is what survives.)
+**📐 Numbers you must know — the interconnect ratio that decides your topology.** On H100, NVLink gives ~900 GB/s bidirectional per GPU (~450 GB/s each way); a single InfiniBand NDR port gives 400 Gb/s = 50 GB/s each way. That is roughly a **9× cliff** the moment your expert-parallel group crosses a node boundary. Now compute the arithmetic intensity of an EP step: per token per MoE layer, expert FLOPs = `2 · k · 3 · d_model · d_ff_expert = 2 · 8 · 3 · 7168 · 2048 ≈ 705 MFLOP`; network bytes ≈ `2 · 57 KB = 114 KB`. Ratio ≈ **6,200 FLOP per network byte**. An H100 at ~1,979 TFLOP/s fp8 needs 1,979e12/450e9 ≈ **4,400 FLOP/byte** to stay compute-bound on NVLink — 6,200 comfortably clears it. Over InfiniBand it needs 1,979e12/50e9 ≈ **39,600 FLOP/byte** — 6,200 misses by roughly 6×. **Conclusion: expert parallelism belongs inside an NVLink domain; cross-node EP is communication-bound by about 6× and you must overlap or shrink it.** (Derate all of this by real achieved efficiency; the ratio is what survives.)
 
 **⚠ Trap:** at decode, all-to-all is usually **latency**-bound, not bandwidth-bound, and people size it with bandwidth math. A batch of 32 decode tokens sends messages of a few kilobytes — far below the size where bandwidth matters. What you pay is fixed collective latency, on the order of 10–30 µs intra-node and worse across nodes. 116 collectives × 20 µs ≈ **2.3 ms per token of pure synchronization**, against an inter-token-latency target of maybe 25 ms. That is ~9% of your budget spent on nothing but barriers, and it does not shrink when you add GPUs — it grows. This is why production MoE stacks invest so heavily in overlapping communication with computation (compute layer `L`'s attention while layer `L-1`'s combine is in flight) and in specialized low-latency all-to-all kernels; DeepSeek open-sourced their expert-parallel communication library precisely because the stock collective was not good enough.
 
@@ -3298,7 +3298,7 @@ B_eff = B · k / E
 
 **📐 The number to memorize:** an MoE at decode batch `B` has the weight-reuse characteristics of a dense model at batch `B·k/E`. Mixtral (k=2, E=8): `B/4`. DeepSeek-V3 (k=8, E=256): `B/32`. Qwen3-class (k=8, E=128): `B/16`.
 
-Now put numbers on it. Suppose you want the arithmetic intensity of a dense model at batch 256 — comfortably past the H100 ridge point, where you are finally using the tensor cores. For Mixtral you need `B = 1024` concurrent decode tokens. For DeepSeek-V3 you need `B = 8192`. **Eight thousand concurrent sequences in the decode batch.** That is the number that decides whether an MoE makes sense for your deployment, and it is a *product* question — do you have that much simultaneous traffic? — dressed as an architecture question.
+Now put numbers on it. Suppose you want the arithmetic intensity of a dense model at batch 256 — at the H100 ridge point (~295 FLOP/byte in bf16), where you are finally using the tensor cores. For Mixtral you need `B = 1024` concurrent decode tokens. For DeepSeek-V3 you need `B = 8192`. **Eight thousand concurrent sequences in the decode batch.** That is the number that decides whether an MoE makes sense for your deployment, and it is a *product* question — do you have that much simultaneous traffic? — dressed as an architecture question.
 
 And here is the cruelty that makes this self-defeating on fixed hardware: the batch size you can reach is capped by KV-cache memory, and the MoE's weights already ate that memory. Take Mixtral 8x22B (141 B total, 39 B active) on 4× H100 with fp8 weights: 141 GB of weights leaves 179 GB for KV. At 224 KiB/token of GQA cache (56 layers × 8 KV heads × 128 × 2 tensors, bf16 KV) that is 800k tokens — about **25 concurrent sequences at 32k context**. But you needed `B ≈ 1024` tokens in flight to reach good expert utilization, and 25 sequences gives you 25. You are running at `B_eff = 25 · 2/8 = 6.25`. The model is being read at an effective batch of six.
 
@@ -3306,33 +3306,34 @@ And here is the cruelty that makes this self-defeating on fixed hardware: the ba
 
 ### Show me the crossover. At what concurrency does an MoE actually beat the dense model, on real hardware?
 
-Let me do this fully, because the arithmetic *is* the answer. Compare **Llama-3-70B dense** against **Mixtral 8x22B** (141 B total, 39 B active), both fp8, both on 4× H100 (320 GB HBM, ~3.35 TB/s each, ~990 TFLOP/s dense fp8 each). I will use peak numbers; real MFU derates both sides similarly, so the crossover moves little.
+Let me do this fully, because the arithmetic *is* the answer. Compare **Llama-3-70B dense** against **Mixtral 8x22B** (141 B total, 39 B active), both fp8, both on 4× H100 (320 GB HBM, ~3.35 TB/s each, ~1,979 TFLOP/s dense fp8 each). I will use peak numbers; real MFU derates both sides similarly, so the crossover moves little.
 
 **Bytes per decode step (the floor, independent of batch):**
 - Dense 70B: 70 GB of weights, sharded 4 ways → 17.5 GB per GPU → `17.5e9 / 3.35e12 = 5.2 ms`.
 - Mixtral 8x22B at any batch large enough to touch all 8 experts (which is any batch above ~15 tokens): 141 GB → 35.3 GB per GPU → `35.3e9 / 3.35e12 = 10.5 ms`.
 
 **FLOPs per decode step (linear in batch):**
-- Dense: `2 · 70e9 · B` FLOP over `4 · 990e12` FLOP/s → `35.4 µs · B`.
-- MoE: `2 · 39e9 · B` over the same → `19.7 µs · B`.
+- Dense: `2 · 70e9 · B` FLOP over `4 · 1,979e12` FLOP/s → `17.7 µs · B`.
+- MoE: `2 · 39e9 · B` over the same → `9.9 µs · B`.
 
-**Where each becomes compute-bound:** dense at `B = 5.2e-3 / 35.4e-6 ≈ 147`; MoE at `B = 10.5e-3 / 19.7e-6 ≈ 533`.
+**Where each becomes compute-bound:** dense at `B = 5.2e-3 / 17.7e-6 ≈ 294`; MoE at `B = 10.5e-3 / 9.9e-6 ≈ 1,060`.
 
 **Throughput:**
 | batch B | dense step | dense tok/s | MoE step | MoE tok/s | winner |
 |---|---|---|---|---|---|
 | 16 | 5.2 ms | 3,080 | 10.5 ms | 1,520 | dense, 2.0× |
 | 128 | 5.2 ms | 24,600 | 10.5 ms | 12,200 | dense, 2.0× |
-| 256 | 9.1 ms | 28,200 | 10.5 ms | 24,400 | dense, 1.2× |
-| 300 | 10.6 ms | 28,300 | 10.5 ms | 28,600 | **crossover** |
-| 512 | 18.1 ms | 28,300 | 10.5 ms | 48,800 | MoE, 1.7× |
-| 1024 | 36.2 ms | 28,300 | 20.2 ms | 50,700 | MoE, 1.8× |
+| 256 | 5.2 ms | 49,200 | 10.5 ms | 24,400 | dense, 2.0× |
+| 512 | 9.1 ms | 56,500 | 10.5 ms | 48,800 | dense, 1.2× |
+| 600 | 10.6 ms | 56,600 | 10.5 ms | 57,100 | **crossover** |
+| 1024 | 18.1 ms | 56,500 | 10.5 ms | 97,500 | MoE, 1.7× |
+| 2048 | 36.2 ms | 56,500 | 20.2 ms | 101,000 | MoE, 1.8× |
 
-**The crossover is around 300 concurrent decode tokens.** Below it, the dense 70B is up to **2× faster** despite having 1.8× the active parameters, because decode is bandwidth-bound and the MoE reads twice as many bytes. Above it, the MoE is up to 1.8× faster because it does half the FLOPs.
+**The crossover is around 600 concurrent decode tokens.** Below it, the dense 70B is up to **2× faster** despite having 1.8× the active parameters, because decode is bandwidth-bound and the MoE reads twice as many bytes. Above it, the MoE is up to 1.8× faster because it does half the FLOPs.
 
-Now the capacity check, which is the part people skip. Can you *reach* batch 300 on this hardware? KV budget for Mixtral 8x22B is `320 − 141 = 179 GB` at 224 KiB/token (bf16 KV) = 800k tokens. At 32k average context: 25 sequences. At 8k: 100 sequences. At 2k: 400 sequences. **So the MoE only wins if your workload is short-context and high-concurrency.** For a long-context enterprise assistant, you sit permanently on the wrong side of the crossover.
+Now the capacity check, which is the part people skip. Can you *reach* batch 600 on this hardware? KV budget for Mixtral 8x22B is `320 − 141 = 179 GB` at 224 KiB/token (bf16 KV) = 800k tokens. At 32k average context: 25 sequences. At 8k: 100 sequences. At 2k: 400 sequences — still short of 600. **So on this hardware the MoE never beats the dense model at context lengths of 2k or more**; you would need sub-2k contexts (at 1k: 800 sequences) or more HBM. For a long-context enterprise assistant, you sit permanently on the wrong side of the crossover.
 
-**🗣 Say this in the room:** "For that pair on 4 H100s, the crossover is around 300 concurrent decode tokens. Below it the dense model wins by up to 2× because decode is bandwidth-bound and the MoE reads 141 GB per step against the dense model's 70. Above it the MoE wins by ~1.8× because it does half the FLOPs. Then I'd check whether the KV budget even permits batch 300 at our context length — for 32k contexts it caps out around 25 sequences, so we'd never get there."
+**🗣 Say this in the room:** "For that pair on 4 H100s, the crossover is around 600 concurrent decode tokens. Below it the dense model wins by up to 2× because decode is bandwidth-bound and the MoE reads 141 GB per step against the dense model's 70. Above it the MoE wins by ~1.8× because it does half the FLOPs. Then I'd check whether the KV budget even permits batch 600 at our context length — at 2k contexts it caps out around 400 sequences, so on this hardware the crossover is unreachable and I'd serve the dense model."
 
 ### Walk me through the memory profile of an MoE over a request's lifetime. What dominates when?
 
@@ -3509,16 +3510,16 @@ I will start with the measurements that determine the answer, because the archit
 
 Note the MoE's *KV* is smaller (fewer layers), which partly offsets its larger weights. Same GPU count. So memory does not decide it.
 
-*Decode speed on 8× H100 (3.35 TB/s, ~990 TFLOP/s fp8 each).*
+*Decode speed on 8× H100 (3.35 TB/s, ~1,979 TFLOP/s fp8 each).*
 
-- Dense: `70 GB / 8 = 8.75 GB` per GPU per step → `8.75e9 / 3.35e12 = 2.6 ms` bandwidth floor. Compute at B=67: `2 · 70e9 · 67 = 9.4 TFLOP / 7.92 PFLOP/s = 1.2 ms`. Bound: **2.6 ms/token.**
-- MoE: `141 / 8 = 17.6 GB` per GPU → **5.3 ms/token** (compute is only 0.66 ms; irrelevant).
+- Dense: `70 GB / 8 = 8.75 GB` per GPU per step → `8.75e9 / 3.35e12 = 2.6 ms` bandwidth floor. Compute at B=67: `2 · 70e9 · 67 = 9.4 TFLOP / 15.8 PFLOP/s = 0.6 ms`. Bound: **2.6 ms/token.**
+- MoE: `141 / 8 = 17.6 GB` per GPU → **5.3 ms/token** (compute is only ~0.3 ms; irrelevant).
 
 Both clear the 30 ms ITL budget with room, but the dense model is **2× faster per token** and gives you 2× the headroom for traffic growth before you need more GPUs. `B_eff` for the MoE is `67 × 2/8 ≈ 17` — it is running at an effective batch of seventeen, deep in its bad regime.
 
-*Prefill / TTFT.* 30k prompt tokens. Dense: `2 · 70e9 · 30000 = 4.2 PFLOP`; at 50% MFU on 7.92 PFLOP/s → **1.06 s**. MoE: `2.34 PFLOP` → **0.59 s**. The MoE wins TTFT by ~470 ms — genuinely meaningful. But this is a coding assistant where the file/repo context repeats across turns, so prefix caching will eliminate most prefill on turns 2+, and the advantage shrinks to the first turn of a session.
+*Prefill / TTFT.* 30k prompt tokens. Dense: `2 · 70e9 · 30000 = 4.2 PFLOP`; at 50% MFU on 15.8 PFLOP/s → **0.53 s**. MoE: `2.34 PFLOP` → **0.30 s**. The MoE wins TTFT by ~230 ms — genuinely meaningful. But this is a coding assistant where the file/repo context repeats across turns, so prefix caching will eliminate most prefill on turns 2+, and the advantage shrinks to the first turn of a session.
 
-**My call: dense 70B-class for Product B.** Same GPU count, 2× better ITL, 2× more headroom, dramatically simpler operations — no expert telemetry, no straggler management, no placement table. The MoE's only win is first-turn TTFT, which prefix caching largely erases. **I would revisit if concurrency grew past ~300 decode tokens** (roughly 12 req/s, a 4× traffic increase) — at that point the crossover flips and the MoE's FLOP advantage starts to matter.
+**My call: dense 70B-class for Product B.** Same GPU count, 2× better ITL, 2× more headroom, dramatically simpler operations — no expert telemetry, no straggler management, no placement table. The MoE's only win is first-turn TTFT, which prefix caching largely erases. **I would revisit if concurrency grew past ~600 decode tokens** (roughly 25 req/s, a ~9× traffic increase) — at that point the crossover flips and the MoE's FLOP advantage starts to matter.
 
 **💰 Build-versus-buy, because this is what actually gets asked next.** 8× H100 on-demand at ~$2.50/GPU-hour (**📅 Volatile:** GPU rates *and* the API list prices below both move every few months — quote the ratio, not the absolute numbers, and re-derive from current price pages before your loop) = $20/hour = **$14.6k/month** for Product B. Against a frontier API at, say, $3/Mtok input and $15/Mtok output: input is `80,000 × 30,000 = 2.4 B tokens/day`; with prefix caching hitting 80% of it at a 90% discount, that is `0.8 × 2400 Mtok × $0.30 + 0.2 × 2400 Mtok × $3.00 = $576 + $1,440 = $2,016/day`. Output: `80,000 × 800 = 64 Mtok × $15 = $960/day`. Total ≈ **$3.0k/day ≈ $89k/month**. Self-hosting is ~6× cheaper *if* you sustain utilization — which at 67 concurrent sequences on 8 GPUs, you do. That 6× is the entire business case, and it is also why the answer changes completely at 200 engineers instead of 2,000: at one-tenth the traffic the API bill is $8.9k and the GPUs still cost $14.6k, and you should buy.
 

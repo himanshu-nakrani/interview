@@ -51,13 +51,13 @@ Now the backward pass. For each layer you must compute two gradients: the gradie
 
 Total: `2 + 4 = 6` FLOPs per parameter per token. For `N` parameters and `D` training tokens, `C = 6ND`.
 
-What the formula silently ignores: attention's quadratic term. The `QK^T` and `attn·V` products cost roughly `12 · n_layers · d_model · seq_len` FLOPs per token extra, which is *not* proportional to parameter count. As a fraction of the `6ND` term, that extra is `seq_len / (6 · d_model)`-ish. For Llama-3-8B at `d_model = 4096` with `seq_len = 8192`, that is `8192 / (6 × 4096) ≈ 33%` on top of `6ND` — very much not negligible. At `seq_len = 2048` it is 8%. So `6ND` is a good approximation at short context and a *systematic underestimate* at long context.
+What the formula silently ignores: attention's quadratic term. The `QK^T` and `attn·V` products cost roughly `6 · n_layers · d_model · seq_len` FLOPs per token extra in training for a *causal* model — the mask halves the average attention span, and forward-plus-backward triples the forward term — which is *not* proportional to parameter count. As a fraction of the `6ND` term, that extra is `seq_len / (12 · d_model)`-ish. For Llama-3-8B at `d_model = 4096` with `seq_len = 8192`, that is `8192 / (12 × 4096) ≈ 17%` on top of `6ND` — very much not negligible. At `seq_len = 2048` it is ~4%. So `6ND` is a good approximation at short context and a *systematic underestimate* at long context.
 
 **📐 Numbers you must know:** 2 FLOPs/param/token forward, 4 backward, 6 total. Inference *prefill* is 2ND. Inference *decode* is also 2N FLOPs per generated token, but decode is memory-bandwidth-bound, not FLOP-bound, so that number tells you almost nothing about decode latency — it tells you about cost on a saturated batched server.
 
 **⚠ Trap:** using `6ND` for a Mixture-of-Experts model with total parameters. Use **active** parameters. DeepSeek-V3 has ~671B total and ~37B active; its training compute is `6 × 37e9 × D`, not `6 × 671e9 × D`. Getting this wrong overestimates the cost by 18×, and an interviewer will catch it instantly.
 
-**🗣 Say this in the room:** "Six FLOPs per parameter per token — two forward because a MAC is two FLOPs, four backward because you compute both input-grads and weight-grads. It ignores the attention quadratic, which adds about a third on top of `6ND` once you're at 8k context on a small model."
+**🗣 Say this in the room:** "Six FLOPs per parameter per token — two forward because a MAC is two FLOPs, four backward because you compute both input-grads and weight-grads. It ignores the attention quadratic, which adds about a sixth on top of `6ND` once you're at 8k context on a small causal model."
 
 ### Kaplan 2020 said one thing, Chinchilla 2022 said another. What changed, and was Kaplan simply wrong?
 
@@ -143,7 +143,7 @@ Throughput is tokens/second while the job is running. **Goodput is tokens/second
 
 The mechanism that makes it enormous is a hardware-reliability argument you can do in your head. If a single GPU node has a mean time between failures of `M` hours, a job that requires all `n` nodes simultaneously has an effective MTBF of roughly `M / n`. Synchronous data-parallel training is an AND across every rank — one dead GPU kills the step, and therefore the job.
 
-**📐 Numbers you must know:** at 16,000 GPUs with a generous per-GPU MTBF of 50,000 hours, cluster MTBF is `50,000 / 16,000 ≈ 3.1 hours`. You will crash multiple times a day, forever, and that is the *normal* state. Meta's Llama-3 405B run publicly reported on the order of 400+ unexpected interruptions across a ~54-day window on a 16k-GPU cluster — roughly one every three hours — with the large majority hardware-attributed, while still achieving over 90% effective training time. Both halves of that sentence matter: the failures are constant, and good engineering still recovers 90% goodput.
+**📐 Numbers you must know:** at 16,000 GPUs with a generous per-GPU MTBF of 50,000 hours, cluster MTBF is `50,000 / 16,000 ≈ 3.1 hours`. You will crash multiple times a day, forever, and that is the *normal* state. Meta's Llama-3 405B run publicly reported on the order of 400+ unexpected interruptions across a ~54-day window on a 16k-GPU cluster — roughly one every three hours — with hardware failures the single largest category (~47% of them), while still achieving over 90% effective training time. Both halves of that sentence matter: the failures are constant, and good engineering still recovers 90% goodput.
 
 Goodput decomposes as:
 
@@ -778,7 +778,7 @@ The composition is a deliberate inversion of the trunk mixture. Where the trunk 
 
 The mental model: long context is **not** something you train for from scratch, because the attention cost is quadratic in sequence length and you would be paying it for all 15 trillion tokens. Instead you train the bulk at short context, where it is cheap, and then spend a small dedicated budget teaching the model to use longer ranges. The reason this works is that almost everything the model needs to learn — grammar, facts, reasoning — is learnable in 8k windows; only the positional machinery needs extending.
 
-**The arithmetic that forces this design.** Attention FLOPs per token scale with sequence length. Using the earlier estimate, the attention term is roughly `seq_len / (6 · d_model)` as a fraction of the `6ND` term. At `d_model = 4096`: at 8k that ratio is `8192/24576 = 33%`; at 128k it is `131072/24576 = 533%`. So training at 128k costs roughly `(1 + 5.33)/(1 + 0.33) = 4.8×` per token versus 8k. Training the entire 15T-token run at 128k would turn a $1.26M run into a $6M run to buy a capability that 2% of the tokens can deliver.
+**The arithmetic that forces this design.** Attention FLOPs per token scale with sequence length. Using the earlier estimate, the attention term is roughly `seq_len / (12 · d_model)` as a fraction of the `6ND` term for a causal model. At `d_model = 4096`: at 8k that ratio is `8192/49152 = 17%`; at 128k it is `131072/49152 = 267%`. So training at 128k costs roughly `(1 + 2.67)/(1 + 0.17) ≈ 3.1×` per token versus 8k. Training the entire 15T-token run at 128k would turn a $1.26M run into a ~$3.9M run to buy a capability that 2% of the tokens can deliver.
 
 **The mechanism, in three parts:**
 
@@ -1092,10 +1092,10 @@ This is a pipeline observability problem and it is solvable in an hour if you bu
 - 5% — **ablations**: ~20 runs at 1B params × 20B tokens each. Each is `6 × 1e9 × 2e10 = 1.2e20` FLOPs, and 20 of them is `2.4e21` = 1.4% of budget. Cheap, and it is where you learn what your data is worth.
 - 60% — **CPT + mid-training trunk**: ~2T tokens on the 8B at `6 × 8e9 × 2e12 = 9.6e22` FLOPs = 56% of budget. Domain-heavy with 20% general replay.
 - 15% — **decay-phase variants**: four annealed mixes at 150B tokens each = `4 × 7.2e21 = 2.9e22` = 17%.
-- 10% — **long-context extension**: 100B tokens at 128k, which costs ~4.8× per token, so `4.8 × 6 × 8e9 × 1e11 = 2.3e22` = 13%.
+- 10% — **long-context extension**: 100B tokens at 128k, which costs ~3.1× per token, so `3.1 × 6 × 8e9 × 1e11 = 1.5e22` = 9%.
 - Remainder — post-training and slack. And there is *always* slack, because you will lose ~10% to failures.
 
-*Sanity checks you should state:* 56% + 17% + 13% + 1.4% ≈ 88%, leaving ~10% for goodput loss — that is the right shape. And a 2T-token trunk at 20% replay is 1.6T domain tokens against, say, 300B unique domain tokens, i.e. 5.3 epochs, which is over the 4-epoch line, so either I need more data or I lower the domain weight. **Catching that in the plan rather than in the run is the point of the drill.**
+*Sanity checks you should state:* 56% + 17% + 9% + 1.4% ≈ 83%, leaving ~15% for post-training and goodput loss — that is the right shape. And a 2T-token trunk at 20% replay is 1.6T domain tokens against, say, 300B unique domain tokens, i.e. 5.3 epochs, which is over the 4-epoch line, so either I need more data or I lower the domain weight. **Catching that in the plan rather than in the run is the point of the drill.**
 
 ### 🏋 Second drill: implement MinHash near-duplicate detection from scratch. Thirty minutes.
 

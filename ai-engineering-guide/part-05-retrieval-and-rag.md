@@ -185,12 +185,12 @@ Rarely, and being able to say that crisply is a senior signal. Let me do the ari
 - 335M encoder: `2 × 0.335e9 × 40e9` = **2.7e19 FLOPs**
 - 7B decoder-embedder: `2 × 7e9 × 40e9` = **5.6e20 FLOPs** — 21× more.
 
-Put that on an H100 at ~990 bf16 TFLOPS peak, assume a realistic 35% MFU for batched encoder inference (~350 TFLOPS effective):
+Put that on an H100 at ~990 bf16 TFLOPS peak, assume a best-case 35% MFU for batched encoder inference (~350 TFLOPS effective) — optimistic, and I'll correct for that in a moment:
 
 - 335M: 2.7e19 / 3.5e14 = **77,000 GPU-seconds ≈ 21 GPU-hours**
 - 7B: 5.6e20 / 3.5e14 = 1.6e6 s ≈ **444 GPU-hours**
 
-At a rough $3/hr for an on-demand H100 that is **$63 versus $1,332** for one full index build. That difference alone is not decisive — but you do not build the index once. Every model upgrade, every chunking change, every schema migration forces a rebuild, and if you re-embed quarterly the 7B costs you ~$5.3k/yr versus $250/yr in pure compute. **Treat those absolute dollars as a floor, not a forecast:** 35% MFU is an optimistic FLOP-bound assumption, and later in this section I plan real self-hosted capacity at a *measured* ~100k tokens/s per H100 for a 335M encoder, which is roughly 3× more conservative and moves the 335M build to ~111 GPU-hours / ~$333. The **ratio** between the two models is the robust part of this calculation and it is what the decision actually turns on.
+At a rough $3/hr for an on-demand H100 that is **$63 versus $1,332** for one full index build. That difference alone is not decisive — but you do not build the index once. Every model upgrade, every chunking change, every schema migration forces a rebuild, and if you re-embed quarterly the 7B costs you ~$5.3k/yr versus $250/yr in pure compute. **Treat those absolute dollars as a floor, not a forecast:** 35% MFU is an optimistic FLOP-bound assumption, and later in this section I plan real self-hosted capacity at a *measured* ~100k tokens/s per H100 for a 335M encoder, which is roughly 5× more conservative than the number used here (the 35%-MFU derivation implies ~520k tokens/s) and moves the 335M build to ~111 GPU-hours / ~$333. The **ratio** between the two models is the robust part of this calculation and it is what the decision actually turns on.
 
 The real cost is at query time. A 335M encoder embeds a 20-token query in single-digit milliseconds; a 7B model, even batched, adds tens of milliseconds to a p99 that sits directly in your TTFT budget, and it needs a GPU with enough memory to hold 14GB of weights per replica instead of 0.7GB — so your embedding fleet's minimum viable footprint jumps by an order of magnitude, and you can no longer colocate it on a cheap L4.
 
@@ -2543,26 +2543,26 @@ The through-line worth stating: **every advance moved information from "computed
 
 This is exactly the arithmetic I want a candidate to be able to do out loud, so let me do it fully.
 
-A transformer forward pass costs approximately `2 × N_params × N_tokens` FLOPs for the matmul-dominated part. Take `bge-reranker-base`, a BERT-base-class model at ~110M parameters, and a query-plus-passage sequence truncated to 512 tokens.
+A transformer forward pass costs approximately `2 × N_params × N_tokens` FLOPs for the matmul-dominated part. Take `bge-reranker-base` — despite the name it is XLM-RoBERTa-base under the hood, ~278M parameters, not BERT-base's 110M — and a query-plus-passage sequence truncated to 512 tokens.
 
-Per pair: `2 × 110e6 × 512 = 1.13e11 FLOPs = 0.113 TFLOP`.
-For 100 candidates: `100 × 0.113 = 11.3 TFLOP`.
+Per pair: `2 × 278e6 × 512 = 2.85e11 FLOPs = 0.285 TFLOP`.
+For 100 candidates: `100 × 0.285 = 28.5 TFLOP`.
 
 Now the hardware. An A10G does roughly 70 TFLOP/s of non-sparse bf16 in theory; at a realistic 35–45% model-FLOPs-utilization for a batched short-sequence encoder workload, call it **25 TFLOP/s effective**.
 
-`11.3 / 25 = 0.45 seconds`. **100 candidates at 512 tokens does not fit in a 300 ms budget on one A10G.** That is the honest answer and the interesting part is what you do about it.
+`28.5 / 25 = 1.14 seconds`. **100 candidates at 512 tokens does not fit in a 300 ms budget on one A10G — it is nearly 4× over.** That is the honest answer and the interesting part is what you do about it.
 
 Three levers, in the order I pull them:
 
-**Truncate.** Cost is linear in sequence length. Going from 512 to 256 tokens halves it to 226 ms. Your chunks are probably ~400 tokens; the reranker rarely needs all of them, because relevance is usually determined in the first couple of sentences. Measure the nDCG loss from truncation — in my experience truncating to 256 costs under 1 point on typical RAG chunks and buys you 2× throughput. That is a trade I take almost every time.
+**Truncate.** Cost is linear in sequence length. Going from 512 to 256 tokens halves it to 570 ms. Your chunks are probably ~400 tokens; the reranker rarely needs all of them, because relevance is usually determined in the first couple of sentences. Measure the nDCG loss from truncation — in my experience truncating to 256 costs under 1 point on typical RAG chunks and buys you 2× throughput. That is a trade I take almost every time.
 
-**Cut the candidate count.** 100 → 50 halves it again, to 113 ms at 256 tokens. Combined with truncation you are now comfortably inside budget. The recall cost of 100 → 50 is measurable on your ablation table and is usually small if your first stage is a good hybrid.
+**Cut the candidate count.** 100 → 50 halves it again, to ~285 ms at 256 tokens. Combined with truncation you are now at the edge of the budget, and the length-sorted batching below is what gets you comfortably inside it. The recall cost of 100 → 50 is measurable on your ablation table and is usually small if your first stage is a good hybrid.
 
 **Batch properly and use a smaller model.** All 50 pairs go in one batch — this is not optional, per-pair calls waste the GPU entirely. Sort by length and pad within the batch rather than to a global 512, which on a realistic length distribution saves another 20–35%. And consider a distilled 4- or 6-layer reranker: a 6-layer model at ~1/2 the params of BERT-base roughly halves FLOPs again.
 
-**📐 Numbers you must know:** `2 × params × tokens` FLOPs per forward pass. `bge-reranker-base` ≈ 110M params. 100 pairs × 512 tokens ≈ 11.3 TFLOP ≈ 450 ms on one A10G at 25 TFLOP/s effective. **The memorizable version: roughly 4–5 ms per 512-token pair on a mid-range single GPU, so your candidate count times 4.5 ms is your rerank latency.** Sanity-check any vendor's latency claim against this.
+**📐 Numbers you must know:** `2 × params × tokens` FLOPs per forward pass. `bge-reranker-base` ≈ 278M params. 100 pairs × 512 tokens ≈ 28.5 TFLOP ≈ 1.1 s on one A10G at 25 TFLOP/s effective. **The memorizable version: roughly 11 ms per 512-token pair on a mid-range single GPU, so your candidate count times 11 ms is your rerank latency.** Sanity-check any vendor's latency claim against this.
 
-**⚠ Trap:** measuring reranker latency with a warm single-request benchmark and then deploying behind a shared endpoint. At 20 QPS with 50 candidates each, you are asking for 1,000 pair-scorings per second, which is `1000 × 0.113 TFLOP = 113 TFLOP/s` of *useful* work — at the 25 TFLOP/s effective throughput derived above, that is `113 / 25 ≈ 4.5`, so more than four A10Gs saturated. Reranking is a *throughput* problem in production and a *latency* problem in your benchmark, and the two sizing calculations give completely different answers.
+**⚠ Trap:** measuring reranker latency with a warm single-request benchmark and then deploying behind a shared endpoint. At 20 QPS with 50 candidates each, you are asking for 1,000 pair-scorings per second, which is `1000 × 0.285 TFLOP = 285 TFLOP/s` of *useful* work — at the 25 TFLOP/s effective throughput derived above, that is `285 / 25 ≈ 11`, so more than ten A10Gs saturated. Reranking is a *throughput* problem in production and a *latency* problem in your benchmark, and the two sizing calculations give completely different answers.
 
 ### Write the production code for a rerank stage. Assume a self-hosted cross-encoder.
 
@@ -2619,10 +2619,10 @@ The axes, in the order I actually weigh them:
 **💰 Math — the buy-vs-build crossover, which you should be able to compute live.** Assume a hosted reranker at $2.00 per 1,000 searches (📅 Volatile — verify current list pricing; the shape of the argument survives, the number will not).
 
 - 1M queries/day = 1,000 thousand-search units/day × $2.00 = **$2,000/day = $60,000/month.**
-- Self-hosted: from the arithmetic above, one A10G scores ~50 candidates at 256 tokens in ~113 ms, so ~8 QPS/GPU sustained. Average load is `1e6 / 86,400 = 11.6 QPS`; size for a 3× peak = 35 QPS → **5 GPUs**, call it 7 with headroom for failure domains. At roughly $1.00/GPU-hour on-demand: `7 × $1.00 × 730 = $5,110/month`, or under $3,000 with reserved/spot capacity.
-- **Crossover: roughly $55k/month in favor of self-hosting at this volume**, against maybe 0.3–0.5 FTE of ops burden. At 10k queries/day the same math gives `10 × $2.00 = $20/day = $600/month` for the API versus $730/month for one always-on GPU you cannot scale below one — and once you add the ops burden on top of that $730, the API wins comfortably.
+- Self-hosted: from the arithmetic above, one A10G scores ~50 candidates at 256 tokens in ~285 ms, so ~3.5 QPS/GPU sustained. Average load is `1e6 / 86,400 = 11.6 QPS`; size for a 3× peak = 35 QPS → **10 GPUs**, call it 12 with headroom for failure domains. At roughly $1.00/GPU-hour on-demand: `12 × $1.00 × 730 = $8,760/month`, or ~$5,000 with reserved/spot capacity.
+- **Crossover: roughly $51k/month in favor of self-hosting at this volume**, against maybe 0.3–0.5 FTE of ops burden. At 10k queries/day the same math gives `10 × $2.00 = $20/day = $600/month` for the API versus $730/month for one always-on GPU you cannot scale below one — and once you add the ops burden on top of that $730, the API wins comfortably.
 
-**🗣 Say this in the room:** "Use the hosted reranker until you cross roughly 100k reranked queries per day, then the GPU math flips hard — at 1M/day a hosted reranker at $2 per thousand searches is $60k/month against about $5k of A10G capacity. Below that threshold, paying the vendor is cheaper than the engineer-hours to run it."
+**🗣 Say this in the room:** "Use the hosted reranker until you cross roughly 100k reranked queries per day, then the GPU math flips hard — at 1M/day a hosted reranker at $2 per thousand searches is $60k/month against about $9k of A10G capacity. Below that threshold, paying the vendor is cheaper than the engineer-hours to run it."
 
 ### An LLM can rank passages too. Compare pointwise, listwise and RankGPT-style reranking against a cross-encoder.
 
@@ -2746,13 +2746,13 @@ Budget arithmetic for a chat product with a 1.5 s TTFT target:
 ```
 query embed + rewrite    :  120 ms   (skip the rewrite when there's no chat history)
 hybrid retrieval (‖)     :   60 ms   (max of BM25 and ANN, run concurrently)
-rerank 50 @ 256 tok      :  115 ms
+rerank 50 @ 256 tok      :  285 ms
 dedup + MMR + assembly   :   15 ms
 ──────────────────────────────────
-retrieval subtotal       :  310 ms
+retrieval subtotal       :  480 ms
 LLM prefill + first token: 400–900 ms depending on context length
 ──────────────────────────────────
-total TTFT               : 710–1210 ms   ✓ inside budget
+total TTFT               : 880–1380 ms   ✓ inside budget
 ```
 
 The levers when you blow the budget, in the order I use them:
@@ -2909,7 +2909,7 @@ I'll assume a 5M-line monorepo, a chat-and-inline-edit product, and a hard TTFT 
 3. **Reference/call-graph edges** — not a retrieval index but an expansion step: once you have a relevant function, pull its callers and callees. This is how you answer "why is this failing" questions that need the call site, not just the definition.
 4. **Recent-edit and open-file context**, which is not retrieved at all but injected — the file the user is looking at is overwhelmingly the most relevant context and should never have to win a similarity contest.
 
-**Fusion and reranking:** RRF over symbol/BM25/dense with symbol matches weighted heavily, then a cross-encoder rerank over 50 candidates truncated to 256 tokens (~115 ms per the earlier arithmetic), then dedup — critical in a monorepo where the same utility function exists in four vendored copies.
+**Fusion and reranking:** RRF over symbol/BM25/dense with symbol matches weighted heavily, then a cross-encoder rerank over 50 candidates truncated to 256 tokens (~285 ms per the earlier arithmetic), then dedup — critical in a monorepo where the same utility function exists in four vendored copies.
 
 **The operational requirement that dominates the design: incremental reindex per commit.** A monorepo takes hours to fully index and receives hundreds of commits a day. So the index must be keyed by content hash per file, reindexing only changed files on the post-commit hook, with the symbol index updated transactionally alongside. A retrieval system that is 40 minutes stale in a coding assistant returns code the user just deleted, and that is a trust-destroying failure — worse than returning nothing.
 
@@ -3031,7 +3031,7 @@ Four drills, unaided, no autocomplete, timed. These are calibrated so that passi
 
 **🏋 Drill 2 — fusion and diversity (30 minutes).** Implement weighted RRF and MMR from scratch, both with correct edge-case handling: missing documents contribute zero to RRF; MMR rescales relevance onto the cosine scale before combining. Then, on paper: a document is rank 1 in dense only, another is rank 15 in both. Which wins at `k = 60`? Show the arithmetic. *Pass criterion:* `1/61 = 0.0164` vs `2/75 = 0.0267`, second wins, and you can state in one sentence why that is the desired behavior.
 
-**🏋 Drill 3 — the latency budget (15 minutes, whiteboard, no calculator).** You have a 1.2 s TTFT budget. Your reranker is a 110M-parameter cross-encoder on one A10G. How many candidates can you rerank at 512 tokens? At 256? Show `2 × params × tokens`, an effective 25 TFLOP/s, and derive the candidate count. Then name three levers to double it. *Pass criterion:* you get ~0.113 TFLOP/pair at 512 tokens, ~4.5 ms/pair, so ~65 candidates fill a 300 ms rerank budget — and 130 at 256 tokens. Levers: truncation, cascade with a small first reranker, batching with length-sorted padding.
+**🏋 Drill 3 — the latency budget (15 minutes, whiteboard, no calculator).** You have a 1.2 s TTFT budget. Your reranker is `bge-reranker-base` (~278M parameters) on one A10G. How many candidates can you rerank at 512 tokens? At 256? Show `2 × params × tokens`, an effective 25 TFLOP/s, and derive the candidate count. Then name three levers to double it. *Pass criterion:* you get ~0.285 TFLOP/pair at 512 tokens, ~11 ms/pair, so ~26 candidates fill a 300 ms rerank budget — and ~52 at 256 tokens. Levers: truncation, cascade with a small first reranker, batching with length-sorted padding.
 
 **🏋 Drill 4 — the ablation table (45 minutes, with a laptop).** Take any public QA dataset with relevance labels. Build the six-row ablation table from earlier — dense only, BM25 only, hybrid, +rerank, +MMR, +recency — reporting recall@50, nDCG@10 and p95 latency, with bootstrap 95% confidence intervals on each delta. *Pass criterion:* the table exists, every delta has an interval, and you can point to at least one row whose interval crosses zero and say out loud "this stage does not currently earn its place."
 

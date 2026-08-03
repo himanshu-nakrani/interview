@@ -2079,7 +2079,11 @@ class FakeModel:
         step = self._next(req)
         if isinstance(step, Raise): raise step.exc
         assert isinstance(step, Chunks)
-        for p in step.parts:
+        for i, p in enumerate(step.parts):
+            if i == len(step.parts) - 1 and step.gap_before_last:
+                await asyncio.sleep(step.gap_before_last)   # stall right before the last delta
+            elif step.gap:
+                await asyncio.sleep(step.gap)               # steady inter-chunk pacing
             yield ModelEvent(type="delta", text=p)
         if step.truncate:
             raise ConnectionResetError("stream cut mid-generation")

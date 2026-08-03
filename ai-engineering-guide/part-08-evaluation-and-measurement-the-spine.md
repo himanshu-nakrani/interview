@@ -152,7 +152,7 @@ The dimensions I stratify on, in priority order:
 4. **Language / locale**, if you serve more than one.
 5. **The negative arm** — inputs where the correct behaviour is refusal, escalation, or "not found." Typically 15–25% of the set. Without this, every metric rewards confident guessing.
 
-The failure this prevents is a Simpson's-paradox flip and it is not hypothetical. Aggregate goes 0.71 → 0.74; underneath, easy went 0.94 → 0.97 (n=180) and hard went 0.41 → 0.34 (n=60). You shipped a regression on precisely the queries where users notice, because the easy bucket outnumbered the hard one three to one. **The rule I enforce in review: no eval result is reportable without the per-slice table, and CI gates on the worst slice, not the mean.**
+The failure this prevents is a Simpson's-paradox flip and it is not hypothetical. Aggregate goes 0.81 → 0.81, reading as a small win; underneath, easy went 0.94 → 0.97 (n=180) and hard went 0.41 → 0.34 (n=60), and the weighted mean ((180×0.97 + 60×0.34)/240) hides the drop completely. You shipped a regression on precisely the queries where users notice, because the easy bucket outnumbered the hard one three to one. **The rule I enforce in review: no eval result is reportable without the per-slice table, and CI gates on the worst slice, not the mean.**
 
 There is a real cost to this: with k slices you need roughly k times the cases for the same per-slice power, and I've already shown 50 cases per slice gives ±11 points. So slice count is a budget. Four to six slices on your primary axis is usually the sweet spot; twelve slices of 30 cases each is a table of noise that looks rigorous.
 
