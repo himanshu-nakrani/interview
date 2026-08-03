@@ -12,6 +12,23 @@ prior ML, GPU, or training knowledge, teaching those from the ground up at full 
 
 [**Read the curriculum rationale, answer-format contract, and study paths →**](CURRICULUM.md)
 
+## Read it on the web
+
+The markdown in this repository is the source of truth. A small static-site generator renders it into a
+reading site — one page per section, light/sepia/dark themes, adjustable type and measure, and search across
+all 5,642 questions in both guides.
+
+```bash
+npm install
+npm run dev      # build, then serve at http://localhost:4173
+```
+
+`npm run build` writes the site to `site/` (git-ignored). Pushing to `main` builds and publishes it to GitHub
+Pages via `.github/workflows/pages.yml` — enable it once under **Settings → Pages → Source: GitHub Actions**.
+
+Nothing in the generator writes to the markdown files. Section splits, question anchors, contents lists and
+reading times are all derived at build time, so editing a `.md` file and rebuilding is the whole workflow.
+
 ## Every answer follows a five-beat contract
 
 1. **Mental model first** — the intuition that makes the mechanism inevitable rather than memorized.
