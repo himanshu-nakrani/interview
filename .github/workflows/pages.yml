@@ -32,8 +32,12 @@ jobs:
           node-version: 22
           cache: npm
 
+      # `enablement` turns Pages on with the Actions build type the first time
+      # this runs, so the site does not need the settings toggled by hand.
       - uses: actions/configure-pages@v5
         id: pages
+        with:
+          enablement: true
 
       - run: npm ci
 
