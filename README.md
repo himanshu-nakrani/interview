@@ -23,8 +23,17 @@ npm install
 npm run dev      # build, then serve at http://localhost:4173
 ```
 
-`npm run build` writes the site to `site/` (git-ignored). Pushing to `main` builds and publishes it to GitHub
-Pages via `.github/workflows/pages.yml` — enable it once under **Settings → Pages → Source: GitHub Actions**.
+`npm run build` writes the site to `site/` (git-ignored). Two deployment paths are wired up, and they can be
+used together or separately:
+
+- **Vercel** — import the repository at [vercel.com/new](https://vercel.com/new). `vercel.json` sets the build
+  command and output directory, so no settings need filling in. Every push builds a preview; `main` becomes
+  production.
+- **GitHub Pages** — `.github/workflows/pages.yml` builds and publishes on pushes to `main`. Requires
+  **Settings → Pages → Source: GitHub Actions** once; creating the Pages site cannot be done from CI.
+
+The build reads its base path from whichever host it runs on, so the same output works at a domain root or
+under a `/repo/` sub-path.
 
 Nothing in the generator writes to the markdown files. Section splits, question anchors, contents lists and
 reading times are all derived at build time, so editing a `.md` file and rebuilding is the whole workflow.

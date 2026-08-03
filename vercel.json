@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "npm ci",
+  "buildCommand": "SITE_URL=${VERCEL_PROJECT_PRODUCTION_URL:+https://$VERCEL_PROJECT_PRODUCTION_URL} npm run build",
+  "outputDirectory": "site",
+  "trailingSlash": true,
+  "headers": [
+    {
+      "source": "/assets/search-index.json",
+      "headers": [{ "key": "Cache-Control", "value": "public, max-age=0, s-maxage=86400, must-revalidate" }]
+    }
+  ]
+}
