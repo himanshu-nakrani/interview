@@ -1,0 +1,17 @@
+{
+  "name": "interview-guides-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Static site generator for the interview preparation guides — a quiet, readable web edition of the markdown sources.",
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "serve": "node tools/serve.mjs",
+    "dev": "node tools/build.mjs && node tools/serve.mjs"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "highlight.js": "^11.11.1",
+    "markdown-it": "^14.3.0"
+  }
+}

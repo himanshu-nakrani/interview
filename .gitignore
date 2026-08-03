@@ -44,3 +44,6 @@ build/
 # intermediate generation output
 build/
 verify/
+
+# generated website (npm run build)
+/site
