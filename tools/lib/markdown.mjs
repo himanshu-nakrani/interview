@@ -204,26 +204,35 @@ export function createRenderer() {
     // Question anchors were minted by the content parser; consume them in
     // document order so every link in the build agrees on the same id.
     let id;
-    if (level === 3 && env.questionAnchors?.length) id = env.questionAnchors.shift();
+    let isQuestion = false;
+    if (level === 3 && env.questionAnchors?.length) {
+      id = env.questionAnchors.shift();
+      isQuestion = true;
+    }
     id = id ?? env.slugger(text);
 
     token.attrSet('id', id);
     token.attrJoin('class', 'anchored');
+    if (isQuestion) token.attrJoin('class', 'question');
     env.headings?.push({ level, text, id });
     return self.renderToken(tokens, index, options);
   };
   md.renderer.rules.heading_close = (tokens, index, options, env, self) => {
     let id = null;
+    let cls = '';
     for (let i = index - 1; i >= 0; i -= 1) {
       if (tokens[i].type === 'heading_open') {
         id = tokens[i].attrGet('id');
+        cls = tokens[i].attrGet('class') || '';
         break;
       }
     }
     const close = self.renderToken(tokens, index, options);
-    return id
-      ? `<a class="heading-link" href="#${id}" aria-hidden="true" tabindex="-1">#</a>${close}`
-      : close;
+    if (!id) return close;
+    const openBtn = cls.split(' ').includes('question')
+      ? '<button class="question-open" type="button" title="Open in a reading popup" aria-label="Open this question in a reading popup"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5H5v4M15 5h4v4M9 19H5v-4M15 19h4v-4"/></svg></button>'
+      : '';
+    return `${openBtn}<a class="heading-link" href="#${id}" aria-hidden="true" tabindex="-1">#</a>${close}`;
   };
 
   // Callouts: a paragraph that opens with one of the guides' markers becomes

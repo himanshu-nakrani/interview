@@ -86,6 +86,9 @@
     }
     if (action === 'open-search') { event.preventDefault(); openSearch(); return; }
     if (action === 'close-search') { closeSearch(); return; }
+    if (action === 'close-question') { if (qdialog && qdialog.open) qdialog.close(); return; }
+    if (action === 'prev-question') { stepQuestion(-1); return; }
+    if (action === 'next-question') { stepQuestion(1); return; }
 
     if (prefsPanel && !prefsPanel.hidden && !event.target.closest('#prefs') && !event.target.closest('[data-action="toggle-prefs"]')) {
       setPrefsOpen(false);
@@ -94,35 +97,39 @@
 
   /* --- Copy buttons ------------------------------------------------ */
 
-  $$('.code-block').forEach(function (block) {
-    var button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'code-copy';
-    button.textContent = 'Copy';
-    button.addEventListener('click', function () {
-      var code = $('code', block);
-      var text = code ? code.textContent : '';
-      var done = function () {
-        button.textContent = 'Copied';
-        button.setAttribute('data-copied', '');
-        setTimeout(function () {
-          button.textContent = 'Copy';
-          button.removeAttribute('data-copied');
-        }, 1600);
-      };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(done, function () {});
-      } else {
-        var area = document.createElement('textarea');
-        area.value = text;
-        document.body.appendChild(area);
-        area.select();
-        try { document.execCommand('copy'); done(); } catch (e) { /* ignore */ }
-        document.body.removeChild(area);
-      }
+  function wireCopy(scope) {
+    $$('.code-block', scope).forEach(function (block) {
+      if ($('.code-copy', block)) return;
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'code-copy';
+      button.textContent = 'Copy';
+      button.addEventListener('click', function () {
+        var code = $('code', block);
+        var text = code ? code.textContent : '';
+        var done = function () {
+          button.textContent = 'Copied';
+          button.setAttribute('data-copied', '');
+          setTimeout(function () {
+            button.textContent = 'Copy';
+            button.removeAttribute('data-copied');
+          }, 1600);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, function () {});
+        } else {
+          var area = document.createElement('textarea');
+          area.value = text;
+          document.body.appendChild(area);
+          area.select();
+          try { document.execCommand('copy'); done(); } catch (e) { /* ignore */ }
+          document.body.removeChild(area);
+        }
+      });
+      block.appendChild(button);
     });
-    block.appendChild(button);
-  });
+  }
+  wireCopy(document);
 
   /* --- Reading progress -------------------------------------------- */
 
@@ -346,6 +353,76 @@
     pageInput.focus();
   }
 
+  /* --- Question popup ---------------------------------------------- *
+   * Each question (an h3 minted with a question anchor) can be lifted
+   * into a reading dialog on its own, with prev/next between questions. */
+
+  var qdialog = $('#question-dialog');
+  var qbody = $('#qdialog-body');
+  var qcount = $('#qdialog-count');
+  var questions = qdialog ? $$('.prose h3.question') : [];
+  var qIndex = -1;
+
+  function questionNodes(heading) {
+    var nodes = [];
+    var node = heading.nextElementSibling;
+    while (node && !/^H[23]$/.test(node.tagName)) {
+      nodes.push(node);
+      node = node.nextElementSibling;
+    }
+    return nodes;
+  }
+
+  function renderQuestion(i) {
+    var heading = questions[i];
+    if (!heading || !qbody || !qdialog) return;
+    qIndex = i;
+    qbody.innerHTML = '';
+    var inner = document.createElement('div');
+    inner.className = 'qdialog-inner prose';
+    var title = heading.cloneNode(true);
+    $$('.heading-link, .question-open', title).forEach(function (n) { n.remove(); });
+    inner.appendChild(title);
+    questionNodes(heading).forEach(function (n) { inner.appendChild(n.cloneNode(true)); });
+    qbody.appendChild(inner);
+    wireCopy(inner);
+    var text = heading.textContent.replace(/[#\s]+$/g, '').trim();
+    qdialog.setAttribute('aria-label', text.length > 90 ? text.slice(0, 90) + '…' : text);
+    if (qcount) qcount.textContent = (i + 1) + ' of ' + questions.length;
+    var prev = $('[data-action="prev-question"]', qdialog);
+    var next = $('[data-action="next-question"]', qdialog);
+    if (prev) prev.disabled = i === 0;
+    if (next) next.disabled = i === questions.length - 1;
+    qbody.scrollTop = 0;
+    qbody.focus({ preventScroll: true });
+  }
+
+  function openQuestion(i) {
+    if (!qdialog || !questions.length) return;
+    renderQuestion(i);
+    if (!qdialog.open) qdialog.showModal();
+  }
+
+  function stepQuestion(delta) {
+    if (!qdialog || !qdialog.open) return;
+    var n = qIndex + delta;
+    if (n >= 0 && n < questions.length) renderQuestion(n);
+  }
+
+  $$('.question-open').forEach(function (button) {
+    button.addEventListener('click', function () {
+      var heading = button.closest('h3');
+      var i = questions.indexOf(heading);
+      if (i >= 0) openQuestion(i);
+    });
+  });
+
+  if (qdialog) {
+    qdialog.addEventListener('click', function (event) {
+      if (event.target === qdialog) qdialog.close();
+    });
+  }
+
   /* --- Keyboard ----------------------------------------------------- */
 
   document.addEventListener('keydown', function (event) {
@@ -358,6 +435,14 @@
     if ((event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)) {
       event.preventDefault();
       openSearch();
+      return;
+    }
+
+    if (qdialog && qdialog.open) {
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        event.preventDefault();
+        stepQuestion(event.key === 'ArrowLeft' ? -1 : 1);
+      }
       return;
     }
 

@@ -296,6 +296,21 @@ ${searchOverlay()}
   </main>
   ${hasOutline ? `<aside class="outline">${outlineHtml}</aside>` : ''}
 </div>
+<dialog class="qdialog" id="question-dialog">
+  <div class="qdialog-head">
+    <div class="qdialog-bar">
+      <p class="qdialog-count" id="qdialog-count" aria-live="polite"></p>
+      <button class="icon-btn" type="button" data-action="close-question" aria-label="Close question">${icon.close}</button>
+    </div>
+  </div>
+  <div class="qdialog-body" id="qdialog-body" tabindex="-1"></div>
+  <div class="qdialog-foot">
+    <div class="qdialog-bar">
+      <button class="btn" type="button" data-action="prev-question">${icon.arrowLeft} Previous</button>
+      <button class="btn" type="button" data-action="next-question">Next ${icon.arrowRight}</button>
+    </div>
+  </div>
+</dialog>
 ${siteFooter()}
 <script src="/assets/reader.js" defer></script>
 </body>
@@ -348,32 +363,13 @@ export function homePage({ collections, stats }) {
     </p>
   </header>
 
-  <dl class="stat-row">
-    <div><dt>Questions</dt><dd>${formatNumber(stats.questions)}</dd></div>
-    <div><dt>Sections</dt><dd>${formatNumber(stats.sections)}</dd></div>
-    <div><dt>Words</dt><dd>${formatNumber(Math.round(stats.words / 1000))}k</dd></div>
-    <div><dt>Reading time</dt><dd>≈${formatNumber(Math.round(stats.minutes / 60))} h</dd></div>
-  </dl>
-
   <section class="guide-cards">${cards}</section>
 
   <section class="legend-block">
     <h2 class="section-heading">The marks in the margin</h2>
-    <p class="prose">Both guides use a small, consistent vocabulary of markers. On the web they are set as
-      callouts, so you can skim a section for exactly the thing you need.</p>
+    <p class="prose">Both guides use a small, consistent vocabulary of markers, set as quiet callouts
+      so you can skim a section for exactly the thing you need.</p>
     <ul class="legend">${legend}</ul>
-  </section>
-
-  <section class="closing">
-    <h2 class="section-heading">How this site is made</h2>
-    <div class="prose">
-      <p>The markdown files in this repository are the source of truth and are never rewritten. The build
-        reads them, splits them at their own section boundaries, and renders static HTML — one page per
-        section, so no page is longer than a sitting.</p>
-      <p>Everything is progressive enhancement: the text is in the HTML, the code is highlighted at build
-        time, and JavaScript only adds search, the reading controls and the outline highlight. Reader
-        preferences live in your browser and nowhere else.</p>
-    </div>
   </section>
 </article>`;
 
