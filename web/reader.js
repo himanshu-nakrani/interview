@@ -53,6 +53,33 @@
     });
   });
 
+  /* --- Collapsible rails (contents / outline) ---------------------- */
+
+  var RAILS_KEY = 'reader-rails';
+  var rails = {};
+  try { rails = JSON.parse(localStorage.getItem(RAILS_KEY) || '{}') || {}; } catch (e) { rails = {}; }
+
+  function railHidden(name) { return root.getAttribute('data-' + name) === 'hidden'; }
+
+  function setRail(name, hidden) {
+    if (hidden) root.setAttribute('data-' + name, 'hidden');
+    else root.removeAttribute('data-' + name);
+    rails[name] = hidden ? true : false;
+    try { localStorage.setItem(RAILS_KEY, JSON.stringify(rails)); } catch (e) { /* private mode */ }
+    var button = document.querySelector(
+      name === 'contents' ? '[data-action="toggle-contents"]' : '[data-action="toggle-outline"]',
+    );
+    if (button) button.setAttribute('aria-expanded', String(!hidden));
+  }
+
+  // Reflect any state applied before paint (head script) onto the buttons.
+  (function () {
+    var left = document.querySelector('[data-action="toggle-contents"]');
+    var right = document.querySelector('[data-action="toggle-outline"]');
+    if (left) left.setAttribute('aria-expanded', String(!railHidden('contents')));
+    if (right) right.setAttribute('aria-expanded', String(!railHidden('outline')));
+  })();
+
   /* --- Panels ------------------------------------------------------ */
 
   var prefsPanel = $('#prefs');
@@ -78,6 +105,8 @@
 
     if (action === 'toggle-prefs') { setPrefsOpen(prefsPanel.hidden); return; }
     if (action === 'toggle-nav') { setNavOpen(!body.classList.contains('nav-open')); return; }
+    if (action === 'toggle-contents') { setRail('contents', !railHidden('contents')); return; }
+    if (action === 'toggle-outline') { setRail('outline', !railHidden('outline')); return; }
     if (action === 'cycle-theme') {
       var next = THEME_ORDER[(THEME_ORDER.indexOf(pref('theme')) + 1) % THEME_ORDER.length];
       setPref('theme', next);

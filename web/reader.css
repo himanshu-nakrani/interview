@@ -1,13 +1,17 @@
 /* ------------------------------------------------------------------ *
- * Interview Guides — reading styles
+ * Interview Guides — reading styles, set as a printed book.
  *
- * Goals, in order: a comfortable measure, quiet colour, and no motion that
- * asks for attention. Everything else follows from those three.
+ * The conceit: warm paper, ink-black serif text, one oxblood-red accent
+ * (two-colour letterpress), running heads, folios, chapter openers with
+ * drop caps, and fleuron dividers. Quiet colour, no motion that asks for
+ * attention. Everything else follows from that.
  * ------------------------------------------------------------------ */
 
 /* --- Tokens ------------------------------------------------------- */
 
 :root {
+  --font-display: "Fraunces", "Iowan Old Style", "Palatino Linotype", Palatino,
+    "Book Antiqua", Charter, Georgia, serif;
   --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua",
     Charter, "Bitstream Charter", Georgia, Cambria, "Noto Serif", "Times New Roman", serif;
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto,
@@ -17,40 +21,44 @@
   --font-emoji: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
 
   --font-reading: var(--font-serif);
-  --measure: 38rem;
+  --measure: 37rem;
   --fs: 1.125rem;
-  --lh: 1.75;
+  --lh: 1.78;
 
   --topbar-h: 3.5rem;
   --rail: 17.5rem;
   --rail-right: 16rem;
   --gap: clamp(1.25rem, 4vw, 3.25rem);
 
-  --radius: 10px;
-  --radius-sm: 6px;
+  --radius: 4px;
+  --radius-sm: 3px;
 
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* Paper tooth — a whisper of fibre noise over the page. */
+  --paper-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
 }
 
-/* Light — warm paper */
+/* Light — fresh cream paper, black ink, oxblood red */
 :root,
 :root[data-theme="light"] {
   color-scheme: light;
-  --bg: #fbf8f3;
-  --bg-tint: #f3eee4;
-  --surface: #fffdfa;
-  --surface-2: #f7f2e9;
-  --ink: #23201c;
-  --ink-2: #4c463d;
-  --ink-3: #7e7568;
-  --rule: #e3dbcd;
-  --rule-soft: #ece5d8;
-  --accent: #2f6f61;
-  --accent-ink: #275d51;
-  --accent-wash: #e6efeb;
-  --code-bg: #f7f3ea;
-  --shadow: 0 1px 2px rgb(35 32 28 / 4%), 0 10px 30px -18px rgb(35 32 28 / 30%);
-  --hl-comment: #9b9386;
+  --bg: #f6efe1;
+  --bg-tint: #efe6d2;
+  --surface: #fbf6ea;
+  --surface-2: #f3ecdb;
+  --ink: #241f18;
+  --ink-2: #52483a;
+  --ink-3: #877a66;
+  --rule: #d9cdb4;
+  --rule-soft: #e4dac3;
+  --accent: #9c3d2e;
+  --accent-ink: #863327;
+  --accent-wash: #f2e2d8;
+  --code-bg: #f1e9d6;
+  --grain-opacity: 0.05;
+  --shadow: 0 1px 2px rgb(36 31 24 / 5%), 0 12px 34px -18px rgb(36 31 24 / 32%);
+  --hl-comment: #9b9081;
   --hl-keyword: #8a5c7d;
   --hl-string: #5c7a52;
   --hl-number: #a06a3c;
@@ -59,23 +67,24 @@
   --hl-attr: #6b7684;
 }
 
-/* Sepia — for long evenings */
+/* Sepia — an older, deeper paper */
 :root[data-theme="sepia"] {
   color-scheme: light;
-  --bg: #f3e9d8;
-  --bg-tint: #ecdfc9;
-  --surface: #f9f1e3;
-  --surface-2: #eee1cb;
-  --ink: #3a2e21;
-  --ink-2: #5b4b37;
+  --bg: #eddfc4;
+  --bg-tint: #e5d5b5;
+  --surface: #f4e9d2;
+  --surface-2: #eadcc0;
+  --ink: #38290f;
+  --ink-2: #5b4a2e;
   --ink-3: #8b7757;
-  --rule: #ddcdb1;
-  --rule-soft: #e6d9c1;
-  --accent: #8a5527;
-  --accent-ink: #6e441e;
-  --accent-wash: #eddfc6;
-  --code-bg: #efe4cf;
-  --shadow: 0 1px 2px rgb(58 46 33 / 5%), 0 10px 30px -18px rgb(58 46 33 / 32%);
+  --rule: #d3c09a;
+  --rule-soft: #dcccaa;
+  --accent: #8c3527;
+  --accent-ink: #742c20;
+  --accent-wash: #ecd8c0;
+  --code-bg: #e7d9bc;
+  --grain-opacity: 0.06;
+  --shadow: 0 1px 2px rgb(56 41 15 / 6%), 0 12px 34px -18px rgb(56 41 15 / 34%);
   --hl-comment: #978468;
   --hl-keyword: #855070;
   --hl-string: #4f7147;
@@ -85,24 +94,25 @@
   --hl-attr: #6a6d64;
 }
 
-/* Dark — warm charcoal, never black */
+/* Dark — a leather-bound volume read by lamplight */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #181715;
-  --bg-tint: #201e1b;
-  --surface: #1e1c19;
-  --surface-2: #24221e;
-  --ink: #e7e2d8;
-  --ink-2: #b4aea2;
-  --ink-3: #8b8577;
-  --rule: #322f29;
-  --rule-soft: #2a2723;
-  --accent: #84c0ac;
-  --accent-ink: #9bd0be;
-  --accent-wash: #1e2a26;
-  --code-bg: #141312;
-  --shadow: 0 1px 2px rgb(0 0 0 / 30%), 0 10px 30px -18px rgb(0 0 0 / 70%);
-  --hl-comment: #7c7568;
+  --bg: #191512;
+  --bg-tint: #211c17;
+  --surface: #1f1a15;
+  --surface-2: #262019;
+  --ink: #e9dfc9;
+  --ink-2: #b8ab90;
+  --ink-3: #8d8168;
+  --rule: #3a3226;
+  --rule-soft: #2e2820;
+  --accent: #d98f77;
+  --accent-ink: #e2a28c;
+  --accent-wash: #2c211b;
+  --code-bg: #131009;
+  --grain-opacity: 0.045;
+  --shadow: 0 1px 2px rgb(0 0 0 / 32%), 0 12px 34px -18px rgb(0 0 0 / 72%);
+  --hl-comment: #7f7562;
   --hl-keyword: #d3a0be;
   --hl-string: #9cbe8c;
   --hl-number: #d9a87a;
@@ -115,21 +125,22 @@
   :root:not([data-theme]),
   :root[data-theme="system"] {
     color-scheme: dark;
-    --bg: #181715;
-    --bg-tint: #201e1b;
-    --surface: #1e1c19;
-    --surface-2: #24221e;
-    --ink: #e7e2d8;
-    --ink-2: #b4aea2;
-    --ink-3: #8b8577;
-    --rule: #322f29;
-    --rule-soft: #2a2723;
-    --accent: #84c0ac;
-    --accent-ink: #9bd0be;
-    --accent-wash: #1e2a26;
-    --code-bg: #141312;
-    --shadow: 0 1px 2px rgb(0 0 0 / 30%), 0 10px 30px -18px rgb(0 0 0 / 70%);
-    --hl-comment: #7c7568;
+    --bg: #191512;
+    --bg-tint: #211c17;
+    --surface: #1f1a15;
+    --surface-2: #262019;
+    --ink: #e9dfc9;
+    --ink-2: #b8ab90;
+    --ink-3: #8d8168;
+    --rule: #3a3226;
+    --rule-soft: #2e2820;
+    --accent: #d98f77;
+    --accent-ink: #e2a28c;
+    --accent-wash: #2c211b;
+    --code-bg: #131009;
+    --grain-opacity: 0.045;
+    --shadow: 0 1px 2px rgb(0 0 0 / 32%), 0 12px 34px -18px rgb(0 0 0 / 72%);
+    --hl-comment: #7f7562;
     --hl-keyword: #d3a0be;
     --hl-string: #9cbe8c;
     --hl-number: #d9a87a;
@@ -146,11 +157,11 @@
 :root[data-size="m"] { --fs: 1.1875rem; }
 :root[data-size="l"] { --fs: 1.3125rem; }
 :root[data-width="narrow"] { --measure: 32rem; }
-:root[data-width="normal"] { --measure: 38rem; }
-:root[data-width="wide"] { --measure: 46rem; }
-:root[data-leading="tight"] { --lh: 1.6; }
-:root[data-leading="normal"] { --lh: 1.75; }
-:root[data-leading="airy"] { --lh: 1.92; }
+:root[data-width="normal"] { --measure: 37rem; }
+:root[data-width="wide"] { --measure: 44rem; }
+:root[data-leading="tight"] { --lh: 1.62; }
+:root[data-leading="normal"] { --lh: 1.78; }
+:root[data-leading="airy"] { --lh: 1.94; }
 
 /* --- Reset -------------------------------------------------------- */
 
@@ -173,6 +184,24 @@ body {
   text-rendering: optimizeLegibility;
   overflow-wrap: break-word;
 }
+
+/* The paper itself: a fixed layer of fibre noise under everything. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: var(--paper-grain);
+  opacity: var(--grain-opacity);
+  mix-blend-mode: multiply;
+}
+:root[data-theme="dark"] body::before { mix-blend-mode: screen; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) body::before,
+  :root[data-theme="system"] body::before { mix-blend-mode: screen; }
+}
+body > * { position: relative; z-index: 1; }
 
 img, svg { max-width: 100%; }
 button { font: inherit; color: inherit; }
@@ -200,16 +229,27 @@ button { font: inherit; color: inherit; }
 }
 .skip-link:focus { top: 0.5rem; }
 
-/* --- Top bar ------------------------------------------------------ */
+/* --- Top bar (the running head) ----------------------------------- */
 
 .topbar {
   position: sticky;
   top: 0;
   z-index: 40;
-  background: color-mix(in oklab, var(--bg) 82%, transparent);
-  backdrop-filter: saturate(1.4) blur(14px);
-  -webkit-backdrop-filter: saturate(1.4) blur(14px);
-  border-bottom: 1px solid var(--rule-soft);
+  background: color-mix(in oklab, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(1.3) blur(12px);
+  -webkit-backdrop-filter: saturate(1.3) blur(12px);
+  border-bottom: 1px solid var(--ink-3);
+}
+/* The printer's double rule under the running head. */
+.topbar::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -4px;
+  height: 1px;
+  background: var(--rule);
+  pointer-events: none;
 }
 
 .topbar-inner {
@@ -228,6 +268,7 @@ button { font: inherit; color: inherit; }
   gap: 0.55rem;
   text-decoration: none;
   color: var(--ink);
+  font-family: var(--font-display);
   font-weight: 600;
   letter-spacing: -0.01em;
   white-space: nowrap;
@@ -235,11 +276,26 @@ button { font: inherit; color: inherit; }
 .brand-mark {
   width: 0.9rem;
   height: 0.9rem;
-  border-radius: 3px;
+  border-radius: 2px;
   background: var(--accent);
   flex: none;
 }
-.brand-name { font-size: 0.95rem; }
+.brand-name { font-size: 0.98rem; }
+
+/* Running head — where you are in the book, set small and quiet. */
+.running-head {
+  flex: 1;
+  min-width: 0;
+  margin-inline: 1rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 0.82rem;
+  color: var(--ink-3);
+  text-align: center;
+}
 
 .topbar-nav {
   display: flex;
@@ -349,10 +405,33 @@ body:not(.page-section) .reading-progress { display: none; }
 
 @media (min-width: 68rem) {
   body.has-sidebar .shell { grid-template-columns: var(--rail) minmax(0, 1fr); }
+  body.has-sidebar .rail-toggle-left { display: inline-grid; }
 }
 @media (min-width: 87rem) {
   body.has-sidebar.has-outline .shell {
     grid-template-columns: var(--rail) minmax(0, 1fr) var(--rail-right);
+  }
+  body.has-outline .rail-toggle-right { display: inline-grid; }
+}
+
+/* Collapsed rails (desktop). State lives on <html> so it applies before paint. */
+.rail-toggle { display: none; }
+.rail-toggle[aria-expanded="true"] { color: var(--accent-ink); }
+
+@media (min-width: 68rem) {
+  :root[data-contents="hidden"] .sidebar { display: none; }
+  :root[data-contents="hidden"] body.has-sidebar .shell { grid-template-columns: minmax(0, 1fr); }
+}
+@media (min-width: 87rem) {
+  :root[data-outline="hidden"] .outline { display: none; }
+  :root[data-outline="hidden"] body.has-sidebar.has-outline .shell {
+    grid-template-columns: var(--rail) minmax(0, 1fr);
+  }
+  :root[data-contents="hidden"] body.has-sidebar.has-outline .shell {
+    grid-template-columns: minmax(0, 1fr) var(--rail-right);
+  }
+  :root[data-contents="hidden"][data-outline="hidden"] body.has-sidebar.has-outline .shell {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -519,17 +598,124 @@ body:not(.page-section) .reading-progress { display: none; }
 .outline-list a.is-active { color: var(--accent-ink); border-left-color: var(--accent); }
 .outline-l4 a { padding-left: 1.6rem; }
 
-/* --- Page furniture ----------------------------------------------- */
+/* --- Page furniture (chapter openers) ----------------------------- */
 
-.page-head { margin-bottom: 2.25rem; }
+.page-head { margin-bottom: 2rem; }
+.chapter-head { text-align: center; }
 
 .eyebrow {
-  margin: 0 0 0.9rem;
-  font-size: 0.75rem;
+  margin: 0 0 1rem;
+  font-size: 0.73rem;
   font-weight: 550;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--ink-3);
+}
+.eyebrow a { color: inherit; text-decoration: none; border-bottom: 1px solid var(--rule); }
+.eyebrow a:hover { color: var(--ink); }
+.crumb-sep { margin-inline: 0.5rem; opacity: 0.6; }
+
+/* The large Roman numeral that opens a part, like a title page. */
+.part-ordinal {
+  margin: 0.2rem 0 0.4rem;
+  font-family: var(--font-display);
+  font-size: clamp(3rem, 2rem + 5vw, 4.6rem);
+  font-weight: 340;
+  line-height: 1;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+}
+
+.page-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(1.95rem, 1.35rem + 2.2vw, 2.8rem);
+  line-height: 1.12;
+  letter-spacing: -0.018em;
+  font-weight: 560;
+  text-wrap: balance;
+  color: var(--ink);
+}
+
+.standfirst {
+  margin: 1.15rem auto 0;
+  max-width: 32rem;
+  font-family: var(--font-reading);
+  font-size: 1.06rem;
+  line-height: 1.62;
+  color: var(--ink-2);
+  font-style: italic;
+  text-wrap: pretty;
+}
+
+.page-meta {
+  margin: 1.2rem 0 0;
+  font-size: 0.78rem;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.03em;
+}
+
+.section-heading {
+  margin: 3.2rem 0 1.2rem;
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-weight: 580;
+  letter-spacing: -0.012em;
+  color: var(--ink);
+}
+
+/* --- Fleuron divider & folio -------------------------------------- */
+
+.dinkus {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin: 0.4rem 0 2.4rem;
+}
+.dinkus-rule {
+  flex: 1;
+  height: 1px;
+  background: var(--rule);
+}
+.fleuron-mark {
+  width: 1.15rem;
+  height: 1.15rem;
+  flex: none;
+  fill: var(--accent);
+  opacity: 0.85;
+}
+
+/* Folio — the page number at the foot of the page. */
+.folio {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.8rem;
+  margin: 3.4rem 0 0;
+  font-family: var(--font-display);
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.folio-dash {
+  width: 2.2rem;
+  height: 1px;
+  background: var(--rule);
+}
+
+/* --- Drop caps ---------------------------------------------------- */
+
+.dropcap > p:first-of-type::first-letter {
+  float: left;
+  font-family: var(--font-display);
+  font-weight: 560;
+  font-size: 3.3em;
+  line-height: 0.82;
+  padding-right: 0.09em;
+  margin-top: 0.04em;
+  color: var(--accent);
 }
 .eyebrow a { color: inherit; text-decoration: none; border-bottom: 1px solid var(--rule); }
 .eyebrow a:hover { color: var(--ink); }
@@ -589,27 +775,27 @@ body:not(.page-section) .reading-progress { display: none; }
 .prose h3,
 .prose h4,
 .prose h5 {
-  font-family: var(--font-serif);
+  font-family: var(--font-display);
   letter-spacing: -0.012em;
-  line-height: 1.28;
+  line-height: 1.26;
   text-wrap: balance;
   scroll-margin-top: calc(var(--topbar-h) + 1.5rem);
   position: relative;
 }
 
-.prose h2 { font-size: 1.5em; font-weight: 600; margin: 2.6em 0 0.7em; }
+.prose h2 { font-size: 1.5em; font-weight: 580; margin: 2.6em 0 0.7em; }
 
-/* Questions. A hairline dinkus above each one gives the page its rhythm. */
+/* Questions. A short hairline above each one gives the page its rhythm. */
 .prose h3 {
-  font-size: 1.24em;
-  font-weight: 600;
+  font-size: 1.26em;
+  font-weight: 580;
   margin: 2.9em 0 0.85em;
   color: var(--ink);
 }
 .prose h3::before {
   content: "";
   display: block;
-  width: 2.25rem;
+  width: 2.4rem;
   height: 1px;
   background: var(--rule);
   margin-bottom: 1.7rem;
@@ -617,8 +803,8 @@ body:not(.page-section) .reading-progress { display: none; }
 .prose > h3:first-child { margin-top: 0; }
 .prose > h3:first-child::before { display: none; }
 
-.prose h4 { font-size: 1.06em; font-weight: 650; margin: 2em 0 0.6em; }
-.prose h5 { font-size: 0.98em; font-weight: 650; margin: 1.6em 0 0.5em; color: var(--ink-2); }
+.prose h4 { font-size: 1.06em; font-weight: 600; margin: 2em 0 0.6em; }
+.prose h5 { font-size: 0.98em; font-weight: 600; margin: 1.6em 0 0.5em; color: var(--ink-2); }
 
 .heading-link {
   position: absolute;
@@ -861,72 +1047,115 @@ body:not(.page-section) .reading-progress { display: none; }
 .table-wrap tbody tr:last-child td { border-bottom: 0; }
 .table-wrap td code { font-size: 0.92em; }
 
-/* --- Home --------------------------------------------------------- */
+/* --- Home (the book cover) ---------------------------------------- */
 
-.hero { margin-bottom: 2.75rem; }
-.hero-title {
-  margin: 0 0 1.25rem;
-  font-family: var(--font-serif);
-  font-size: clamp(2.1rem, 1.35rem + 3vw, 3.15rem);
-  line-height: 1.1;
-  letter-spacing: -0.022em;
-  font-weight: 600;
+.cover { margin-bottom: 3rem; }
+.cover-frame {
+  border: 1px solid var(--rule);
+  outline: 1px solid var(--rule-soft);
+  outline-offset: 5px;
+  padding: clamp(2.2rem, 6vw, 4rem) clamp(1.4rem, 5vw, 3.5rem);
+  text-align: center;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.cover-publisher {
+  margin: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.cover-rule {
+  width: 4.5rem;
+  height: 1px;
+  background: var(--accent);
+  margin: 1.2rem auto 1.6rem;
+}
+.cover-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(2.5rem, 1.6rem + 4.4vw, 4.2rem);
+  line-height: 1.04;
+  letter-spacing: -0.02em;
+  font-weight: 560;
+  color: var(--ink);
   text-wrap: balance;
 }
-.hero-lede {
-  margin: 0 0 2rem;
+.cover-subtitle {
+  margin: 1.1rem auto 0;
+  max-width: 30rem;
+  font-family: var(--font-display);
+  font-style: italic;
+  font-size: 1.12rem;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.cover-ornament { width: 1.5rem; height: 1.5rem; margin: 1.7rem auto 1.4rem; display: block; }
+.cover-blurb {
+  margin: 0 auto;
+  max-width: 34rem;
   font-family: var(--font-reading);
-  font-size: 1.15rem;
-  line-height: 1.65;
+  font-size: 1.02rem;
+  line-height: 1.7;
   color: var(--ink-2);
   text-wrap: pretty;
 }
 .hero-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; margin: 1.75rem 0 0; }
+.cover-actions { justify-content: center; margin-top: 2rem; }
 
 .btn {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
-  padding: 0.55rem 1.05rem;
+  padding: 0.55rem 1.15rem;
   border: 1px solid var(--rule);
-  border-radius: 999px;
+  border-radius: 2px;
   background: var(--surface);
   color: var(--ink);
-  font-size: 0.88rem;
+  font-family: var(--font-sans);
+  font-size: 0.87rem;
   font-weight: 550;
+  letter-spacing: 0.01em;
   text-decoration: none;
   transition: border-color 0.15s var(--ease), background 0.15s var(--ease), color 0.15s var(--ease);
 }
 .btn:hover { border-color: var(--ink-3); }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-:root[data-theme="dark"] .btn-primary { color: #14201d; }
-@media (prefers-color-scheme: dark) { :root:not([data-theme]) .btn-primary { color: #14201d; } }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fbf6ea; }
+:root[data-theme="dark"] .btn-primary { color: #241512; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme]) .btn-primary { color: #241512; } }
 .btn-primary:hover { background: var(--accent-ink); border-color: var(--accent-ink); }
 
-.guide-cards { display: grid; gap: 0; margin-bottom: 1rem; }
+.volumes { margin-top: 3.4rem; }
+
+.guide-cards { display: grid; gap: 1.25rem; margin-bottom: 1rem; }
+@media (min-width: 46rem) { .guide-cards { grid-template-columns: 1fr 1fr; } }
 .guide-card {
+  position: relative;
   display: block;
-  padding: 1.5rem 0.25rem 1.6rem;
-  border-top: 1px solid var(--rule-soft);
-  background: none;
+  padding: 1.5rem 1.6rem 1.6rem 1.9rem;
+  border: 1px solid var(--rule);
+  border-left: 4px solid var(--accent);
+  border-radius: 2px;
+  background: var(--surface);
   text-decoration: none;
   color: inherit;
-  transition: background 0.18s var(--ease);
+  box-shadow: var(--shadow);
+  transition: transform 0.18s var(--ease), box-shadow 0.18s var(--ease), border-color 0.18s var(--ease);
 }
-.guide-card:last-child { border-bottom: 1px solid var(--rule-soft); }
-.guide-card:hover { background: color-mix(in oklab, var(--bg-tint) 55%, transparent); }
-.guide-card-eyebrow { font-size: 0.7rem; letter-spacing: 0.09em; text-transform: uppercase; color: var(--accent); }
+.guide-card:hover { transform: translateY(-2px); box-shadow: 0 2px 3px rgb(36 31 24 / 6%), 0 18px 40px -18px rgb(36 31 24 / 38%); }
+.guide-card-eyebrow { font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--accent); }
 .guide-card-title {
-  margin: 0.45rem 0 0.5rem;
-  font-family: var(--font-serif);
-  font-size: 1.4rem;
-  font-weight: 600;
+  margin: 0.5rem 0 0.55rem;
+  font-family: var(--font-display);
+  font-size: 1.42rem;
+  font-weight: 580;
   letter-spacing: -0.015em;
   transition: color 0.15s var(--ease);
 }
 .guide-card:hover .guide-card-title { color: var(--accent-ink); }
-.guide-card-body { margin: 0 0 0.8rem; color: var(--ink-2); font-family: var(--font-reading); line-height: 1.55; }
-.guide-card-meta { margin: 0; font-size: 0.79rem; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.guide-card-body { margin: 0 0 0.85rem; color: var(--ink-2); font-family: var(--font-reading); line-height: 1.58; }
+.guide-card-meta { margin: 0; font-size: 0.78rem; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 
 .legend {
   list-style: none;
@@ -961,29 +1190,37 @@ body:not(.page-section) .reading-progress { display: none; }
 .legend-targeted { --cal: #7c5f7a; }
 .legend-twice { --cal: #6d7182; }
 
-/* --- Contents lists ----------------------------------------------- */
+/* --- Contents lists (table of contents) --------------------------- */
 
 .part-list, .chapter-list { list-style: none; margin: 0; padding: 0; }
 
-.part-item { margin-bottom: 2.25rem; }
+/* Dot leaders — the row of dots that carries the eye to the page number. */
+.toc-dots {
+  flex: 1;
+  min-width: 1.4rem;
+  margin: 0 0.45rem;
+  border-bottom: 1px dotted var(--rule);
+  transform: translateY(-0.3em);
+}
+
+.part-item { margin-bottom: 2.4rem; }
 .part-link { display: block; text-decoration: none; color: inherit; }
-.part-label { display: block; font-size: 0.7rem; letter-spacing: 0.09em; text-transform: uppercase; color: var(--ink-3); }
+.part-label { display: block; font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); }
 .part-title {
   display: block;
-  margin-top: 0.2rem;
-  font-family: var(--font-serif);
-  font-size: 1.22rem;
-  font-weight: 600;
+  margin-top: 0.25rem;
+  font-family: var(--font-display);
+  font-size: 1.26rem;
+  font-weight: 580;
   letter-spacing: -0.012em;
 }
 .part-link:hover .part-title { color: var(--accent-ink); }
-.part-sections { list-style: none; margin: 0.7rem 0 0; padding: 0 0 0 0.9rem; border-left: 1px solid var(--rule-soft); }
+.part-sections { list-style: none; margin: 0.8rem 0 0; padding: 0 0 0 0.2rem; }
 .part-sections li {
   display: flex;
   align-items: baseline;
-  gap: 0.75rem;
-  padding: 0.25rem 0;
-  font-size: 0.92rem;
+  padding: 0.28rem 0;
+  font-size: 0.93rem;
 }
 .part-sections a { color: var(--ink-2); text-decoration: none; display: flex; gap: 0.6rem; min-width: 0; }
 .part-sections a:hover { color: var(--accent-ink); }
@@ -994,23 +1231,24 @@ body:not(.page-section) .reading-progress { display: none; }
   font-size: 0.8rem;
   color: var(--ink-3);
 }
-.sec-meta { margin-left: auto; flex: none; font-size: 0.74rem; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.sec-meta { margin-left: 0; flex: none; font-size: 0.74rem; color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 .chapter-list li {
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 0.25rem 1rem;
+  grid-template-columns: auto 1fr auto;
+  gap: 0 0;
   align-items: baseline;
-  padding: 0.85rem 0;
+  padding: 0.8rem 0;
   border-bottom: 1px solid var(--rule-soft);
 }
 .chapter-list li:last-child { border-bottom: 0; }
 .chapter-list a { display: flex; gap: 0.7rem; text-decoration: none; color: var(--ink); min-width: 0; }
 .chapter-list a:hover .sec-title { color: var(--accent-ink); }
-.sec-title { font-family: var(--font-serif); font-size: 1.05rem; font-weight: 550; line-height: 1.35; }
+.chapter-list .toc-dots { align-self: end; margin-bottom: 0.32em; }
+.sec-title { font-family: var(--font-display); font-size: 1.06rem; font-weight: 540; line-height: 1.35; }
 .sec-kicker {
   grid-column: 1 / -1;
-  margin: 0.15rem 0 0 2.4rem;
+  margin: 0.3rem 0 0 2.4rem;
   font-family: var(--font-reading);
   font-size: 0.9rem;
   font-style: italic;

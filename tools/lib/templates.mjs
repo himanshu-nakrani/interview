@@ -51,13 +51,34 @@ const icon = {
   close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>',
   arrowLeft: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5m0 0 6-6m-6 6 6 6"/></svg>',
   arrowRight: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m0 0-6-6m6 6-6 6"/></svg>',
+  panelLeft:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M9.5 4.5v15"/></svg>',
+  panelRight:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M14.5 4.5v15"/></svg>',
 };
+
+/* A fleuron divider — the printer's ornament that breaks a page into
+   movements. Rendered as SVG so it is identical on every platform. */
+const FLEURON =
+  '<svg class="fleuron-mark" viewBox="0 0 24 24" aria-hidden="true">' +
+  '<path d="M12 3.5c1.8 2.4 2.7 4.6 2.7 6.7 0 1.7-.6 3.2-1.8 4.6.7.4 1.5.6 2.4.6 1.5 0 2.8-.6 3.9-1.7-.4 2.6-2.1 4.3-4.6 4.8-.9.2-1.8.1-2.6-.2-.8.3-1.7.4-2.6.2-2.5-.5-4.2-2.2-4.6-4.8 1.1 1.1 2.4 1.7 3.9 1.7.9 0 1.7-.2 2.4-.6-1.2-1.4-1.8-2.9-1.8-4.6 0-2.1.9-4.3 2.7-6.7Z"/>' +
+  '</svg>';
+
+function dinkus() {
+  return `<div class="dinkus" aria-hidden="true"><span class="dinkus-rule"></span>${FLEURON}<span class="dinkus-rule"></span></div>`;
+}
+
+/** Folio — the page number at the foot of a book page. */
+function folio(number) {
+  if (number == null) return '';
+  return `<p class="folio" aria-hidden="true"><span class="folio-dash"></span>${escapeHtml(String(number))}<span class="folio-dash"></span></p>`;
+}
 
 /* ------------------------------------------------------------------ *
  * Chrome
  * ------------------------------------------------------------------ */
 
-function topbar({ collections, activeCollection }) {
+function topbar({ collections, activeCollection, runningHead }) {
   const links = collections
     .map(
       (collection) =>
@@ -72,7 +93,10 @@ function topbar({ collections, activeCollection }) {
     <button class="icon-btn topbar-menu" type="button" data-action="toggle-nav" aria-label="Open contents" aria-expanded="false">${icon.menu}</button>
     <a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">${escapeHtml(SITE_NAME)}</span></a>
     <nav class="topbar-nav" aria-label="Guides">${links}</nav>
+    ${runningHead ? `<span class="running-head">${runningHead}</span>` : ''}
     <div class="topbar-tools">
+      <button class="icon-btn rail-toggle rail-toggle-left" type="button" data-action="toggle-contents" aria-label="Toggle contents sidebar" aria-expanded="true">${icon.panelLeft}</button>
+      <button class="icon-btn rail-toggle rail-toggle-right" type="button" data-action="toggle-outline" aria-label="Toggle questions outline" aria-expanded="true">${icon.panelRight}</button>
       <button class="search-trigger" type="button" data-action="open-search" aria-label="Search">
         ${icon.search}<span class="search-trigger-text">Search</span><kbd class="search-trigger-kbd">/</kbd>
       </button>
@@ -254,6 +278,7 @@ export function layout({
   bodyClass = '',
   collections,
   activeCollection = null,
+  runningHead = '',
   sidebar = '',
   outline: outlineHtml = '',
   main,
@@ -271,21 +296,24 @@ export function layout({
 <title>${escapeHtml(pageTitle)}</title>
 <meta name="description" content="${attr(description ?? SITE_TAGLINE)}">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#faf7f2" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#17161a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f6efe1" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#191512" media="(prefers-color-scheme: dark)">
 <meta property="og:type" content="article">
 <meta property="og:site_name" content="${attr(SITE_NAME)}">
 <meta property="og:title" content="${attr(title)}">
 <meta property="og:description" content="${attr(description ?? SITE_TAGLINE)}">
 <link rel="icon" href="${FAVICON}">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,340..700;1,9..144,340..700&display=swap">
 <link rel="stylesheet" href="/assets/reader.css">
 <script>
-(function(){var d=document.documentElement;d.classList.remove('no-js');try{var p=JSON.parse(localStorage.getItem('reader-prefs')||'{}');for(var k in p){if(p[k])d.setAttribute('data-'+k,p[k]);}}catch(e){}})();
+(function(){var d=document.documentElement;d.classList.remove('no-js');try{var p=JSON.parse(localStorage.getItem('reader-prefs')||'{}');for(var k in p){if(p[k])d.setAttribute('data-'+k,p[k]);}}catch(e){}try{var r=JSON.parse(localStorage.getItem('reader-rails')||'{}');if(r.contents)d.setAttribute('data-contents','hidden');if(r.outline)d.setAttribute('data-outline','hidden');}catch(e){}})();
 </script>
 </head>
 <body class="${attr(bodyClass)}${hasSidebar ? ' has-sidebar' : ''}${hasOutline ? ' has-outline' : ''}">
 <a class="skip-link" href="#content">Skip to the text</a>
-${topbar({ collections, activeCollection })}
+${topbar({ collections, activeCollection, runningHead })}
 ${prefsPanel()}
 ${searchOverlay()}
 <div class="shell">
@@ -351,19 +379,28 @@ export function homePage({ collections, stats }) {
   ).join('');
 
   const main = `<article class="reader home">
-  <header class="hero">
-    <p class="eyebrow">A quiet place to read</p>
-    <h1 class="hero-title">Two interview guides,<br>written to be read end to end.</h1>
-    <p class="hero-lede">${formatNumber(stats.questions)} questions and ${formatNumber(
-      stats.words,
-    )} words on AI engineering and Python backend engineering — set in a single reading column, with light, sepia and dark modes, and nothing that blinks.</p>
-    <p class="hero-actions">
-      <a class="btn btn-primary" href="/ai-engineer/">Start with AI Engineer</a>
-      <a class="btn" href="/python-backend/">Python Backend</a>
-    </p>
+  <header class="cover">
+    <div class="cover-frame">
+      <p class="cover-publisher">${escapeHtml(SITE_NAME)} · Reading Edition</p>
+      <div class="cover-rule" aria-hidden="true"></div>
+      <h1 class="cover-title">The Interview<br>Codex</h1>
+      <p class="cover-subtitle">Two guides, set end to end, for the price of your attention.</p>
+      ${FLEURON.replace('class="fleuron-mark"', 'class="fleuron-mark cover-ornament"')}
+      <p class="cover-blurb">${formatNumber(stats.questions)} questions and ${formatNumber(
+        stats.words,
+      )} words on AI engineering and Python backend engineering — set in a single reading
+      column, in light, sepia and dark, and bound to stay out of your way.</p>
+      <p class="hero-actions cover-actions">
+        <a class="btn btn-primary" href="/ai-engineer/">Open the AI Engineer volume</a>
+        <a class="btn" href="/python-backend/">Python Backend</a>
+      </p>
+    </div>
   </header>
 
-  <section class="guide-cards">${cards}</section>
+  <section class="volumes">
+    <h2 class="section-heading">The two volumes</h2>
+    <div class="guide-cards">${cards}</div>
+  </section>
 
   <section class="legend-block">
     <h2 class="section-heading">The marks in the margin</h2>
@@ -379,6 +416,7 @@ export function homePage({ collections, stats }) {
     url: '/',
     bodyClass: 'page-home',
     collections,
+    runningHead: 'A quiet place to read',
     main,
   });
 }
@@ -402,7 +440,7 @@ export function collectionPage({ collection, collections, introHtml, headings })
             (section) =>
               `<li><a href="${attr(section.url)}"><span class="sec-num">${section.number}</span>${escapeHtml(
                 section.title,
-              )}</a><span class="sec-meta">${formatNumber(section.questions.length)} q</span></li>`,
+              )}</a><span class="toc-dots" aria-hidden="true"></span><span class="sec-meta">${formatNumber(section.questions.length)} q</span></li>`,
           )
           .join('')}
       </ul>
@@ -420,6 +458,7 @@ export function collectionPage({ collection, collections, introHtml, headings })
       <a href="${attr(section.url)}"><span class="sec-num">${section.number}</span><span class="sec-title">${escapeHtml(
         section.title,
       )}</span></a>
+      <span class="toc-dots" aria-hidden="true"></span>
       <span class="sec-meta">${formatNumber(section.questions.length)} questions · ${section.minutes} min</span>
     </li>`,
       )
@@ -429,8 +468,8 @@ export function collectionPage({ collection, collections, introHtml, headings })
 
   const first = collection.sections[0];
   const main = `<article class="reader">
-  <header class="page-head">
-    <p class="eyebrow">Guide</p>
+  <header class="page-head chapter-head">
+    <p class="eyebrow">Guide · A volume of ${escapeHtml(SITE_NAME)}</p>
     <h1 class="page-title">${escapeHtml(collection.title)}</h1>
     <p class="standfirst">${escapeHtml(collection.tagline)}</p>
     <p class="page-meta">${escapeHtml(
@@ -452,8 +491,10 @@ export function collectionPage({ collection, collections, introHtml, headings })
       }
     </p>
   </header>
+  ${dinkus()}
   <div class="prose">${introHtml}</div>
   ${partsHtml}
+  ${folio(collection.id === 'ai-engineer' ? 'I' : 'II')}
 </article>`;
 
   return layout({
@@ -463,6 +504,7 @@ export function collectionPage({ collection, collections, introHtml, headings })
     bodyClass: 'page-collection',
     collections,
     activeCollection: collection.id,
+    runningHead: escapeHtml(collection.title),
     sidebar: sidebarForCollection(collection, collection.base),
     outline: outline(headings),
     main,
@@ -474,10 +516,11 @@ export function partPage({ part, collection, collections, introHtml, prev, next 
   const words = part.sections.reduce((total, section) => total + section.words, 0);
 
   const main = `<article class="reader">
-  <header class="page-head">
+  <header class="page-head chapter-head">
     <p class="eyebrow"><a href="${attr(collection.base)}">${escapeHtml(collection.short)}</a> · ${escapeHtml(
       part.label,
     )}</p>
+    <p class="part-ordinal" aria-hidden="true">${escapeHtml((part.label || '').replace(/^Part\s+/i, ''))}</p>
     <h1 class="page-title">${escapeHtml(part.title)}</h1>
     <p class="page-meta">${escapeHtml(
       `${pluralise(part.sections.length, 'section')} · ${pluralise(questions, 'question')} · ${readingMinutes(
@@ -485,7 +528,8 @@ export function partPage({ part, collection, collections, introHtml, prev, next 
       )} min`,
     )}</p>
   </header>
-  ${introHtml ? `<div class="prose standfirst-prose">${introHtml}</div>` : ''}
+  ${dinkus()}
+  ${introHtml ? `<div class="prose standfirst-prose dropcap">${introHtml}</div>` : ''}
   <ol class="chapter-list">
     ${part.sections
       .map(
@@ -493,13 +537,15 @@ export function partPage({ part, collection, collections, introHtml, prev, next 
       <a href="${attr(section.url)}"><span class="sec-num">${section.number}</span><span class="sec-title">${escapeHtml(
         section.title,
       )}</span></a>
-      ${section.kicker ? `<p class="sec-kicker">${escapeHtml(section.kicker)}</p>` : ''}
+      <span class="toc-dots" aria-hidden="true"></span>
       <span class="sec-meta">${formatNumber(section.questions.length)} questions · ${section.minutes} min</span>
+      ${section.kicker ? `<p class="sec-kicker">${escapeHtml(section.kicker)}</p>` : ''}
     </li>`,
       )
       .join('')}
   </ol>
   ${pager(prev, next)}
+  ${folio((part.label || '').replace(/^Part\s+/i, ''))}
 </article>`;
 
   return layout({
@@ -509,6 +555,7 @@ export function partPage({ part, collection, collections, introHtml, prev, next 
     bodyClass: 'page-part',
     collections,
     activeCollection: collection.id,
+    runningHead: `${escapeHtml(part.label)} · ${escapeHtml(part.title)}`,
     sidebar: sidebarForCollection(collection, part.url),
     main,
   });
@@ -524,7 +571,7 @@ export function sectionPage({ section, collection, collections, bodyHtml, prev, 
     .join('<span class="crumb-sep" aria-hidden="true">·</span>');
 
   const main = `<article class="reader">
-  <header class="page-head">
+  <header class="page-head chapter-head">
     <p class="eyebrow">${crumbs}</p>
     <h1 class="page-title">${escapeHtml(section.title)}</h1>
     ${section.kicker ? `<p class="standfirst">${escapeHtml(section.kicker)}</p>` : ''}
@@ -534,8 +581,10 @@ export function sectionPage({ section, collection, collections, bodyHtml, prev, 
       )} words`,
     )}</p>
   </header>
-  <div class="prose">${bodyHtml}</div>
+  ${dinkus()}
+  <div class="prose dropcap">${bodyHtml}</div>
   ${pager(prev, next)}
+  ${folio(section.number)}
 </article>`;
 
   const questionOutline = section.questions.map((question) => ({
@@ -551,6 +600,9 @@ export function sectionPage({ section, collection, collections, bodyHtml, prev, 
     bodyClass: 'page-section',
     collections,
     activeCollection: collection.id,
+    runningHead: `${escapeHtml(section.part ? section.part.label : collection.short)} · §${escapeHtml(
+      String(section.number ?? ''),
+    )} ${escapeHtml(section.title)}`,
     sidebar: sidebarForCollection(collection, section.url),
     outline: outline(questionOutline, { label: 'Questions' }),
     main,
@@ -575,6 +627,7 @@ export function articlePage({ title, standfirst, url, collection, collections, b
     bodyClass: 'page-article',
     collections,
     activeCollection: collection.id,
+    runningHead: escapeHtml(title),
     sidebar: sidebarForCollection(collection, url),
     // The curriculum lists all 87 sections as h3s; the rail only wants the parts.
     outline: outline((headings ?? []).filter((heading) => heading.level <= 2)),
@@ -607,6 +660,7 @@ export function searchPage({ collections }) {
     url: '/search/',
     bodyClass: 'page-search',
     collections,
+    runningHead: 'The index of questions',
     main,
   });
 }
@@ -631,6 +685,7 @@ export function notFoundPage({ collections }) {
     url: '/404.html',
     bodyClass: 'page-404',
     collections,
+    runningHead: 'A missing page',
     main,
   });
 }
